@@ -123,7 +123,10 @@ def main():
                     client.model.load_state_dict(
                         {"key": ka["key"], "anchor_pool": ka["anchor_pool"]},
                         strict=False)  # head untouched: evaluate() loads heads[old_task]
-                    acc = client.evaluate(old_task, nb_classes)
+                    # observer-only diagnostics: use evaluate_with_margin so
+                    # last_margin_stats is populated (evaluate() is now the
+                    # pure official accuracy path)
+                    acc = client.evaluate_with_margin(old_task, nb_classes)
                     stats = client.last_margin_stats or {}
                     rows.append({
                         "client_id": cid,

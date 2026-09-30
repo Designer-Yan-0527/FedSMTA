@@ -4,8 +4,9 @@ Compares:
   A) one continuous run of N rounds
   B) a run stopped after K rounds, then resumed for the remaining rounds
 
-Final checkpoints (model states / protos / fix_keys / heads / prompts /
-RNG states / data-split indices) and the accuracy matrices must match.
+Final checkpoints (model states / protos / temp protos / fix_keys / heads /
+prompts / full tail-anchor states / RNG states / data-split indices /
+existing_class) and the accuracy matrices must match.
 Exact bitwise equality needs --deterministic (passed automatically);
 without it, small CUDA nondeterminism may appear and the test falls back
 to reporting max diffs.
@@ -121,6 +122,43 @@ def require_outer_manifest(ckpt, label="checkpoint"):
     return manifest
 
 
+def validate_split_state(state, label, expected_tasks=None):
+    """Structural check of an inner 70/30 split state
+    ({client_id: {task_id: {"train": [...], "test": [...]}}}):
+    empty/invalid entries must FAIL instead of {} == {} vacuous pass."""
+    assert isinstance(state, dict) and len(state) > 0, (
+        f"{label}: inner split state is empty or invalid (false-pass guard)")
+    for cid, tasks in state.items():
+        assert isinstance(tasks, dict) and len(tasks) > 0, (
+            f"{label}: client {cid} has no task split (false-pass guard)")
+        for t, splits in tasks.items():
+            assert (isinstance(splits, dict) and "train" in splits
+                    and "test" in splits), (
+                f"{label}: client {cid} task {t} split lacks train/test keys")
+            assert len(splits["train"]) > 0 and len(splits["test"]) > 0, (
+                f"{label}: client {cid} task {t} has an empty train/test "
+                "split (false-pass guard)")
+    if expected_tasks is not None:
+        # thisclients = ALL clients every round (no sampling), so every
+        # client must have entered (and split) every task the run reached
+        for cid, tasks in state.items():
+            present = {str(k) for k in tasks}
+            missing = [str(t) for t in expected_tasks if str(t) not in present]
+            assert not missing, (
+                f"{label}: client {cid} inner split missing task(s) "
+                f"{missing} (false-pass guard)")
+    return state
+
+
+def require_inner_split_state(ckpt, label="checkpoint", expected_tasks=None):
+    """Gate 0B/0C false-pass guard: the checkpoint must carry a valid,
+    non-empty data_split_state (no {} == {} vacuous pass)."""
+    assert "data_split_state" in ckpt, (
+        f"{label}: checkpoint missing data_split_state (false-pass guard)")
+    return validate_split_state(ckpt["data_split_state"], label,
+                                expected_tasks)
+
+
 def hash_obj(obj):
     """Stable sha256 over tensors / nested dict-list structures."""
     h = hashlib.sha256()
@@ -152,9 +190,9 @@ def load_matrix(run_dir):
 
 
 def matrix_diff(ma, mb):
-    """Max numeric difference between two accuracy matrices (inf on mismatch)."""
-    if ma is None and mb is None:
-        return 0.0
+    """Max numeric difference between two accuracy matrices (inf on mismatch).
+    None on either side is inf: Gate B runs with instrumentation ON, so a
+    missing accuracy_matrix.csv must FAIL (no None == None vacuous pass)."""
     if ma is None or mb is None or len(ma) != len(mb):
         return float("inf")
     worst = 0.0
@@ -178,8 +216,9 @@ def matrix_diff(ma, mb):
 
 def baseline_records(run_dir, ckpt):
     """The Phase-0 baseline verification record of one run."""
-    # inner 70/30 split indices (relative to each client-task subset)
-    split_state = ckpt.get("data_split_state") or {}
+    # inner 70/30 split indices (relative to each client-task subset);
+    # fail-fast on a missing/empty/invalid state (no {} == {} false pass)
+    split_state = require_inner_split_state(ckpt, str(run_dir))
     split_index_hashes = {}
     for cid, tasks in split_state.items():
         per_task = {}
@@ -247,8 +286,12 @@ def main():
     run_main(base + ["--run_name", "reg_full", "--max_rounds", str(args.rounds)])
     # B1: first K rounds only
     run_main(base + ["--run_name", "reg_split", "--max_rounds", str(args.split_at)])
-    # B2: resume auto -> runs the remaining rounds
-    run_main(base + ["--run_name", "reg_split", "--resume", "auto"])
+    # B2: resume auto -> runs the remaining rounds. --max_rounds is passed
+    # explicitly: without it the resume would run the FULL task loop
+    # (task_num*global_epoch), which only coincides with --rounds under the
+    # default config and would silently break equivalence otherwise.
+    run_main(base + ["--run_name", "reg_split", "--resume", "auto",
+                     "--max_rounds", str(args.rounds)])
 
     ckpt_a = torch.load(run_a / "checkpoints" / "latest.pth",
                         map_location="cpu", weights_only=False)
@@ -256,40 +299,98 @@ def main():
                         map_location="cpu", weights_only=False)
 
     # ---------- comparison (doc-named fields) ----------
+    # false-pass guards: core states that MUST exist after >= 1 round
+    for ck, lbl in ((ckpt_a, str(run_a)), (ckpt_b, str(run_b))):
+        assert "temp_protos" in ck, (
+            f"{lbl}: checkpoint missing temp_protos (false-pass guard)")
+        assert ck["temp_protos"] is not None, (
+            f"{lbl}: temp_protos is None (fuse_protos never ran?)")
+        assert "existing_class" in ck, (
+            f"{lbl}: checkpoint missing existing_class (false-pass guard)")
+
     head_diffs = [state_dict_diff(ckpt_a["global_head"], ckpt_b["global_head"])]
-    key_diffs, anchor_diffs = [], []
+    key_diffs, anchor_diffs, ta_state_diffs = [], [], []
+    cprompt_diffs, client_gproto_diffs, client_lproto_diffs = [], [], []
     for ca, cb in zip(ckpt_a["clients"], ckpt_b["clients"]):
         for ha, hb in zip(ca["heads"], cb["heads"]):
             head_diffs.append(state_dict_diff(ha, hb))
         ta, tb = ca["tail_anchor_model"], cb["tail_anchor_model"]
+        # full tail-anchor state (covers more than key/anchor_pool alone)
+        ta_state_diffs.append(state_dict_diff(ta, tb))
         key_diffs.append(max_diff(ta.get("key"), tb.get("key")))
         anchor_diffs.append(max_diff(ta.get("anchor_pool"), tb.get("anchor_pool")))
+        # client prompts: None == None is tolerated on BOTH sides (prompts
+        # are legitimately None before the first server distribution), but
+        # None on exactly one side is a mismatch
+        pa, pb = ca.get("prompts"), cb.get("prompts")
+        if (pa is None) != (pb is None):
+            cprompt_diffs.append(float("inf"))
+        elif pa is not None:
+            cprompt_diffs.append(state_dict_diff(pa, pb))
+        # per-client global/local protos must exist after >= 1 round
+        for c, lbl in ((ca, str(run_a)), (cb, str(run_b))):
+            assert c.get("global_protos") is not None, (
+                f"{lbl}: client {c['id']} global_protos is None "
+                "(false-pass guard)")
+            assert c.get("local_protos") is not None, (
+                f"{lbl}: client {c['id']} local_protos is None "
+                "(false-pass guard)")
+        client_gproto_diffs.append(protos_diff(ca["global_protos"],
+                                               cb["global_protos"]))
+        client_lproto_diffs.append(protos_diff(ca["local_protos"],
+                                               cb["local_protos"]))
 
-    split_state_a, split_state_b = (ckpt_a.get("data_split_state") or {},
-                                    ckpt_b.get("data_split_state") or {})
+    # inner 70/30 splits: fail-fast on missing/empty/invalid state, and
+    # every client must carry a split for every task the run reached
+    # (thisclients = all clients every round, no sampling)
+    expected_tasks = list(range((args.rounds - 1) // args.global_epoch + 1))
+    split_state_a = require_inner_split_state(ckpt_a, str(run_a),
+                                              expected_tasks)
+    split_state_b = require_inner_split_state(ckpt_b, str(run_b),
+                                              expected_tasks)
     split_equal = deep_equal(split_state_a, split_state_b)
 
     outer_a = require_outer_manifest(ckpt_a, str(run_a))
     outer_b = require_outer_manifest(ckpt_b, str(run_b))
     outer_equal = deep_equal(outer_a, outer_b)
 
+    # accuracy matrices must EXIST on both sides (instrumentation is ON in
+    # Gate B): a missing file must FAIL, not None == None -> 0.0
     ma, mb = load_matrix(run_a), load_matrix(run_b)
+    assert ma is not None, (
+        f"{run_a}: metrics/accuracy_matrix.csv is missing (false-pass guard)")
+    assert mb is not None, (
+        f"{run_b}: metrics/accuracy_matrix.csv is missing (false-pass guard)")
 
     comparison = {
         "completed_round_diff": abs(int(ckpt_a["completed_round"])
                                     - int(ckpt_b["completed_round"])),
+        "server_task_id_diff": abs(int(ckpt_a["server_task_id"])
+                                   - int(ckpt_b["server_task_id"])),
         "server_model_max_diff": state_dict_diff(ckpt_a["server_model"],
                                                  ckpt_b["server_model"]),
         "global_proto_max_diff": protos_diff(ckpt_a["global_protos"],
                                              ckpt_b["global_protos"]),
+        "temp_proto_max_diff": protos_diff(ckpt_a["temp_protos"],
+                                           ckpt_b["temp_protos"]),
         "prompt_max_diff": state_dict_diff(ckpt_a["server_prompt"],
                                            ckpt_b["server_prompt"]),
+        "client_prompt_max_diff": (max(cprompt_diffs)
+                                   if cprompt_diffs else 0.0),
         "head_max_diff": max(head_diffs),
         "key_max_diff": max(key_diffs),
         "anchor_max_diff": max(anchor_diffs),
+        "tail_anchor_state_max_diff": (max(ta_state_diffs)
+                                       if ta_state_diffs else 0.0),
+        "client_global_proto_max_diff": (max(client_gproto_diffs)
+                                         if client_gproto_diffs else 0.0),
+        "client_local_proto_max_diff": (max(client_lproto_diffs)
+                                        if client_lproto_diffs else 0.0),
         "accuracy_max_diff": matrix_diff(ma, mb),
         "split_equal": bool(split_equal),
         "outer_split_equal": bool(outer_equal),
+        "existing_class_equal": deep_equal(ckpt_a["existing_class"],
+                                           ckpt_b["existing_class"]),
         "fix_keys_equal": sorted(map(str, ckpt_a["fix_keys"]))
                           == sorted(map(str, ckpt_b["fix_keys"])),
     }
@@ -307,7 +408,8 @@ def main():
     # ---------- pass/fail report ----------
     report = []
     for name, diff in comparison.items():
-        if name in ("split_equal", "outer_split_equal", "fix_keys_equal"):
+        if name in ("split_equal", "outer_split_equal", "existing_class_equal",
+                    "fix_keys_equal"):
             report.append((name, diff is True, 0.0 if diff else float("inf"), ""))
         else:
             report.append((name, diff == 0.0, diff, ""))

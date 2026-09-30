@@ -717,11 +717,20 @@ GPT 对仓库多轮源码级审查（官方 FedTA vs FedSMTA 逐文件对照）�
 | 11 | **observer 测试缺封板断言**：未验证两组 run 的 `no_instrumentation` args（A 可能根本不是 OFF），也未验证 artifact 确实区分 | 增加 `ckpt_off["args"]["no_instrumentation"] is True` / `ckpt_on[...] is False` 硬断言 + artifact 区分验证（OFF 无 observer 文件、ON 必须有） |
 | 12 | **Gate 0A 无专门测试**：官方 parity 检查此前只有人工对照计划 | 新增 `tests/test_official_fedta_parity.py`：driver 脚本进程内复刻官方 `main()` 流程并导出状态、严格 key 存在性断言（fail loudly）、`D=0` 判定，输出 `metrics/official_fedta_parity.json` |
 | 13 | **测试潜伏 bug（第三轮新发现）**：两个测试的 `--work_dir` 默认为 str 但代码用 `/` 运算符（运行时 TypeError）；stale run 目录会触发 auto-resume 破坏等价性比较 | `--work_dir` 加 `type=Path`；三个测试运行前 rmtree 清理各自 run 目录 |
+| 14 | **Gate 0A 默认 `global_epoch=2` 与官方不等价**（第四轮复核，🔴 阻塞）：官方 FedTA 硬编码 SIKF 分支为 `i % global_epoch != 4`，本仓库参数化为 `!= global_epoch - 1`，两者仅当 `global_epoch=5` 时等价（$4 = 5-1$）；用 `global_epoch=2` 跑 parity 比较的是两条不同训练路径，PASS 反而说明测试失效 | Gate 0A 强制 `global_epoch=5`（其他值直接 `SystemExit`）；默认改为 smoke 配置 `task_num=1, rounds=5, local_epoch=1`（第 4 轮已覆盖官方 `!=4` 分支），正式短程用 `task_num=2, rounds=10`。**Gate 0B/0C 保持 `global_epoch=2` 合法**：它们比较 ours vs ours（resume/observer 机制），不涉及官方硬编码等价性 |
+| 15 | **inner split 假 PASS 残留**（第四轮复核，🟠）：B/C/A 仍用 `ckpt.get("data_split_state") or {}`，两侧都缺字段时 `{}` == `{}` 仍 PASS | 新增 `require_inner_split_state()` + `validate_split_state()` fail-fast（缺失/空/缺 train-test 键/train-test 空列表一律 AssertionError；且每 client 必须含运行到达的全部 task 的划分——`thisclients` 为全量无采样）；A/B/C 全部接入，官方侧 dump 的 `inner_splits` 同样做结构校验 |
+| 16 | **Gate 0B accuracy matrix 假 PASS**（第四轮复核，🟠）：`matrix_diff()` 中 `ma is None and mb is None → 0.0`，两侧都缺 `accuracy_matrix.csv` 仍 PASS | Gate B 插桩开启、矩阵必须存在：两侧显式 `assert` 矩阵文件存在；`matrix_diff()` 单侧 None 直接 `inf` |
+| 17 | **Gate B B2 resume 未显式传 `--max_rounds`**（第四轮复核）：默认配置下 `rounds == task_num*global_epoch` 恰好掩盖问题，非默认 rounds 时 resume 会跑满完整任务循环破坏等价性 | B2 命令显式附加 `--max_rounds args.rounds` |
+| 18 | **B/C 漏比较若干 checkpoint 核心状态**（第四轮复核，🟡）：`temp_protos`、client 级 global/local protos、完整 tail_anchor state、client prompts（B 缺）、`existing_class`、`server_task_id` 均未比较 | B/C 比较矩阵补齐上述全部字段；`temp_protos`/client protos 增加"必须存在且非 None"断言（fuse_protos / 训练每轮必然写入） |
+| 19 | **margin 计算混在官方 `evaluate()` 路径**（第五轮复核，⚠️ 不改算法但破坏严格 baseline execution path）：`Client_DF.evaluate()` 内嵌 margin 记录（gather/scatter/quantile），且不受 `--no_instrumentation` 控制——违反 OFF = "FedTA + checkpoint only" 的严格定义 | `evaluate()` 恢复官方原样（accuracy only，唯一增加是不影响计算的 `return float(acc)`）；新增 observer-only 的 `evaluate_with_margin()`（同一 accuracy 计算 + margin 记录）；`evaluate_all_seen_tasks()` 与 `diagnostics/compatibility_drift.py` 改调 wrapper（`_log_local_phase` 只需 accuracy，保持官方 `evaluate()`）；`__init__` 初始化 `last_margin_stats=None`。margin 代码不消耗 RNG，此改动对 Gate B/C 轨迹中立 |
 
-> **封板状态说明（v3）**：第 5、6 两项连同第三轮复核发现的假 PASS 残留（第 9–11 项）**代码侧修复已全部落地**：
+第五轮复核同时确认：CIFAR-100 冻结协议下 Client 两阶段训练 / Tail Anchor / InfoNCE / Global Prompt（含 batchwise majority routing）/ BGPS（`threshold=0.25` 时）/ SIKF（`global_epoch=5` 时）/ FedAvg head / CIFAR partition 均与官方一致；单客户端 SIKF 分支的 `client.prompts` bugfix 在标准 5-client 全参与协议下不触发；ImageNet-R 不宣称 strict official parity。
+
+> **封板状态说明（v5）**：第 5、6 两项连同第三轮（第 9–11 项）、第四轮（第 14–18 项）、第五轮（第 19 项）复核发现的假 PASS / 阻塞 / baseline 纯度问题**代码侧修复已全部落地**：
 >
-> - `--no_instrumentation`：Server_DF 门控 + observer args 断言 + artifact 区分验证均已在测试代码中封板
-> - `outer_split_manifest`：三处 `or {}` 假 PASS 模式全部替换为 fail-fast；`load_checkpoint()` 严格拒绝无 manifest 的 checkpoint
+> - `--no_instrumentation`：Server_DF 门控 + observer args 断言 + artifact 区分验证 + **官方 `evaluate()` 路径去 margin 化**（margin 隔离进 `evaluate_with_margin()`）均在代码中封板
+> - `outer_split_manifest` / `data_split_state`（inner split）/ accuracy matrix：三处 `or {}` / `None == None` 假 PASS 模式全部替换为 fail-fast 结构校验
+> - Gate 0A 协议修正：强制 `global_epoch=5` + `threshold=0.25`（官方硬编码的唯一等价点），smoke 默认 `task_num=1/rounds=5/local_epoch=1`
 >
 > 但"实现完成 ≠ Gate 通过"：三个 Gate 测试（`test_official_fedta_parity.py` / `test_resume_regression.py` / `test_observer_invariance.py`）**均尚未在服务器真实跑通**。在服务器跑通并打 tag `phase0-fedta-baseline` 之前，上述各项只算"实现完成"，不算"已验证修复"。
 
@@ -746,32 +755,45 @@ GPT 对仓库多轮源码级审查（官方 FedTA vs FedSMTA 逐文件对照）�
 
 ## 13. 当前状态与下一步
 
-### 状态快照（截至 2026-09-30，v3）
+### 状态快照（截至 2026-09-30，v4）
 
-$$\boxed{\text{Phase 0 = implementation complete (3-Gate sealed in code), Gate NOT passed}}$$
+$$\boxed{\text{Phase 0 = implementation complete (3-Gate sealed in code, round-4 hardening done), Gate NOT passed}}$$
 
-- **Phase 0**：三个 Gate（0A/0B/0C）的测试代码**已全部实现并封板**（假 PASS 防护、args 断言、artifact 区分验证均落地，见 §12.2 第 9–13 项），**但 Gate 尚未通过**——三个测试在服务器真实跑通并打 tag `phase0-fedta-baseline` 之前，baseline **不算冻结**
+- **Phase 0**：三个 Gate（0A/0B/0C）的测试代码**已全部实现并封板**（假 PASS 防护、args 断言、artifact 区分验证、第四轮 inner-split/matrix/核心状态加固均落地，见 §12.2 第 9–18 项），**但 Gate 尚未通过**——三个测试在服务器真实跑通并打 tag `phase0-fedta-baseline` 之前，baseline **不算冻结**
 - **Phase 1**：数学实现基本通过。待实现 batch sensitivity 诊断（Phase 1-precheck）+ 服务器跑特征提取/多模态分析
 - **Phase 2+**：未开始，**一行 Phase 2 代码都不要继续加**（synthetic_oracle_k2.py 仅为 synthetic sanity check，不计入）
 
 ### 下一步行动（按序）
 
-1. 服务器按顺序跑通三个 Gate（实现完成 ≠ Gate 通过）：
+1. 服务器按顺序跑通三个 Gate（实现完成 ≠ Gate 通过；Gate 0A 强制 `global_epoch=5`，smoke 先行）：
    ```bash
-   # Gate 0A：官方 parity（需 --official_repo 指向官方 FedTA 仓库本地克隆）
+   # Gate 0A smoke：官方 parity（需 --official_repo 指向官方 FedTA 仓库本地克隆）
    python tests/test_official_fedta_parity.py \
        --official_repo /path/to/official_FedTA \
-       --data_name cifar100 --data_path ./local_datasets --device cuda
+       --data_path ./local_datasets \
+       --global_epoch 5 --task_num 1 --rounds 5 --local_epoch 1 \
+       --batch_size 16 --surrogate_num 20 --threshold 0.25 \
+       --seed 42 --device cuda
 
-   # Gate 0B：resume 回归（resume 正好跨 task boundary）
+   # Gate 0A 正式短程（覆盖 task transition）
+   python tests/test_official_fedta_parity.py \
+       --official_repo /path/to/official_FedTA \
+       --data_path ./local_datasets \
+       --global_epoch 5 --task_num 2 --rounds 10 --local_epoch 1 \
+       --batch_size 16 --surrogate_num 20 --threshold 0.25 \
+       --seed 42 --device cuda
+
+   # Gate 0B：resume 回归（resume 正好跨 task boundary；ours vs ours，global_epoch=2 合法）
    python tests/test_resume_regression.py \
        --data_name cifar100 --data_path ./local_datasets \
-       --rounds 4 --split_at 2 --global_epoch 2 --task_num 2 --local_epoch 2
+       --rounds 4 --split_at 2 --global_epoch 2 --task_num 2 --local_epoch 2 \
+       --seed 42 --device cuda
 
    # Gate 0C：observer 不变性（rounds=3 跨 task 边界，覆盖 next-task split）
    python tests/test_observer_invariance.py \
        --data_name cifar100 --data_path ./local_datasets \
-       --rounds 3 --global_epoch 2 --task_num 2 --local_epoch 2
+       --rounds 3 --global_epoch 2 --task_num 2 --local_epoch 2 \
+       --seed 42 --device cuda
    ```
 2. 三个 Gate 全部 PASS 后打 tag `phase0-fedta-baseline`，冻结 baseline（`--method fedta` 从此视为 read-only scientific baseline）
 3. 实现 `diagnostics/check_feature_batch_sensitivity.py`（§5.9 规格）并运行，确认 $z_{\rm op}$ 是否为稳定的 sample-level semantic representation（**Phase 1-precheck**，不是 Phase 0 Gate）

@@ -39,6 +39,13 @@ Usage (ON THE SERVER, from the repo root):
   python tests/test_official_fedta_parity.py \
       --official_repo /path/to/official_FedTA \
       --data_path ./local_datasets
+
+global_epoch is FORCED to 5 (the frozen Phase-0 baseline): the official
+repo hardcodes the SIKF branch as `i % global_epoch != 4`, equivalent to
+this repo's `!= global_epoch - 1` only at global_epoch=5. Defaults are
+the smoke config (task_num=1, rounds=5, local_epoch=1, which already
+exercises the official `!= 4` branch at round 4); for the formal short
+run use --task_num 2 --rounds 10.
 """
 
 import argparse
@@ -54,7 +61,7 @@ import torch
 
 from test_resume_regression import (
     REPO_ROOT, max_diff, state_dict_diff, protos_diff, deep_equal, hash_obj,
-    require_outer_manifest,
+    require_outer_manifest, require_inner_split_state, validate_split_state,
 )
 
 # config modules tried in order inside the official repo (the fork renamed
@@ -382,12 +389,21 @@ def parse_args():
     p.add_argument("--data_path", default="./local_datasets",
                    help="dataset root for the fork side (and for the "
                         "official side if its spliter accepts data_path)")
-    p.add_argument("--rounds", default=4, type=int,
+    p.add_argument("--rounds", default=5, type=int,
                    help="total rounds; must equal task_num*global_epoch "
-                        "(the official repo always runs the full task loop)")
-    p.add_argument("--global_epoch", default=2, type=int)
-    p.add_argument("--task_num", default=2, type=int)
-    p.add_argument("--local_epoch", default=2, type=int,
+                        "(the official repo always runs the full task loop); "
+                        "default is the smoke config: 1 task x 5 rounds, "
+                        "which already covers the official `!= 4` SIKF "
+                        "branch at round 4")
+    p.add_argument("--global_epoch", default=5, type=int,
+                   help="MUST be 5: the official FedTA hardcodes the SIKF "
+                        "branch as `i %% global_epoch != 4`, which equals "
+                        "this repo's `!= global_epoch - 1` ONLY when "
+                        "global_epoch=5 (the frozen Phase-0 baseline)")
+    p.add_argument("--task_num", default=1, type=int,
+                   help="smoke default = 1 task; use 2 for the formal "
+                        "short-parity run (covers the task transition)")
+    p.add_argument("--local_epoch", default=1, type=int,
                    help="keep small: this only tests parity mechanics")
     p.add_argument("--client_num", default=5, type=int)
     p.add_argument("--private_class_num", default=15, type=int)
@@ -415,6 +431,20 @@ def run_main(extra):
 
 def main():
     args = parse_args()
+    # Gate 0A seal: parity against the official FedTA is only defined for
+    # the frozen global_epoch=5. The official repo hardcodes the SIKF
+    # branch as `i % global_epoch != 4`; this repo's parameterized
+    # `!= global_epoch - 1` equals it ONLY when global_epoch=5. Any other
+    # value would compare two DIFFERENT training paths (and a PASS there
+    # would itself be a red flag that the test is not measuring anything).
+    if args.global_epoch != 5:
+        raise SystemExit(
+            "Gate 0A official parity requires global_epoch=5: the official "
+            "FedTA hardcodes the SIKF branch as `i % global_epoch != 4`, "
+            "which equals this repo's `!= global_epoch - 1` ONLY when "
+            "global_epoch=5. Phase 0 freezes global_epoch=5. (Gate 0B/0C "
+            "may keep global_epoch=2: they compare ours-vs-ours, not "
+            "ours-vs-official.)")
     total = args.task_num * args.global_epoch
     if args.rounds != total:
         raise SystemExit(
@@ -550,11 +580,17 @@ def main():
             cprompt_diffs.append(state_dict_diff(cf.get("prompts"),
                                                  co.get("prompts")))
 
-        # inner 70/30 splits (fork uses int client/task keys -> normalize)
+        # inner 70/30 splits: fail-fast on missing/empty/invalid state on
+        # EITHER side (no {} == {} vacuous pass); every client must carry a
+        # split for every task the run reached. Fork uses int client/task
+        # keys -> normalize to str keys, matching the driver's dump format.
+        expected_tasks = list(range((args.rounds - 1) // args.global_epoch + 1))
         inner_fork = {str(cid): {str(t): s for t, s in tasks.items()}
-                      for cid, tasks in
-                      (ckpt.get("data_split_state") or {}).items()}
-        inner_official = dump["inner_splits"]
+                      for cid, tasks in require_inner_split_state(
+                          ckpt, str(run_dir), expected_tasks).items()}
+        inner_official = validate_split_state(dump["inner_splits"],
+                                              "official dump inner_splits",
+                                              expected_tasks)
         split_equal = bool(deep_equal(inner_fork, inner_official))
         outer_equal = bool(deep_equal(outer_fork, outer_official))
 

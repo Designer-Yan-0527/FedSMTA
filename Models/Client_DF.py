@@ -61,6 +61,10 @@ class Client_DF(object):
         # original random_split).
         self.data_split_indices = {}
 
+        # Phase-1 margin stats; ONLY written by evaluate_with_margin()
+        # (observer-only), never by the official evaluate()
+        self.last_margin_stats = None
+
 
         self.head = Chead(args.nb_classes)
 
@@ -328,6 +332,12 @@ class Client_DF(object):
 
 
     def evaluate(self,task=0,nb_classes=None):
+        """Official FedTA evaluate(), restored verbatim: accuracy only.
+
+        Phase-0/1 margin recording has been isolated into
+        evaluate_with_margin() so that --no_instrumentation gives the exact
+        official evaluation path (the only addition is `return float(acc)`,
+        which does not affect any computation)."""
         test_data = self.test_loader[task]
         test_loader = DataLoader(test_data,batch_size=8,shuffle=True)
         correct =0
@@ -336,10 +346,57 @@ class Client_DF(object):
         self.model.load_head(self.heads[task])
         self.model.to(self.device)
 
-        # Phase 1 diagnostics: margin = logit_y - max_{j != y} logit_j,
-        # recorded on the task-masked logits the prediction actually uses.
-        # Pure recording: does not change the returned accuracy or the
-        # training/eval logic.
+        for iteration, (input,target) in enumerate(test_loader):
+            input = input.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
+            # if iteration==0:
+            #     input_ = input[0]
+            #     self.model.forward_visual(input_)
+            with torch.no_grad():
+                if self.original_model is not None:
+                    output = self.original_model(input)
+                    output = output['pre_logits'].requires_grad_(False)
+                    output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
+                    pre, output_mixed, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+            logits = pre
+
+            # logits = output['logits']
+
+            # class_mask
+            mask = self.class_mask[task]
+            not_mask = np.setdiff1d(np.arange(nb_classes), mask)
+            not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
+            logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
+
+            predicts = torch.max(logits, dim=1)[1].cpu()
+            # print(predicts)
+            # print(target)
+            correct += (predicts == target.cpu()).sum()
+            total += len(target)
+
+        acc = 100 * correct / total
+
+        print(f'{acc}')
+        return float(acc)
+
+    def evaluate_with_margin(self,task=0,nb_classes=None):
+        """Observer-only variant of evaluate(): identical accuracy
+        computation, additionally records margin stats into
+        self.last_margin_stats.
+
+        margin = logit_y - max_{j != y} logit_j on the task-masked logits
+        the prediction actually uses. Pure recording: no RNG consumption,
+        no parameter change. Called ONLY from instrumentation paths
+        (evaluate_all_seen_tasks -> run_full_evaluation); the official
+        training loop must keep calling evaluate()."""
+        test_data = self.test_loader[task]
+        test_loader = DataLoader(test_data,batch_size=8,shuffle=True)
+        correct =0
+        total = 0
+
+        self.model.load_head(self.heads[task])
+        self.model.to(self.device)
+
         margin_list = []
 
         for iteration, (input,target) in enumerate(test_loader):
@@ -370,7 +427,7 @@ class Client_DF(object):
             correct += (predicts == target.cpu()).sum()
             total += len(target)
 
-            # Phase 1: margin recording (masked logits, y = ground truth)
+            # margin recording (masked logits, y = ground truth)
             with torch.no_grad():
                 logit_y = logits.gather(1, target.unsqueeze(1)).squeeze(1)
                 other = logits.scatter(1, target.unsqueeze(1), float('-inf'))
@@ -397,13 +454,13 @@ class Client_DF(object):
         left with the current task head loaded. Returns {task: accuracy}.
 
         Phase 1: also collects the per-task margin stats recorded by
-        evaluate() into self.last_margin_stats_by_task."""
+        evaluate_with_margin() into self.last_margin_stats_by_task."""
         results = {}
         margin_by_task = {}
         for task in range(self.task_id + 1):
             if task >= len(self.heads) or self.heads[task] is None:
                 continue
-            results[task] = self.evaluate(task, nb_classes)
+            results[task] = self.evaluate_with_margin(task, nb_classes)
             margin_by_task[task] = self.last_margin_stats
         self.last_margin_stats_by_task = margin_by_task
         return results

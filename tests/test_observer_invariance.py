@@ -10,9 +10,10 @@ Runs two short training runs:
   B) default (Phase-0 instrumentation ON)
 
 and compares the final checkpoints:
-  server model / global head / global protos / server prompt / fix_keys,
-  per-client heads / tail-anchor key / anchor_pool / prompts /
-  local+global protos, RNG states, inner 70/30 split indices (including
+  server model / global head / global+temp protos / server prompt /
+  fix_keys / existing_class, per-client heads / tail-anchor key /
+  anchor_pool / full tail-anchor state / prompts / local+global protos,
+  RNG states, inner 70/30 split indices (including
   the NEXT-TASK split: --rounds defaults to global_epoch + 1 so the run
   enters task 1 and its data split is compared too), and the federated
   outer split manifest.
@@ -43,7 +44,7 @@ import torch
 
 from test_resume_regression import (
     REPO_ROOT, max_diff, state_dict_diff, protos_diff, deep_equal, hash_obj,
-    require_outer_manifest,
+    require_outer_manifest, require_inner_split_state,
 )
 
 
@@ -131,19 +132,49 @@ def main():
         "obs_on checkpoint must record no_instrumentation=False")
 
     # ---------- training-trajectory comparison ----------
+    # false-pass guards: core states that MUST exist after >= 1 round
+    for ck, lbl in ((ckpt_off, str(run_off)), (ckpt_on, str(run_on))):
+        assert "temp_protos" in ck, (
+            f"{lbl}: checkpoint missing temp_protos (false-pass guard)")
+        assert ck["temp_protos"] is not None, (
+            f"{lbl}: temp_protos is None (fuse_protos never ran?)")
+        assert "existing_class" in ck, (
+            f"{lbl}: checkpoint missing existing_class (false-pass guard)")
+
     head_diffs = [state_dict_diff(ckpt_off["global_head"],
                                   ckpt_on["global_head"])]
-    key_diffs, anchor_diffs = [], []
+    key_diffs, anchor_diffs, ta_state_diffs = [], [], []
+    client_gproto_diffs, client_lproto_diffs = [], []
     for c_off, c_on in zip(ckpt_off["clients"], ckpt_on["clients"]):
         for h_off, h_on in zip(c_off["heads"], c_on["heads"]):
             head_diffs.append(state_dict_diff(h_off, h_on))
         ta_off, ta_on = c_off["tail_anchor_model"], c_on["tail_anchor_model"]
+        # full tail-anchor state (covers more than key/anchor_pool alone)
+        ta_state_diffs.append(state_dict_diff(ta_off, ta_on))
         key_diffs.append(max_diff(ta_off.get("key"), ta_on.get("key")))
         anchor_diffs.append(max_diff(ta_off.get("anchor_pool"),
                                      ta_on.get("anchor_pool")))
+        # per-client global/local protos must exist after >= 1 round
+        for c, lbl in ((c_off, str(run_off)), (c_on, str(run_on))):
+            assert c.get("global_protos") is not None, (
+                f"{lbl}: client {c['id']} global_protos is None "
+                "(false-pass guard)")
+            assert c.get("local_protos") is not None, (
+                f"{lbl}: client {c['id']} local_protos is None "
+                "(false-pass guard)")
+        client_gproto_diffs.append(protos_diff(c_off["global_protos"],
+                                               c_on["global_protos"]))
+        client_lproto_diffs.append(protos_diff(c_off["local_protos"],
+                                               c_on["local_protos"]))
 
-    inner_off, inner_on = (ckpt_off.get("data_split_state") or {},
-                           ckpt_on.get("data_split_state") or {})
+    # inner 70/30 splits: fail-fast on missing/empty/invalid state (no
+    # {} == {} vacuous pass); every client must carry a split for every task
+    # the run reached (thisclients = all clients every round, no sampling)
+    expected_tasks = list(range((rounds - 1) // args.global_epoch + 1))
+    inner_off = require_inner_split_state(ckpt_off, str(run_off),
+                                          expected_tasks)
+    inner_on = require_inner_split_state(ckpt_on, str(run_on),
+                                         expected_tasks)
     # Gate 0C seal: fail-fast on a missing/empty manifest (no {} == {} pass)
     outer_off = require_outer_manifest(ckpt_off, str(run_off))
     outer_on = require_outer_manifest(ckpt_on, str(run_on))
@@ -172,10 +203,14 @@ def main():
     comparison = {
         "completed_round_diff": abs(int(ckpt_off["completed_round"])
                                     - int(ckpt_on["completed_round"])),
+        "server_task_id_diff": abs(int(ckpt_off["server_task_id"])
+                                   - int(ckpt_on["server_task_id"])),
         "server_model_max_diff": state_dict_diff(ckpt_off["server_model"],
                                                  ckpt_on["server_model"]),
         "global_proto_max_diff": protos_diff(ckpt_off["global_protos"],
                                              ckpt_on["global_protos"]),
+        "temp_proto_max_diff": protos_diff(ckpt_off["temp_protos"],
+                                           ckpt_on["temp_protos"]),
         "prompt_max_diff": state_dict_diff(ckpt_off["server_prompt"],
                                            ckpt_on["server_prompt"]),
         "client_prompt_max_diff": client_prompt_diff(ckpt_off["clients"],
@@ -183,10 +218,18 @@ def main():
         "head_max_diff": max(head_diffs),
         "key_max_diff": max(key_diffs),
         "anchor_max_diff": max(anchor_diffs),
+        "tail_anchor_state_max_diff": (max(ta_state_diffs)
+                                       if ta_state_diffs else 0.0),
+        "client_global_proto_max_diff": (max(client_gproto_diffs)
+                                         if client_gproto_diffs else 0.0),
+        "client_local_proto_max_diff": (max(client_lproto_diffs)
+                                        if client_lproto_diffs else 0.0),
         # inner 70/30 splits; includes the NEXT-task split because rounds
         # runs into task 1
         "split_equal": bool(deep_equal(inner_off, inner_on)),
         "outer_split_equal": bool(deep_equal(outer_off, outer_on)),
+        "existing_class_equal": deep_equal(ckpt_off["existing_class"],
+                                           ckpt_on["existing_class"]),
         "fix_keys_equal": sorted(map(str, ckpt_off["fix_keys"]))
                           == sorted(map(str, ckpt_on["fix_keys"])),
     }
@@ -204,7 +247,8 @@ def main():
     # ---------- pass/fail report ----------
     report = []
     for name, diff in comparison.items():
-        if name in ("split_equal", "outer_split_equal", "fix_keys_equal"):
+        if name in ("split_equal", "outer_split_equal",
+                    "existing_class_equal", "fix_keys_equal"):
             report.append((name, diff is True, 0.0 if diff else float("inf"), ""))
         else:
             report.append((name, diff == 0.0, diff, ""))
