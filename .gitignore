@@ -1,0 +1,43 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ===== 数据集（体积巨大，不入库）=====
+# CIFAR-100 会由 torchvision 自动下载；ImageNet-R 需手动放置 imagenet-r.tar
+local_datasets/
+*.tar
+*.tar.gz
+
+# ===== 训练产物（run 目录：日志 / checkpoint / 指标）=====
+output/
+runs/
+*.log
+
+# ===== 模型权重 =====
+# ViT-B_16.npz 约 394MB，超过 GitHub 单文件 100MB 限制，无法推送。
+# 服务器上需手动放置到 pretrain_model/ViT-B_16.npz，
+# 或按 README.md 改为 timm 在线加载预训练权重。
+pretrain_model/
+*.pth
+*.pt
+*.ckpt
+*.npz
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 临时文件 =====
+*.tmp
+~$*
