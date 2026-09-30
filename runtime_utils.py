@@ -31,7 +31,7 @@ import torch
 RUNTIME_ONLY_ARGS = {
     "run_name", "resume", "output_dir", "save_every", "keep_last",
     "eval_all_every", "num_workers", "pin_mem", "device", "eval",
-    "max_rounds", "deterministic",
+    "max_rounds", "deterministic", "no_instrumentation",
 }
 
 

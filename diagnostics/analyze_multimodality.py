@@ -55,8 +55,10 @@ def parse_args():
                    help="aggregate JSON (default: alongside out_csv, multimodality_aggregate.json)")
     p.add_argument("--feature", default="both", choices=["z_ref", "z_op", "both"],
                    help="which feature set to analyze (default: both)")
-    p.add_argument("--split", default="train", choices=["train", "test", "all"],
-                   help="which split to use (default: train; modes must be discovered on TRAIN only)")
+    p.add_argument("--split", default="train", choices=["train"],
+                   help="which split to use. Semantic mode discovery MUST use "
+                        "TRAIN features only; test/all are intentionally "
+                        "not allowed (test-leakage guard).")
     p.add_argument("--all_classes", action="store_true",
                    help="analyze all classes instead of public classes only")
     p.add_argument("--gmm_seed", default=0, type=int)
@@ -225,6 +227,14 @@ def plot_class(out_png, z, client_ids_c, task_ids_c, stats):
 
 def main():
     args = parse_args()
+    # Hard guard (belt and braces with choices=["train"]): fitting GMMs /
+    # computing BIC/NLL on test features would be test leakage and must
+    # never be possible, even if the choices list is widened later.
+    if args.split != "train":
+        raise ValueError(
+            "Semantic mode discovery must use TRAIN features only "
+            f"(got --split {args.split!r}).")
+
     data = np.load(args.features)
     meta_path = Path(args.features).with_suffix(".json")
     meta = json.loads(meta_path.read_text(encoding="utf-8")) \
@@ -235,12 +245,7 @@ def main():
     task_ids = data["task_ids"]
     splits = data["splits"]
 
-    if args.split == "train":
-        keep = splits == 0
-    elif args.split == "test":
-        keep = splits == 1
-    else:
-        keep = np.ones(len(labels), dtype=bool)
+    keep = splits == 0  # TRAIN split only (test-leakage guard)
 
     if args.all_classes:
         target_classes = sorted(int(c) for c in np.unique(labels[keep]))

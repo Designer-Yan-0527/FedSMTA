@@ -1,8 +1,15 @@
-"""Phase 1 diagnostic: Oracle-K2 controlled experiment (upper-bound probe).
+"""Phase 1 diagnostic: SYNTHETIC Oracle-K2 stress test (sanity check).
 
-Question answered here: if the true semantic modes were KNOWN, would
-multi-mode key/anchor slots recover the accuracy that FedTA's single
-key-routed anchor loses on multimodal class representations?
+*** NOT the real Oracle-K2 experiment ***
+
+This script answers ONLY: "if we ARTIFICIALLY inject two well-separated
+modes into the features (z' = z + s*delta*v_c) and hand the model the
+TRUE mode labels, can K=2 mode-specific key/anchor slots exploit them?"
+It is a synthetic sanity check of the anchor machinery, NOT evidence
+about real CIFAR/ImageNet-R multimodality. The real Phase-2 Oracle-K2
+must be built from semantic modes discovered on real TRAIN features by
+analyze_multimodality.py. Never cite this script's numbers as
+"Oracle-K2 proves real multimodality improves FedTA".
 
 Protocol (feature level, on the pre-anchor features extracted by
 diagnostics/extract_features.py -- NEVER [z;anchor]):
@@ -32,9 +39,9 @@ EQUALLY to both methods so the K1-vs-K2 comparison stays controlled):
   - dropout inactive at evaluation (eval mode).
 
 Usage (from repo root, on the server):
-  python diagnostics/oracle_k2.py \
+  python diagnostics/synthetic_oracle_k2.py \
       --features diagnostics_output/features_cifar100_task_04_end.npz \
-      --out_dir diagnostics_output/oracle_k2 \
+      --out_dir diagnostics_output/synthetic_oracle_k2 \
       --deltas 0,0.25,0.5,1.0,2.0
 """
 
@@ -405,11 +412,12 @@ def mode_separation(blocks, V, delta, nb_classes):
 
 
 def main():
-    p = argparse.ArgumentParser("Phase-1 Oracle-K2 controlled experiment")
+    p = argparse.ArgumentParser(
+        "Phase-1 SYNTHETIC Oracle-K2 stress test (sanity check)")
     p.add_argument("--features", required=True,
                    help="features .npz from extract_features.py (needs train+test splits: "
                         "extract with --split both)")
-    p.add_argument("--out_dir", default="diagnostics_output/oracle_k2")
+    p.add_argument("--out_dir", default="diagnostics_output/synthetic_oracle_k2")
     p.add_argument("--deltas", default="0,0.25,0.5,1.0,2.0",
                    help="comma-separated mode separations (delta)")
     p.add_argument("--methods", default="fedta_k1,oracle_k2")
@@ -464,17 +472,25 @@ def main():
         w.writeheader()
         w.writerows(summaries)
 
-    meta = {"features": str(args.features), "seed": args.seed,
+    meta = {"experiment": "synthetic_oracle_k2_stress_test",
+            "features": str(args.features), "seed": args.seed,
             "deltas": deltas, "methods": methods,
             "global_epoch": args.global_epoch,
             "local_epoch": args.local_epoch,
             "batch_size": args.batch_size, "lr": args.lr,
+            "note": "SYNTHETIC modes (z' = z + s*delta*v_c) with oracle mode "
+                    "labels; sanity check of the K2 anchor machinery only -- "
+                    "NOT evidence about real-data multimodality. The real "
+                    "Phase-2 Oracle-K2 must use semantic modes discovered on "
+                    "real TRAIN features by analyze_multimodality.py.",
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     with open(out_dir / "oracle_k2_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     print(f"\nsaved {out_dir/'oracle_k2_results.csv'}")
     print(f"saved {out_dir/'oracle_k2_summary.csv'}")
+    print("\n===== Synthetic Oracle-K2 Stress Test (sanity check; "
+          "NOT the real Oracle-K2 on FedTA semantic modes) =====")
     print("\n===== summary =====")
     for s in summaries:
         print(s)

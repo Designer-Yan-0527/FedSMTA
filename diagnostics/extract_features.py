@@ -11,7 +11,7 @@ Per the Phase-1 spec, [z; anchor] mixed features are NEVER used here.
 Output: one .npz (z_ref, z_op, labels, client_ids, task_ids, round_ids,
 splits, sample_idx) plus a .json meta file (class masks, public classes,
 run info, checkpoint round) consumable by analyze_multimodality.py /
-oracle_k2.py.
+synthetic_oracle_k2.py.
 
 Usage (from repo root, on the server):
   python diagnostics/extract_features.py \
@@ -137,12 +137,21 @@ def main():
         sample_idx=np.concatenate(idx_all) if idx_all else np.zeros((0,), np.int64),
     )
 
-    # meta: class masks + public classes (classes present at >= 2 clients)
-    labels = np.concatenate(labels_all) if labels_all else np.zeros((0,), np.int64)
-    client_ids = np.concatenate(clients_all) if clients_all else np.zeros((0,), np.int64)
+    # meta: class masks + public classes.
+    # public/private is a property of the federated DATA PROTOCOL (class
+    # masks), NOT of the extracted feature samples: a class is public iff
+    # it appears in >= 2 clients' class masks. (The old fallback inferred
+    # public classes from the extracted samples, which conflated the
+    # protocol with feature-data statistics.)
+    class_to_clients = {}
+    for c in server.clients:
+        this_client_classes = set()
+        for task_classes in c.class_mask:
+            this_client_classes.update(int(x) for x in task_classes)
+        for cls in this_client_classes:
+            class_to_clients.setdefault(cls, set()).add(c.id)
     public_classes = sorted(
-        int(c) for c in np.unique(labels)
-        if len(np.unique(client_ids[labels == c])) >= 2)
+        cls for cls, cs in class_to_clients.items() if len(cs) >= 2)
 
     meta = {
         "run_dir": str(Path(args_cli.run_dir).resolve()),

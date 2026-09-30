@@ -1,7 +1,12 @@
 import argparse
 
 def get_args_parser(subparsers):
-    subparsers.add_argument('--batch-size', default=16, type=int, help='Batch size per device')
+    # both dash and underscore spellings are accepted (the regression test
+    # scripts historically used the underscore form)
+    subparsers.add_argument('--batch-size', '--batch_size', dest='batch_size',
+                            default=16, type=int,
+                            help='Batch size per device (SIKF distillation loader; '
+                                 'local training stays at the official hardcoded 16)')
     subparsers.add_argument('--epochs', default=5, type=int)
 
     # Model parameters
@@ -50,7 +55,11 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--recount', type=int, default=1, help='Random erase count (default: 1)')
 
     # Data parameters
-    subparsers.add_argument('--data-path', default='./local_datasets', type=str, help='dataset root path')
+    # both dash and underscore spellings are accepted (the regression test
+    # scripts historically used the underscore form)
+    subparsers.add_argument('--data-path', '--data_path', dest='data_path',
+                            default='./local_datasets', type=str,
+                            help='dataset root path')
     subparsers.add_argument('--shuffle', default=False, help='shuffle the data order')
     subparsers.add_argument('--output_dir', default='output/', help='path where to save, empty for no saving')
     subparsers.add_argument('--device', default='cuda', help='device to use for training / testing')
@@ -139,6 +148,13 @@ def get_args_parser(subparsers):
                             help='Stop after N global rounds (0 = full task_num*global_epoch). '
                                  'Engineering-only switch for the resume regression test; '
                                  'does not change per-round training logic.')
+    subparsers.add_argument('--no_instrumentation', action='store_true',
+                            help='Disable the Phase-0 observer instrumentation '
+                                 '(train_log.csv local-phase evaluation, full '
+                                 'seen-task evaluation, margin CSV output). '
+                                 'Engineering-only switch used by '
+                                 'tests/test_observer_invariance.py to prove the '
+                                 'observers do not perturb the training trajectory.')
 
 
 

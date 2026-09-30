@@ -11,10 +11,12 @@ without it, small CUDA nondeterminism may appear and the test falls back
 to reporting max diffs.
 
 Writes metrics/baseline_verification.json under --work_dir containing the
-Phase-0 baseline records for both runs (split hashes, checksums of protos /
-head / prompt / keys / anchors / RNG) and the comparison fields:
+Phase-0 baseline records for both runs (outer federated split manifest
+hash, inner 70/30 split index hashes, checksums of protos / head / prompt
+/ keys / anchors / RNG) and the comparison fields:
   accuracy_max_diff, global_proto_max_diff, prompt_max_diff,
-  head_max_diff, key_max_diff, anchor_max_diff, split_equal.
+  head_max_diff, key_max_diff, anchor_max_diff, split_equal,
+  outer_split_equal.
 
 Gate 0: Phase 1 is only allowed when result == PASS.
 
@@ -162,6 +164,7 @@ def matrix_diff(ma, mb):
 
 def baseline_records(run_dir, ckpt):
     """The Phase-0 baseline verification record of one run."""
+    # inner 70/30 split indices (relative to each client-task subset)
     split_state = ckpt.get("data_split_state") or {}
     split_index_hashes = {}
     for cid, tasks in split_state.items():
@@ -169,6 +172,10 @@ def baseline_records(run_dir, ckpt):
         for t, splits in tasks.items():
             per_task[str(t)] = {k: hash_obj(v) for k, v in splits.items()}
         split_index_hashes[str(cid)] = per_task
+
+    # TRUE federated outer partition (raw sample indices + class masks per
+    # client-task), as recorded in the checkpoint manifest
+    outer_manifest = ckpt.get("outer_split_manifest") or {}
 
     key_cs, anchor_cs, head_cs = {}, {}, {}
     for c in ckpt["clients"]:
@@ -184,7 +191,8 @@ def baseline_records(run_dir, ckpt):
     return {
         "run_dir": str(run_dir),
         "completed_round": int(ckpt["completed_round"]),
-        "outer_split_hash": hash_obj(split_state),
+        "outer_split_hash": hash_obj(outer_manifest),
+        "inner_split_hash": hash_obj(split_state),
         "split_index_hashes": split_index_hashes,
         "accuracy_matrix_hash": mat_hash,
         "global_protos_checksum": hash_obj(ckpt.get("global_protos")),
@@ -202,7 +210,7 @@ def main():
     if args.split_at >= args.rounds:
         raise SystemExit("--split_at must be < --rounds")
 
-    base = ["--data_name", args.data_name, "--data_path", args.data_path,
+    base = ["--data_name", args.data_name, "--data-path", args.data_path,
             "--seed", str(args.seed), "--device", args.device,
             "--global_epoch", str(args.global_epoch),
             "--task_num", str(args.task_num),
@@ -239,6 +247,10 @@ def main():
                                     ckpt_b.get("data_split_state") or {})
     split_equal = deep_equal(split_state_a, split_state_b)
 
+    outer_a, outer_b = (ckpt_a.get("outer_split_manifest") or {},
+                        ckpt_b.get("outer_split_manifest") or {})
+    outer_equal = deep_equal(outer_a, outer_b)
+
     ma, mb = load_matrix(run_a), load_matrix(run_b)
 
     comparison = {
@@ -255,6 +267,7 @@ def main():
         "anchor_max_diff": max(anchor_diffs),
         "accuracy_max_diff": matrix_diff(ma, mb),
         "split_equal": bool(split_equal),
+        "outer_split_equal": bool(outer_equal),
         "fix_keys_equal": sorted(map(str, ckpt_a["fix_keys"]))
                           == sorted(map(str, ckpt_b["fix_keys"])),
     }
@@ -272,7 +285,7 @@ def main():
     # ---------- pass/fail report ----------
     report = []
     for name, diff in comparison.items():
-        if name in ("split_equal", "fix_keys_equal"):
+        if name in ("split_equal", "outer_split_equal", "fix_keys_equal"):
             report.append((name, diff is True, 0.0 if diff else float("inf"), ""))
         else:
             report.append((name, diff == 0.0, diff, ""))

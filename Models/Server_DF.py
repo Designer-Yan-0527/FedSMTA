@@ -60,6 +60,12 @@ class Server_DF(object):
 
         # Phase 0: round-boundary checkpoint / resume state
         self.run_manager = run_manager
+        # Phase 0: observer instrumentation switch (tests/test_observer_
+        # invariance.py runs with it OFF to prove the extra evaluations do
+        # not perturb the training trajectory). Official FedTA behavior =
+        # no instrumentation; ON adds RNG-guarded observers only.
+        self.instrumentation = not bool(
+            getattr(args, 'no_instrumentation', False))
         self.start_round = 0
         self.prompt = None
         self.accuracy_records = (
@@ -138,7 +144,8 @@ class Server_DF(object):
 
             # Phase 0: local-phase accuracies (after local training, before
             # aggregation) -> metrics/train_log.csv
-            if self.run_manager is not None:
+            # (skipped entirely under --no_instrumentation)
+            if self.run_manager is not None and self.instrumentation:
                 self._log_local_phase(i)
 
             # FedTA
@@ -191,7 +198,9 @@ class Server_DF(object):
             do_eval = is_task_end or (
                 eval_all_every and eval_all_every > 0
                 and (i + 1) % eval_all_every == 0)
-            if do_eval:
+            # full seen-task evaluation is Phase-0 instrumentation; it is
+            # RNG-guarded and skipped entirely under --no_instrumentation
+            if do_eval and self.instrumentation:
                 self.run_full_evaluation(i)
 
             self.append_round_metrics(i)
@@ -664,6 +673,25 @@ class Server_DF(object):
             raise ValueError(
                 "Checkpoint mismatch:\n" + "\n".join(mismatches))
 
+    def build_outer_split_manifest(self):
+        """The true federated outer partition manifest: for every client and
+        task, the raw sample indices (into the ORIGINAL train set, BEFORE the
+        per-task 70/30 random_split) plus the class mask. data_split_state
+        only records the inner 70/30 indices relative to these subsets, so
+        without this manifest a checkpoint is not self-contained w.r.t. the
+        data protocol."""
+        manifest = {}
+        for i in range(self.client_num):
+            per_task = {}
+            for t in range(self.task_num):
+                subset = self.client_data[i][t]
+                per_task[str(t)] = {
+                    "raw_indices": [int(x) for x in subset.indices],
+                    "class_mask": [int(c) for c in self.class_mask[i][t]],
+                }
+            manifest[str(i)] = per_task
+        return manifest
+
     def build_checkpoint(self, round_id):
         return {
             "version": 1,
@@ -688,6 +716,10 @@ class Server_DF(object):
 
             "data_split_state": {c.id: c.data_split_indices
                                  for c in self.clients},
+
+            # true outer federated partition (raw sample indices + class
+            # masks), verified against the regenerated partition on resume
+            "outer_split_manifest": self.build_outer_split_manifest(),
 
             "args": vars(self.args),
         }
@@ -725,6 +757,23 @@ class Server_DF(object):
         checkpoint = load_checkpoint_file(ckpt_path)
 
         self.validate_checkpoint_args(checkpoint.get("args", {}))
+
+        # Phase 0: the federated outer partition is regenerated from the
+        # seed; verify it is bit-identical to the manifest stored in the
+        # checkpoint (raw sample indices + class masks per client-task).
+        # Old checkpoints without a manifest are still accepted.
+        ckpt_manifest = checkpoint.get("outer_split_manifest")
+        if ckpt_manifest is not None:
+            current_manifest = self.build_outer_split_manifest()
+            if ckpt_manifest != current_manifest:
+                raise ValueError(
+                    "Federated outer split manifest mismatch: the partition "
+                    "regenerated from this seed does NOT match the one "
+                    "recorded in the checkpoint. Refusing to resume with a "
+                    "different data partition (check seed / client_num / "
+                    "task_num / private_class_num / data_name / data_path).")
+            print("[checkpoint] outer split manifest verified "
+                  "(bit-identical raw indices + class masks)")
 
         self.task_id = checkpoint["server_task_id"]
         self.existing_class = set(checkpoint.get("existing_class", []))
