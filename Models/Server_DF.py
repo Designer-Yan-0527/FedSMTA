@@ -747,21 +747,31 @@ class Server_DF(object):
 
     def run_full_evaluation(self, round_id):
         """Evaluate every client on every seen task (task0 -> current) and
-        persist the full accuracy matrix."""
+        persist the full accuracy matrix.
+
+        Phase 0: the evaluation must not perturb the training RNG stream,
+        so the RNG state is snapshotted before evaluating and restored
+        afterwards (also on exception). The next round then sees exactly
+        the random state it would have seen without the evaluation, and
+        checkpointed RNG states stay evaluation-free."""
         after_task = round_id // self.global_epoch
         print(f"===== Full seen-task evaluation after task {after_task} "
               f"(round {round_id}) =====")
-        all_client_results = {}
-        for client in self.clients:
-            results = client.evaluate_all_seen_tasks(self.args.nb_classes)
-            all_client_results[client.id] = results
-            for test_task, acc in results.items():
-                self.accuracy_records.append({
-                    "client_id": client.id,
-                    "after_task": after_task,
-                    "test_task": test_task,
-                    "accuracy": acc,
-                })
+        rng_snapshot = rng_state_dict()
+        try:
+            all_client_results = {}
+            for client in self.clients:
+                results = client.evaluate_all_seen_tasks(self.args.nb_classes)
+                all_client_results[client.id] = results
+                for test_task, acc in results.items():
+                    self.accuracy_records.append({
+                        "client_id": client.id,
+                        "after_task": after_task,
+                        "test_task": test_task,
+                        "accuracy": acc,
+                    })
+        finally:
+            restore_rng_state(rng_snapshot)
         if self.run_manager is not None:
             self.run_manager.write_accuracy_csvs(
                 self.accuracy_records, self.task_num)
