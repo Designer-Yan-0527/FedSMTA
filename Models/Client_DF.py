@@ -257,8 +257,11 @@ class Client_DF(object):
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
 
-        self.evaluate(0, self.nb_classes)
-        self.evaluate(self.task_id,self.nb_classes)
+        acc_task0 = self.evaluate(0, self.nb_classes)
+        acc_current = self.evaluate(self.task_id,self.nb_classes)
+        # Phase 0: return the (unchanged) evaluation results so the server
+        # can log them to metrics/train_log.csv; behavior is identical.
+        return {0: acc_task0, self.task_id: acc_current}
 
     def get_global_proto_and_head_no_test(self, proto, head, prompt, round):
         self.global_protos = deepcopy(proto)

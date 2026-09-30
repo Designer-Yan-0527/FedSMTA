@@ -18,7 +18,7 @@ FedSMTA/
 ├── test.py                           # 一次性数据脚本（从 imagenet2012 每类采样，非测试文件）
 │
 ├── config/
-│   └── cifar100_delay.py            # 全部命令行参数定义（cifar100 / ImageNet-R 共用，
+│   └── datasets_delay.py            # 全部命令行参数定义（cifar100 / ImageNet-R 共用，
 │                                     #   数据集由 --data_name 选择）
 │
 ├── data/                             # 数据集加载与划分
@@ -57,7 +57,7 @@ FedSMTA/
 
 ```
 main.py
-  ├─ 解析参数（config/cifar100_delay.py）
+  ├─ 解析参数（config/datasets_delay.py）
   ├─ 固定种子（torch / numpy / random）
   ├─ RunManager(args)                 # 建 run 目录、Tee 日志、解析 resume 目标
   ├─ 数据划分（cifar100 / ImageNet-R spliter）

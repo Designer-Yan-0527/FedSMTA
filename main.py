@@ -9,7 +9,7 @@ from torch.backends import cudnn
 from torch.utils.data import DataLoader
 
 from Models.Server_DF import Server_DF
-from config.cifar100_delay import get_args_parser
+from config.datasets_delay import get_args_parser
 from runtime_utils import RunManager
 
 from timm.models import create_model
@@ -139,9 +139,9 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('FedTA training and evaluation configs')
 
-    # this project only registers the cifar100_delay config; the dataset is
+    # single neutral entry point for both datasets; the dataset is
     # selected with --data_name (cifar100 / ImageNet-R)
-    config = 'cifar100_delay'
+    config = 'datasets_delay'
 
     subparser = parser.add_subparsers(dest='subparser_name')
     config_parser = subparser.add_parser(config, help='FedTA configs (cifar100 / ImageNet-R)')

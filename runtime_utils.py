@@ -59,13 +59,23 @@ class Tee(object):
         self.stream = stream
         self.file = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
 
+    @staticmethod
+    def _file_payload(data):
+        """tqdm repaints its progress bar with \\r frames (no newline);
+        only newline-terminated lines go to the log file, so train.log
+        stays small and readable. The terminal still shows the live bar.
+        A final 100% frame ends with \\n and is therefore kept."""
+        if '\r' not in data:
+            return data
+        return ''.join(seg for seg in data.split('\r') if seg.endswith('\n'))
+
     def write(self, data):
         try:
             self.stream.write(data)
         except Exception:
             pass
         try:
-            self.file.write(data)
+            self.file.write(self._file_payload(data))
         except Exception:
             pass
 
@@ -360,6 +370,24 @@ class RunManager(object):
                             if aa == a and tt == t]
                     row.append(f"{sum(vals) / len(vals):.2f}" if vals else "")
                 w.writerow(row)
+
+    def append_train_log_rows(self, rows):
+        """Append structured per-round / per-client accuracy rows to
+        metrics/train_log.csv (round,task,client,phase,test_task,accuracy).
+        The full console log stays in logs/train.log; this CSV is the
+        structured training log. Append-mode so resume extends the file."""
+        if not rows:
+            return
+        path = self.metrics_dir / "train_log.csv"
+        exists = path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if not exists:
+                w.writerow(["round", "task", "client",
+                            "phase", "test_task", "accuracy"])
+            for r in rows:
+                w.writerow([r["round"], r["task"], r["client"], r["phase"],
+                            r["test_task"], f"{r['accuracy']:.2f}"])
 
     # -- logging ------------------------------------------------------------
 

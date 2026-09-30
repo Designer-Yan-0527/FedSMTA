@@ -59,11 +59,11 @@ To train a model via command line:
 
 Single node with single gpu
 
-config_file can be chosen from['cifar100_delay','imagenet_r_delay']. For example, the training process of CIFAR-100 can be started by:
+The config_file is 'datasets_delay' for both datasets. For example, the training process of CIFAR-100 can be started by:
 
 ```
 python main.py \
-       cifar100_delay \   #config_file
+       datasets_delay \   #config_file
        --model vit_base_patch16_224 \
        --batch-size 4 \
        --data-path local_datasets/ \
@@ -71,7 +71,7 @@ python main.py \
        --data_name cifar100
 ```
 
-Notice that you can also run Imagenet-R with 'cifar100_delay' as the config_file.
+To run ImageNet-R, use the same config_file with `--data_name ImageNet-R`.
 
 
 

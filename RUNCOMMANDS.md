@@ -1,20 +1,20 @@
 # FedTA 运行命令
 
 本项目只支持 `cifar100` 和 `ImageNet-R` 两个数据集，通过 `--data_name` 选择。
-所有参数定义在 `config/cifar100_delay.py`，两个数据集共用同一套参数。
+所有参数定义在 `config/datasets_delay.py`，两个数据集共用同一套参数。
 
 ## 1. 基本调用格式
 
 ```bash
-python main.py cifar100_delay --data_name {cifar100|ImageNet-R} [其他参数]
+python main.py datasets_delay --data_name {cifar100|ImageNet-R} [其他参数]
 ```
 
-> `cifar100_delay` 是子命令名（必带），与数据集无关；数据集由 `--data_name` 决定。
+> `datasets_delay` 是子命令名（必带），与数据集无关；数据集由 `--data_name` 决定。
 
 ## 2. 运行 CIFAR-100
 
 ```bash
-python main.py cifar100_delay \
+python main.py datasets_delay \
     --data_name cifar100 \
     --data_path ./local_datasets \
     --client_num 5 \
@@ -32,7 +32,7 @@ python main.py cifar100_delay \
 ## 3. 运行 ImageNet-R
 
 ```bash
-python main.py cifar100_delay \
+python main.py datasets_delay \
     --data_name ImageNet-R \
     --data_path ./local_datasets \
     --surrogate_num 5 \
@@ -88,10 +88,10 @@ python main.py cifar100_delay \
 
 ```bash
 # 方式一：自动从最近 checkpoint 恢复（要求 --run_name 等参数与原运行一致）
-python main.py cifar100_delay --data_name cifar100 --run_name <原run_name> --resume auto
+python main.py datasets_delay --data_name cifar100 --run_name <原run_name> --resume auto
 
 # 方式二：显式指定 checkpoint 路径（run_dir 自动从路径推断）
-python main.py cifar100_delay --data_name cifar100 \
+python main.py datasets_delay --data_name cifar100 \
     --resume output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_02_end.pth
 ```
 

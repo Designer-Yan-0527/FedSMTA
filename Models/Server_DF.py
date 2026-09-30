@@ -130,6 +130,11 @@ class Server_DF(object):
             for j in self.thisclients:
                 self.clients[j].train(round=i,args=self.args)
 
+            # Phase 0: local-phase accuracies (after local training, before
+            # aggregation) -> metrics/train_log.csv
+            if self.run_manager is not None:
+                self._log_local_phase(i)
+
             # FedTA
             # if i ==15 or i==16:
             #     for j in self.thisclients:
@@ -150,14 +155,25 @@ class Server_DF(object):
             self.fed_avg_head(self.thisclients)
 
             print('Server aggregation Compelte, results are ()：')
+            # Phase 0: collect the (already existing) post-broadcast
+            # evaluation results for metrics/train_log.csv
+            server_rows = []
             for j in range(self.client_num):
                 # FedTA
                 if j in self.thisclients:
-                    self.clients[j].get_global_proto_and_head(self.global_protos,self.global_head,self.prompt,i)
+                    result = self.clients[j].get_global_proto_and_head(self.global_protos,self.global_head,self.prompt,i)
+                    if result:
+                        for t, acc in result.items():
+                            server_rows.append({
+                                "round": i, "task": i // self.global_epoch,
+                                "client": j, "phase": "server",
+                                "test_task": t, "accuracy": acc})
                     print('-------')
 
                 else:
                     self.clients[j].get_global_proto_and_head_no_test(self.global_protos, self.global_head, self.prompt, i)
+            if self.run_manager is not None:
+                self.run_manager.append_train_log_rows(server_rows)
 
 
             # ---------------- Phase 0: evaluation / metrics / checkpoint ----------------
@@ -744,6 +760,34 @@ class Server_DF(object):
     # ------------------------------------------------------------------
     # Phase 0: full seen-task evaluation + metrics
     # ------------------------------------------------------------------
+
+    def _log_local_phase(self, round_id):
+        """Phase 0: local-phase accuracy (after local training, before
+        aggregation) for metrics/train_log.csv.
+
+        RNG-snapshot guarded: this extra evaluation is NOT part of the
+        original FedTA loop, so it must not perturb the training random
+        stream (unlike the post-broadcast evaluation, which is original
+        behavior)."""
+        task = round_id // self.global_epoch
+        rows = []
+        rng_snapshot = rng_state_dict()
+        try:
+            for j in self.thisclients:
+                client = self.clients[j]
+                for t in sorted({0, client.task_id}):
+                    if (t < 0 or t > client.task_id
+                            or t >= len(client.heads)
+                            or client.heads[t] is None
+                            or t >= len(client.test_loader)):
+                        continue
+                    acc = client.evaluate(t, self.args.nb_classes)
+                    rows.append({"round": round_id, "task": task, "client": j,
+                                 "phase": "local", "test_task": t,
+                                 "accuracy": acc})
+        finally:
+            restore_rng_state(rng_snapshot)
+        self.run_manager.append_train_log_rows(rows)
 
     def run_full_evaluation(self, round_id):
         """Evaluate every client on every seen task (task0 -> current) and
