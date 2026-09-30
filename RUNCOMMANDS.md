@@ -27,7 +27,7 @@ python main.py cifar100_delay \
     --seed 42
 ```
 
-数据集准备：CIFAR-100 由 torchvision 自动下载到 `--data_path` 指定目录，无需手动操作。
+数据集准备：**本地导入，不联网下载**。`--data_path` 目录下需已存在 `cifar-100-python/`（解压后的 CIFAR-100）；数据缺失时直接报错，不会自动下载。
 
 ## 3. 运行 ImageNet-R
 
@@ -46,10 +46,10 @@ python main.py cifar100_delay \
     --seed 42
 ```
 
-数据集准备：
+数据集准备（**本地导入，不联网下载**）：
 
-1. 将 `imagenet-r.tar` 放到 `--data_path` 目录下；
-2. 首次运行会自动解压，并做**一次性**的 80/20 随机划分（把图片移动到 `train/`、`test/` 子目录，之后直接复用，不会重复划分）；
+1. `--data_path` 目录下需已存在 `imagenet-r/`（解压后的 200 个类别目录）或 `imagenet-r.tar`（存在 tar 且未解压时会本地解压）；数据缺失时直接报错，不会自动下载；
+2. 首次运行会做**一次性**的 80/20 随机划分（把图片移动到 `imagenet-r/train/`、`imagenet-r/test/` 子目录，之后直接复用，不会重复划分）；
 3. ImageNet-R 共 30000 张图片、200 类，`args.nb_classes` 自动设为 200。
 
 > **注意**：`--surrogate_num` 现在真正生效（旧代码硬编码为 5）。如果想保持与旧代码完全一致的行为，请显式传 `--surrogate_num 5`；默认值为 20。

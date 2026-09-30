@@ -38,7 +38,7 @@ class ImagenetR_spliter():
     # 分成client_num数目个subset,每个subset里包含了task个subsubset
     def random_split(self):
         trans = build_transform(True,self.input_size)
-        self.Imagenet_R = Imagenet_R(root=self.data_path, train=True, download=True)
+        self.Imagenet_R = Imagenet_R(root=self.data_path, train=True, download=False)
         trainset = self.Imagenet_R
 
         # 100个类别的数据分给三个客户端使用
@@ -128,7 +128,7 @@ class ImagenetR_spliter():
 
     def process_testdata(self,surrogate_num):
         trans = build_transform(False,self.input_size)
-        self.Imagenet_R_test = Imagenet_R(root=self.data_path, train=False, download=True)
+        self.Imagenet_R_test = Imagenet_R(root=self.data_path, train=False, download=False)
         testset = self.Imagenet_R_test
         # 100个类别的数据分给三个客户端使用
 
@@ -161,7 +161,7 @@ class ImagenetR_spliter():
 
     def random_split_synchron(self):
         trans = build_transform(True,self.input_size)
-        self.Imagenet_R = Imagenet_R(root=self.data_path, train=True, download=True)
+        self.Imagenet_R = Imagenet_R(root=self.data_path, train=True, download=False)
         trainset = self.Imagenet_R
 
         # 100个类别的数据分给三个客户端使用

@@ -42,7 +42,7 @@ class cifar100_Data_Spliter():
     # 分成client_num数目个subset,每个subset里包含了task个subsubset
     def random_split(self):
         trans = build_transform(True,self.input_size)
-        self.cifar100_dataset = CIFAR100(root=self.data_path, train=True, download=True)
+        self.cifar100_dataset = CIFAR100(root=self.data_path, train=True, download=False)
         trainset = self.cifar100_dataset
 
         # 100个类别的数据分给三个客户端使用
@@ -108,7 +108,7 @@ class cifar100_Data_Spliter():
 
     def process_testdata(self,surrogate_num):
         trans = build_transform(False,self.input_size)
-        self.cifar100_dataset = CIFAR100(root=self.data_path, train=False, download=True)
+        self.cifar100_dataset = CIFAR100(root=self.data_path, train=False, download=False)
         testset = self.cifar100_dataset
         # 100个类别的数据分给三个客户端使用
 
@@ -140,7 +140,7 @@ class cifar100_Data_Spliter():
 
     def random_split_synchron(self):
         trans = build_transform(True,self.input_size)
-        self.cifar100_dataset = CIFAR100(root=self.data_path, train=True, download=True)
+        self.cifar100_dataset = CIFAR100(root=self.data_path, train=True, download=False)
         trainset = self.cifar100_dataset
 
         # 100个类别的数据分给三个客户端使用
