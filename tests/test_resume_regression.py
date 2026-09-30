@@ -31,6 +31,7 @@ import argparse
 import csv
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -54,7 +55,7 @@ def parse_args():
                    help="keep small: this only tests resume mechanics")
     p.add_argument("--seed", default=42, type=int)
     p.add_argument("--device", default="cuda")
-    p.add_argument("--work_dir", default="output/regression")
+    p.add_argument("--work_dir", default="output/regression", type=Path)
     p.add_argument("--method", default="fedta")
     return p.parse_args()
 
@@ -105,6 +106,19 @@ def deep_equal(a, b):
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) == len(b) and all(deep_equal(x, y) for x, y in zip(a, b))
     return type(a) is type(b) and a == b
+
+
+def require_outer_manifest(ckpt, label="checkpoint"):
+    """Gate 0B false-pass guard: a missing / empty outer_split_manifest
+    must FAIL the test instead of silently comparing {} == {}."""
+    assert "outer_split_manifest" in ckpt, (
+        f"{label}: checkpoint missing outer_split_manifest "
+        "(false-pass guard)")
+    manifest = ckpt["outer_split_manifest"]
+    assert isinstance(manifest, dict) and len(manifest) > 0, (
+        f"{label}: outer_split_manifest is empty or invalid "
+        "(false-pass guard)")
+    return manifest
 
 
 def hash_obj(obj):
@@ -174,8 +188,9 @@ def baseline_records(run_dir, ckpt):
         split_index_hashes[str(cid)] = per_task
 
     # TRUE federated outer partition (raw sample indices + class masks per
-    # client-task), as recorded in the checkpoint manifest
-    outer_manifest = ckpt.get("outer_split_manifest") or {}
+    # client-task), as recorded in the checkpoint manifest; fail-fast on a
+    # missing/empty manifest (no {} == {} false pass)
+    outer_manifest = require_outer_manifest(ckpt, str(run_dir))
 
     key_cs, anchor_cs, head_cs = {}, {}, {}
     for c in ckpt["clients"]:
@@ -216,10 +231,17 @@ def main():
             "--task_num", str(args.task_num),
             "--local_epoch", str(args.local_epoch),
             "--method", args.method, "--deterministic",
-            "--save_every", "1", "--output_dir", args.work_dir]
+            "--save_every", "1", "--output_dir", str(args.work_dir)]
 
     run_a = args.work_dir / args.data_name / args.method / "reg_full" / f"seed_{args.seed}"
     run_b = args.work_dir / args.data_name / args.method / "reg_split" / f"seed_{args.seed}"
+
+    # clean previous test runs: stale checkpoints would trigger auto-resume
+    # and stale metrics would corrupt the comparison
+    for run in (run_a, run_b):
+        if run.exists():
+            print(f"[cleanup] removing previous test run dir {run}")
+            shutil.rmtree(run)
 
     # A: continuous N rounds
     run_main(base + ["--run_name", "reg_full", "--max_rounds", str(args.rounds)])
@@ -247,8 +269,8 @@ def main():
                                     ckpt_b.get("data_split_state") or {})
     split_equal = deep_equal(split_state_a, split_state_b)
 
-    outer_a, outer_b = (ckpt_a.get("outer_split_manifest") or {},
-                        ckpt_b.get("outer_split_manifest") or {})
+    outer_a = require_outer_manifest(ckpt_a, str(run_a))
+    outer_b = require_outer_manifest(ckpt_b, str(run_b))
     outer_equal = deep_equal(outer_a, outer_b)
 
     ma, mb = load_matrix(run_a), load_matrix(run_b)

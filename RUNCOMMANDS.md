@@ -200,7 +200,26 @@ python diagnostics/synthetic_oracle_k2.py \
 - 输出 `oracle_k2_results.csv`（每轮各任务 accuracy/margin）、`oracle_k2_summary.csv`（AA / Forgetting / BWT / retention / mode separation）、`oracle_k2_meta.json`（含 `experiment: synthetic_oracle_k2_stress_test` 标记与 synthetic 定位说明）
 - 服务器上先跑小 delta 网格确认流程，再跑完整网格
 
-## 10. Resume 回归测试（Phase 0）
+## 10. 官方 FedTA parity 测试（Gate 0A）
+
+```bash
+python tests/test_official_fedta_parity.py \
+    --official_repo /path/to/official_FedTA \
+    --data_path ./local_datasets \
+    --device cuda
+```
+
+- 证明最强命题：`FedSMTA --method fedta --no_instrumentation ≡ Official FedTA`（Gate 0B 只能证明"自己的代码连续跑 = 自己的代码 resume 跑"，不能证明等于官方）
+- 官方仓库无 checkpoint 机制：测试会在官方仓库内生成一个一次性 driver 脚本，进程内复刻官方 `main()` 流程（含 RNG 消耗顺序），跑完后导出最终状态；结束后自动清理 driver/payload/dump（`--keep_driver` 保留，FAIL 时也会保留以便调试）
+- fork 侧以冻结的短程 parity 配置运行（`task_num=2, global_epoch=2, local_epoch=2, client_num=5, private_class_num=15, batch_size=16, surrogate_num=20, threshold=0.25, seed=42, rounds=4`），并强制 `--deterministic --no_instrumentation`；`--rounds` 必须等于 `task_num*global_epoch`（官方仓库总是跑完整任务循环）
+- 前置条件：`--official_repo` 为官方 FedTA 仓库的本地克隆（含 `main.py`/`Models`/`config`）；官方仓库内需有 `pretrain_model/ViT-B_16.npz`；官方代码若硬编码数据集路径需提前准备（被 drop 的 kwarg 会在 JSON 中报告）；官方仓库若需要不同环境可用 `--official_python` 指定解释器
+- 配置漂移防护：实验定义参数（client_num/task_num/.../model_name）在官方 config 中逐 key 断言存在，缺失直接报错并列出可用 key（fail loudly，绝不静默错配）；config 模块自动尝试 `config.cifar100` / `config.cifar100_delay`，可用 `--config_module` 覆盖
+- 比较项：server model / global head / global+temp protos / server prompt / 各 client heads / key / anchor / 完整 tail_anchor state / client prompts / fix_keys / 外层 manifest（raw indices + class_mask）/ 内层 70/30 split（通过 patch `random_split` + 包装 `get_data` 在官方侧记录）
+- 封板断言：fork checkpoint 必须记录 `no_instrumentation=True`、`deterministic=True`、跑满全部 rounds；两侧 manifest 必须存在且非空（无 `{} == {}` 假 PASS）
+- 输出 `output/regression/metrics/official_fedta_parity.json`；**PASS 要求 D=0（不容忍浮点误差）**——若出现极小非零差异，先怀疑 GPU 算子非确定性并重跑，不允许放宽 tolerance
+- v1 限制（已记录在 JSON notes，不作 gating）：accuracy 不直接比较（所有模型状态与两个 split 的 D=0 蕴含评估输出一致）；RNG states 无法比较（官方无保存机制）
+
+## 11. Resume 回归测试（Gate 0B）
 
 ```bash
 python tests/test_resume_regression.py \
@@ -214,10 +233,11 @@ python tests/test_resume_regression.py \
 - A = 连续跑 4 轮；B = 用 `--max_rounds 2` 跑 2 轮后 `--resume auto` 续跑 2 轮
 - 自动附加 `--deterministic`，逐项比较最终 model / head / prompt / protos / fix_keys / 各 client tail_anchor / RNG states / accuracy_matrix.csv / 数据划分索引
 - checkpoint 现已包含**真正的联邦外层划分 manifest**（每 client/task 的原始样本 raw_indices + class_mask，位于 70/30 内层划分之前）；resume 时会重新生成划分并与之逐位比对，不一致直接拒绝恢复
+- **封板（假 PASS 防护）**：两侧 checkpoint 缺失或空 manifest 时测试直接 FAIL（`require_outer_manifest` fail-fast，杜绝 `{} == {}` 空比较通过）；`Server_DF.load_checkpoint()` 对缺失/空/不匹配 manifest 一律 `RuntimeError`（不再接受无 manifest 的旧 checkpoint）；每次运行前自动清理旧的测试 run 目录（防 stale checkpoint 触发 auto-resume）
 - 输出 `output/regression/metrics/baseline_verification.json`：两个 run 的 baseline 记录（outer split manifest hash、inner 70/30 split index hash、每 client/task train/test index hash、protos / head / prompt / key / anchor / RNG checksum、accuracy matrix hash）+ 比较字段（`accuracy_max_diff`、`global_proto_max_diff`、`prompt_max_diff`、`head_max_diff`、`key_max_diff`、`anchor_max_diff`、`split_equal`、`outer_split_equal`）
-- **Gate 0**：`result != PASS` 时禁止进入 Phase 1
+- **Gate 0B**：`result != PASS` 时禁止进入 Phase 1
 
-## 11. Observer-invariance 测试（Phase 0）
+## 12. Observer-invariance 测试（Gate 0C）
 
 ```bash
 python tests/test_observer_invariance.py \
@@ -231,5 +251,21 @@ python tests/test_observer_invariance.py \
 - 证明 Phase 0 插桩（train_log.csv 本地阶段评估、全任务评估、margin 记录）是**纯观察者**：`--no_instrumentation`（官方循环，无任何额外评估）vs 默认（插桩开启）两个短程 run 的训练轨迹必须逐位一致
 - 默认 `--rounds = global_epoch + 1`（跑完 task 0 + 进入 task 1 第 1 轮），因此比较项含**next-task split**（task 1 的 70/30 划分索引，由 RNG 流决定）
 - 比较项：server model / prompt / global protos / global head / 各 client heads / key / anchor / client prompts / fix_keys / RNG states / 内层 split / 外层 manifest
+- **封板断言**：checkpoint 必须记录 `no_instrumentation` off=True / on=False（否则比较是空洞的）；manifest fail-fast（缺失/空即 FAIL）；artifact 区分验证——OFF run 不得产生任何 observer 文件（`train_log.csv`/`round_metrics.jsonl`/`accuracy_matrix.csv`/`margins.csv`），ON run 必须产生（证明 `--no_instrumentation` 真正等于 "FedTA + checkpoint only"）
 - 输出 `output/regression/metrics/observer_invariance.json`；`result != PASS` 说明插桩扰动了训练随机流（检查 `_log_local_phase` / `run_full_evaluation` 的 RNG 保护）
-- 与第 10 节互补：回归测试证明 resume 不改变当前程序自身轨迹；本测试证明插桩本身不改变轨迹
+- 与第 11 节互补：回归测试证明 resume 不改变当前程序自身轨迹；本测试证明插桩本身不改变轨迹
+
+## 13. Phase 0 Freeze（三个 Gate 全部 PASS 后）
+
+```bash
+# 顺序：Gate 0A（第 10 节）→ Gate 0B（第 11 节）→ Gate 0C（第 12 节）
+# 三者全部 PASS 后：
+git add .
+git commit -m "freeze verified FedTA baseline"
+git tag phase0-fedta-baseline
+git push origin main
+git push origin phase0-fedta-baseline
+```
+
+- 从 tag 起，`--method fedta` 视为 **read-only scientific baseline**：不得改动 FedTA loss / optimizer / BGPS / SIKF / FedAvg head / Tail Anchor 结构 / prompt 逻辑 / CIFAR 联邦划分
+- 之后的顺序：`diagnostics/check_feature_batch_sensitivity.py`（Phase 1-precheck）→ 正式 Phase 1；z_op batch sensitivity 属于 Phase 1-precheck，不是 Phase 0 Gate

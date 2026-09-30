@@ -33,6 +33,7 @@ Usage (ON THE SERVER, from the repo root):
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -42,6 +43,7 @@ import torch
 
 from test_resume_regression import (
     REPO_ROOT, max_diff, state_dict_diff, protos_diff, deep_equal, hash_obj,
+    require_outer_manifest,
 )
 
 
@@ -59,7 +61,7 @@ def parse_args():
                    help="keep small: this only tests observer invariance")
     p.add_argument("--seed", default=42, type=int)
     p.add_argument("--device", default="cuda")
-    p.add_argument("--work_dir", default="output/regression")
+    p.add_argument("--work_dir", default="output/regression", type=Path)
     p.add_argument("--method", default="fedta")
     return p.parse_args()
 
@@ -97,11 +99,18 @@ def main():
             "--task_num", str(args.task_num),
             "--local_epoch", str(args.local_epoch),
             "--method", args.method, "--deterministic",
-            "--save_every", "1", "--output_dir", args.work_dir,
+            "--save_every", "1", "--output_dir", str(args.work_dir),
             "--max_rounds", str(rounds)]
 
     run_off = args.work_dir / args.data_name / args.method / "obs_off" / f"seed_{args.seed}"
     run_on = args.work_dir / args.data_name / args.method / "obs_on" / f"seed_{args.seed}"
+
+    # clean previous test runs: stale checkpoints would trigger auto-resume
+    # and stale metrics would corrupt the artifact checks below
+    for run in (run_off, run_on):
+        if run.exists():
+            print(f"[cleanup] removing previous test run dir {run}")
+            shutil.rmtree(run)
 
     # A: official loop, Phase-0 observers disabled
     run_main(base + ["--run_name", "obs_off", "--no_instrumentation"])
@@ -112,6 +121,14 @@ def main():
                           map_location="cpu", weights_only=False)
     ckpt_on = torch.load(run_on / "checkpoints" / "latest.pth",
                          map_location="cpu", weights_only=False)
+
+    # Gate 0C seal: prove run A really ran with instrumentation OFF and
+    # run B with ON — otherwise the comparison below is vacuous.
+    assert ckpt_off["args"].get("no_instrumentation") is True, (
+        "obs_off checkpoint must record no_instrumentation=True "
+        "(was the run actually started with --no_instrumentation?)")
+    assert ckpt_on["args"].get("no_instrumentation") is False, (
+        "obs_on checkpoint must record no_instrumentation=False")
 
     # ---------- training-trajectory comparison ----------
     head_diffs = [state_dict_diff(ckpt_off["global_head"],
@@ -127,8 +144,30 @@ def main():
 
     inner_off, inner_on = (ckpt_off.get("data_split_state") or {},
                            ckpt_on.get("data_split_state") or {})
-    outer_off, outer_on = (ckpt_off.get("outer_split_manifest") or {},
-                           ckpt_on.get("outer_split_manifest") or {})
+    # Gate 0C seal: fail-fast on a missing/empty manifest (no {} == {} pass)
+    outer_off = require_outer_manifest(ckpt_off, str(run_off))
+    outer_on = require_outer_manifest(ckpt_on, str(run_on))
+
+    # Gate 0C seal: instrumentation artifacts must actually differ — the
+    # OFF run must produce NONE of the Phase-0 observer files, the ON run
+    # must produce them (proves the flag really disables the observers).
+    # accuracy_matrix.csv / margins.csv are only expected once the run has
+    # reached a task boundary (run_full_evaluation is task-end gated).
+    reached_task_end = rounds >= args.global_epoch
+    observer_artifacts = ["train_log.csv", "round_metrics.jsonl"]
+    if reached_task_end:
+        observer_artifacts += ["accuracy_matrix.csv", "margins.csv"]
+    artifacts_off = {n: (run_off / "metrics" / n).exists()
+                     for n in observer_artifacts}
+    artifacts_on = {n: (run_on / "metrics" / n).exists()
+                    for n in observer_artifacts}
+    for n in observer_artifacts:
+        assert not artifacts_off[n], (
+            f"OFF run must not produce metrics/{n} "
+            "(instrumentation is not fully disabled)")
+        assert artifacts_on[n], (
+            f"ON run must produce metrics/{n} "
+            "(instrumentation artifacts missing)")
 
     comparison = {
         "completed_round_diff": abs(int(ckpt_off["completed_round"])
@@ -171,6 +210,11 @@ def main():
             report.append((name, diff == 0.0, diff, ""))
     for name, d in rng_diffs.items():
         report.append((f"rng.{name}", d == 0.0, d, ""))
+    for n in observer_artifacts:
+        report.append((f"artifact_off_absent[{n}]", not artifacts_off[n],
+                       0.0 if not artifacts_off[n] else float("inf"), ""))
+        report.append((f"artifact_on_present[{n}]", artifacts_on[n],
+                       0.0 if artifacts_on[n] else float("inf"), ""))
 
     print("\n===== observer-invariance report =====")
     all_ok = True
@@ -209,6 +253,7 @@ def main():
         },
         "run_off": records(ckpt_off, run_off),
         "run_on": records(ckpt_on, run_on),
+        "observer_artifacts": {"off": artifacts_off, "on": artifacts_on},
         "comparison": {k: (None if v == float("inf") else v)
                        for k, v in comparison.items()},
         "rng_state_diffs": {k: (None if v == float("inf") else v)

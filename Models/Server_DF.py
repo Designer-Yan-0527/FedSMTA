@@ -185,7 +185,10 @@ class Server_DF(object):
 
                 else:
                     self.clients[j].get_global_proto_and_head_no_test(self.global_protos, self.global_head, self.prompt, i)
-            if self.run_manager is not None:
+            # writing the structured CSV is Phase-0 instrumentation; the
+            # broadcast/evaluation loop above is original FedTA and always
+            # runs (--no_instrumentation must equal FedTA + checkpoint only)
+            if self.run_manager is not None and self.instrumentation:
                 self.run_manager.append_train_log_rows(server_rows)
 
 
@@ -203,7 +206,10 @@ class Server_DF(object):
             if do_eval and self.instrumentation:
                 self.run_full_evaluation(i)
 
-            self.append_round_metrics(i)
+            # round_metrics.jsonl is Phase-0 instrumentation; skipped under
+            # --no_instrumentation (checkpoint saving below always runs)
+            if self.instrumentation:
+                self.append_round_metrics(i)
             self.maybe_save_checkpoint(i)
 
             if self.run_manager is not None:
@@ -761,19 +767,29 @@ class Server_DF(object):
         # Phase 0: the federated outer partition is regenerated from the
         # seed; verify it is bit-identical to the manifest stored in the
         # checkpoint (raw sample indices + class masks per client-task).
-        # Old checkpoints without a manifest are still accepted.
-        ckpt_manifest = checkpoint.get("outer_split_manifest")
-        if ckpt_manifest is not None:
-            current_manifest = self.build_outer_split_manifest()
-            if ckpt_manifest != current_manifest:
-                raise ValueError(
-                    "Federated outer split manifest mismatch: the partition "
-                    "regenerated from this seed does NOT match the one "
-                    "recorded in the checkpoint. Refusing to resume with a "
-                    "different data partition (check seed / client_num / "
-                    "task_num / private_class_num / data_name / data_path).")
-            print("[checkpoint] outer split manifest verified "
-                  "(bit-identical raw indices + class masks)")
+        # Gate 0B seal requirement: a checkpoint WITHOUT a manifest cannot
+        # be verified and is rejected — silently accepting old checkpoints
+        # would let the resume-regression test pass vacuously.
+        if "outer_split_manifest" not in checkpoint:
+            raise RuntimeError(
+                "Checkpoint missing outer_split_manifest: the federated "
+                "outer partition cannot be verified. Phase-0 freeze "
+                "requires every checkpoint to carry the manifest (raw "
+                "sample indices + class masks per client-task).")
+        ckpt_manifest = checkpoint["outer_split_manifest"]
+        if not isinstance(ckpt_manifest, dict) or not ckpt_manifest:
+            raise RuntimeError(
+                "Invalid or empty outer_split_manifest in checkpoint.")
+        current_manifest = self.build_outer_split_manifest()
+        if ckpt_manifest != current_manifest:
+            raise RuntimeError(
+                "Federated outer split manifest mismatch: the partition "
+                "regenerated from this seed does NOT match the one "
+                "recorded in the checkpoint. Refusing to resume with a "
+                "different data partition (check seed / client_num / "
+                "task_num / private_class_num / data_name / data_path).")
+        print("[checkpoint] outer split manifest verified "
+              "(bit-identical raw indices + class masks)")
 
         self.task_id = checkpoint["server_task_id"]
         self.existing_class = set(checkpoint.get("existing_class", []))
