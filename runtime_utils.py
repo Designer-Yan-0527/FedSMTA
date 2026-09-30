@@ -31,6 +31,7 @@ import torch
 RUNTIME_ONLY_ARGS = {
     "run_name", "resume", "output_dir", "save_every", "keep_last",
     "eval_all_every", "num_workers", "pin_mem", "device", "eval",
+    "max_rounds", "deterministic",
 }
 
 
@@ -370,6 +371,103 @@ class RunManager(object):
                             if aa == a and tt == t]
                     row.append(f"{sum(vals) / len(vals):.2f}" if vals else "")
                 w.writerow(row)
+
+        self.write_summary_metrics(latest, task_num)
+
+    @staticmethod
+    def _summary_for_matrix(R, task_num):
+        """Phase 1 summary metrics from an accuracy matrix
+        R[t][k] = accuracy after task t on test task k (None = missing).
+
+        Returns a list of dicts, one per after_task t:
+          avg_accuracy : mean_{k<=t} R[t][k]
+          forgetting   : mean_{k<t} max(0, max_{l in [k,t)} R[l][k] - R[t][k])
+          bwt          : mean_{k<t} (R[t][k] - R[k][k])
+          retention_Tk : 100 * R[t][k] / R[k][k] (per old task k<t)
+        """
+        rows = []
+        for t in range(task_num):
+            if R.get(t) is None:
+                continue
+            seen = [k for k in range(t + 1) if R[t].get(k) is not None]
+            if not seen:
+                continue
+            row = {
+                "after_task": t,
+                "avg_accuracy": sum(R[t][k] for k in seen) / len(seen),
+            }
+            olds = [k for k in range(t)
+                    if R[t].get(k) is not None and R.get(k, {}).get(k) is not None]
+            if olds:
+                row["forgetting"] = sum(
+                    max(0.0, max(R[l][k] for l in range(k, t)
+                                 if R.get(l, {}).get(k) is not None) - R[t][k])
+                    for k in olds) / len(olds)
+                row["bwt"] = sum(R[t][k] - R[k][k] for k in olds) / len(olds)
+                for k in olds:
+                    row[f"retention_T{k}"] = 100.0 * R[t][k] / R[k][k]
+            rows.append(row)
+        return rows
+
+    def write_summary_metrics(self, latest, task_num):
+        """Phase 1: Average Accuracy / Average Forgetting / BWT / per-task
+        retention, per client and client-mean, -> metrics/summary_metrics.csv."""
+        clients = sorted({c for (_a, _t, c) in latest})
+        by_client = {c: {} for c in clients}
+        for (a, t, c), v in latest.items():
+            by_client[c].setdefault(a, {})[t] = v
+
+        max_seen = max((a for a in by_client.get(clients[0], {})), default=-1) \
+            if clients else -1
+        retention_cols = [f"retention_T{k}" for k in range(max(0, max_seen))]
+
+        path = self.metrics_dir / "summary_metrics.csv"
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["client_id", "after_task", "avg_accuracy",
+                        "forgetting", "bwt"] + retention_cols)
+            for c in clients + ["mean"]:
+                if c == "mean":
+                    # client-mean matrix first, then metrics on the mean
+                    R = {}
+                    for a in range(task_num):
+                        for t in range(a + 1):
+                            vals = [by_client[cc][a][t] for cc in clients
+                                    if t in by_client.get(cc, {}).get(a, {})]
+                            if vals:
+                                R.setdefault(a, {})[t] = sum(vals) / len(vals)
+                    matrix = {a: R[a] for a in R}
+                else:
+                    matrix = by_client[c]
+                for row in self._summary_for_matrix(matrix, task_num):
+                    w.writerow(
+                        [c, row["after_task"],
+                         f"{row['avg_accuracy']:.2f}",
+                         f"{row.get('forgetting', float('nan')):.2f}"
+                         if "forgetting" in row else "",
+                         f"{row.get('bwt', float('nan')):.2f}"
+                         if "bwt" in row else ""] +
+                        [f"{row.get(col, float('nan')):.2f}"
+                         if col in row else "" for col in retention_cols])
+
+    def append_margin_rows(self, rows):
+        """Phase 1: append per-task margin statistics to
+        metrics/margins.csv (append-mode, header once; resume-safe)."""
+        if not rows:
+            return
+        path = self.metrics_dir / "margins.csv"
+        exists = path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if not exists:
+                w.writerow(["client_id", "after_task", "test_task",
+                            "accuracy", "margin_mean", "margin_median",
+                            "margin_p10", "n_samples"])
+            for r in rows:
+                w.writerow([r["client_id"], r["after_task"], r["test_task"],
+                            f"{r['accuracy']:.2f}" if r.get("accuracy") is not None else "",
+                            f"{r['mean']:.4f}", f"{r['median']:.4f}",
+                            f"{r['p10']:.4f}", r["n_samples"]])
 
     def append_train_log_rows(self, rows):
         """Append structured per-round / per-client accuracy rows to

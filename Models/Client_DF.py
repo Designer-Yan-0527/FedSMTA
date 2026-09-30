@@ -115,9 +115,10 @@ class Client_DF(object):
 
         self.model.to(self.device)
         self.vit.to(self.device)
-        # BUGFIX: used to be hardcoded batch_size=16, which silently ignored
-        # --batch-size for local training
-        train_loader = DataLoader(self.traindata, batch_size=self.batch_size, num_workers=args.num_workers, shuffle=True)
+        # STRICT BASELINE (Phase 0): official FedTA hardcodes the local
+        # training batch size to 16 (see official Client_DF.train()).
+        # Do NOT replace with --batch-size; that changes the protocol.
+        train_loader = DataLoader(self.traindata, batch_size=16, num_workers=args.num_workers, shuffle=True)
         print(f'Client {self.id} on Task {self.task_id} is training prompts')
 
         # training input enhancement
@@ -335,6 +336,12 @@ class Client_DF(object):
         self.model.load_head(self.heads[task])
         self.model.to(self.device)
 
+        # Phase 1 diagnostics: margin = logit_y - max_{j != y} logit_j,
+        # recorded on the task-masked logits the prediction actually uses.
+        # Pure recording: does not change the returned accuracy or the
+        # training/eval logic.
+        margin_list = []
+
         for iteration, (input,target) in enumerate(test_loader):
             input = input.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
@@ -363,19 +370,42 @@ class Client_DF(object):
             correct += (predicts == target.cpu()).sum()
             total += len(target)
 
+            # Phase 1: margin recording (masked logits, y = ground truth)
+            with torch.no_grad():
+                logit_y = logits.gather(1, target.unsqueeze(1)).squeeze(1)
+                other = logits.scatter(1, target.unsqueeze(1), float('-inf'))
+                margin_list.append((logit_y - other.max(dim=1)[0]).cpu())
+
         acc = 100 * correct / total
+
+        if margin_list:
+            m = torch.cat(margin_list)
+            self.last_margin_stats = {
+                "mean": float(m.mean()),
+                "median": float(m.median()),
+                "p10": float(torch.quantile(m, 0.10)),
+                "n_samples": int(m.numel()),
+            }
+        else:
+            self.last_margin_stats = None
 
         print(f'{acc}')
         return float(acc)
 
     def evaluate_all_seen_tasks(self, nb_classes=None):
         """Evaluate task0 -> current task in ascending order, so the model is
-        left with the current task head loaded. Returns {task: accuracy}."""
+        left with the current task head loaded. Returns {task: accuracy}.
+
+        Phase 1: also collects the per-task margin stats recorded by
+        evaluate() into self.last_margin_stats_by_task."""
         results = {}
+        margin_by_task = {}
         for task in range(self.task_id + 1):
             if task >= len(self.heads) or self.heads[task] is None:
                 continue
             results[task] = self.evaluate(task, nb_classes)
+            margin_by_task[task] = self.last_margin_stats
+        self.last_margin_stats_by_task = margin_by_task
         return results
 
     # ------------------------------------------------------------------

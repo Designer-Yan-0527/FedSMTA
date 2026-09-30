@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from pathlib import Path
 import random
@@ -25,7 +26,33 @@ from data.cifar100_subset_spliter import cifar100_Data_Spliter
 import warnings
 warnings.filterwarnings("ignore")
 
-def main(args):
+
+def setup_determinism(args):
+    """Phase 0: optional deterministic mode (default OFF, official behavior).
+
+    The official FedTA runs with cudnn.benchmark=True and non-deterministic
+    kernels. Determinism is only needed by the resume regression test; it is
+    never enabled silently."""
+    if getattr(args, 'deterministic', False):
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        print("[deterministic] ON (cudnn.deterministic=True, benchmark=False)")
+    else:
+        cudnn.benchmark = True
+
+
+def build_server(args, run_manager=None):
+    """Shared Phase-0 bootstrap: seed -> data partition -> models -> Server_DF.
+
+    The RNG-consumption order here is bit-identical to the original main()
+    (seed -> create_model default_cfg -> partition -> models -> clients), so
+    Phase-1 diagnostics calling this function reproduce exactly the same
+    client data partition as the training run.
+
+    main() additionally creates a RunManager (RNG-neutral) before calling
+    this; diagnostics pass run_manager=None."""
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -34,37 +61,34 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
     pretrained_cfg = create_model(args.model).default_cfg
-    pretrained_cfg['file']='pretrain_model/ViT-B_16.npz'
+    pretrained_cfg['file'] = 'pretrain_model/ViT-B_16.npz'
 
-    cudnn.benchmark = True
-
-    # Phase 0: run directory / tee logging / resume target resolution.
-    # Must happen before any training output so everything is logged.
-    run_manager = RunManager(args)
+    setup_determinism(args)
 
     print(args.data_name)
-    if args.data_name=='cifar100':
-        client_data,client_mask= cifar100_Data_Spliter(client_num=args.client_num,task_num=args.task_num,private_class_num=args.private_class_num,input_size=args.input_size,data_path=args.data_path).random_split()
-        surro_data,test_data = cifar100_Data_Spliter(client_num=args.client_num,task_num=args.task_num,
-                                                     private_class_num=args.private_class_num,input_size=args.input_size,data_path=args.data_path).process_testdata(args.surrogate_num)
+    if args.data_name == 'cifar100':
+        client_data, client_mask = cifar100_Data_Spliter(client_num=args.client_num, task_num=args.task_num, private_class_num=args.private_class_num, input_size=args.input_size, data_path=args.data_path).random_split()
+        surro_data, test_data = cifar100_Data_Spliter(client_num=args.client_num, task_num=args.task_num,
+                                                      private_class_num=args.private_class_num, input_size=args.input_size, data_path=args.data_path).process_testdata(args.surrogate_num)
         surro_data = iCIFAR100c(subset=surro_data)
         args.nb_classes = 100
 
-    elif args.data_name=='ImageNet-R':
+    elif args.data_name == 'ImageNet-R':
         data_spliter = ImagenetR_spliter(client_num=args.client_num, task_num=args.task_num,
-                                                  private_class_num=args.private_class_num,
-                                                  input_size=args.input_size,
-                                                  data_path=args.data_path)
+                                         private_class_num=args.private_class_num,
+                                         input_size=args.input_size,
+                                         data_path=args.data_path)
 
         client_data, client_mask = data_spliter.random_split()
         args.nb_classes = 200
 
-        # BUGFIX: used to be hardcoded process_testdata(5), which silently
-        # ignored --surrogate_num for ImageNet-R
+        # STRICT BASELINE (Phase 0): official FedTA fixes the ImageNet-R
+        # surrogate count to 5 per class (official main.py: process_testdata(5)).
+        # --surrogate_num is only honored for cifar100 (official default 20).
         surro_data, test_data = ImagenetR_spliter(client_num=args.client_num, task_num=args.task_num,
-                                                      private_class_num=args.private_class_num,
-                                                      input_size=args.input_size,
-                                                      data_path=args.data_path).process_testdata(args.surrogate_num)
+                                                  private_class_num=args.private_class_num,
+                                                  input_size=args.input_size,
+                                                  data_path=args.data_path).process_testdata(5)
         surro_data = iCIFAR100c(subset=surro_data)
 
     else:
@@ -76,14 +100,12 @@ def main(args):
     original_model = create_model(
         args.model,
         pretrained=True,
-        pretrained_cfg = pretrained_cfg,
+        pretrained_cfg=pretrained_cfg,
         num_classes=args.nb_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
-        # pretrained_cfg_overlay=dict(file='pretrain_model/pytorch_model.bin')
-        # checkpoint_path='pretrain_model/original_model.pth'
-        )
+    )
 
     print(f"Creating model: {args.model}")
     model = create_model(
@@ -105,15 +127,10 @@ def main(args):
         prompt_key_init=args.prompt_key_init,
         head_type=args.head_type,
         use_prompt_mask=args.use_prompt_mask,
-        # e_prompt_layer_idx=args.e_prompt_layer_idx,
-        # method=args.method,
-        # pretrained_cfg_overlay=dict(file='pretrain_model/pytorch_model.bin')
-        # checkpoint_path='pretrain_model/model.pth'
     )
 
     original_model.to(device)
     model.to(device)
-
 
     if args.freeze:
         # all parameters are frozen for original vit model
@@ -127,14 +144,24 @@ def main(args):
         if p.requires_grad == True:
             print(n)
 
+    myServer = Server_DF(id='Server', origin_model=original_model, model_name=args.model_name, client_num=args.client_num, task_num=args.task_num,
+                         subset=client_data, class_mask=client_mask, lr=args.lr, global_epoch=args.global_epoch, local_epoch=args.local_epoch,
+                         batch_size=args.batch_size, device=args.device, method=args.method, threshold=args.threshold,
+                         surrogate_data=surro_data, test_data=None, args=args, model=model, run_manager=run_manager)
+    return myServer
 
-    # id,origin_model,model,client_num,task_num,subset,class_mask,lr,global_epoch,local_epoch,batch_size,device,method,threshold,surrogate_data,test_data):
-    myServer = Server_DF(id='Server',origin_model=original_model,model_name=args.model_name,client_num=args.client_num,task_num=args.task_num,
-                 subset=client_data,class_mask=client_mask,lr=args.lr,global_epoch=args.global_epoch,local_epoch=args.local_epoch,
-                 batch_size=args.batch_size,device=args.device,method=args.method,threshold=args.threshold,
-                 surrogate_data=surro_data,test_data=None,args=args,model=model,run_manager=run_manager)
+
+def main(args):
+    # Phase 0: run directory / tee logging / resume target resolution.
+    # Must happen before any training output so everything is logged.
+    # (RunManager is RNG-neutral, so its position does not affect the
+    # partition RNG stream.)
+    run_manager = RunManager(args)
+
+    myServer = build_server(args, run_manager=run_manager)
 
     myServer.start()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('FedTA training and evaluation configs')

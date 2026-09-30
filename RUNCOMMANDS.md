@@ -52,7 +52,7 @@ python main.py datasets_delay \
 2. 首次运行会做**一次性**的 80/20 随机划分（把图片移动到 `imagenet-r/train/`、`imagenet-r/test/` 子目录，之后直接复用，不会重复划分）；
 3. ImageNet-R 共 30000 张图片、200 类，`args.nb_classes` 自动设为 200。
 
-> **注意**：`--surrogate_num` 现在真正生效（旧代码硬编码为 5）。如果想保持与旧代码完全一致的行为，请显式传 `--surrogate_num 5`；默认值为 20。
+> **Phase 0 严格 baseline 说明**：官方 FedTA 对 ImageNet-R 固定每类 5 个 surrogate（`process_testdata(5)`），本仓库已恢复该行为——`--surrogate_num` 只对 cifar100 生效（官方默认 20）。本地训练 batch size 也已恢复官方硬编码 16（`--batch-size` 只影响 SIKF 蒸馏加载器，与官方一致）。
 
 ## 4. 常用参数速查
 
@@ -66,10 +66,10 @@ python main.py datasets_delay \
 | `--private_class_num` | 15 | 每个客户端的私有类别数 |
 | `--global_epoch` | 5 | 每个任务的联邦通信轮数 |
 | `--local_epoch` | 30 | 每轮本地训练 epoch 数 |
-| `--batch_size` | 16 | 本地训练 batch size（现已生效，旧代码硬编码 16） |
+| `--batch_size` | 16 | SIKF 蒸馏加载器 batch size（本地训练固定官方 16，不受此参数影响） |
 | `--lr` | 0.001 | 学习率 |
 | `--threshold` | 0.25 | BGPS 原型修复阈值（现已生效，旧代码硬编码 0.25） |
-| `--surrogate_num` | 20 | 每类代理样本数（ImageNet-R 旧代码硬编码 5） |
+| `--surrogate_num` | 20 | 每类代理样本数（仅 cifar100 生效；ImageNet-R 固定官方值 5） |
 | `--seed` | 42 | 随机种子 |
 | `--num_workers` | 2 | DataLoader 进程数 |
 | `--device` | `cuda` | 训练设备 |
@@ -83,6 +83,8 @@ python main.py datasets_delay \
 | `--save_every` | 1 | 每 N 个全局轮保存一次 `round_XXXX.pth` |
 | `--keep_last` | 0 | 只保留最近 N 个 `round_XXXX.pth`（0 = 全部保留）。`latest.pth` 和 `task_XX_end.pth` 始终保留 |
 | `--eval_all_every` | 0 | 每 N 轮做一次全任务评估（0 = 仅在任务结束时评估） |
+| `--deterministic` | off | 可选确定性模式（cudnn.deterministic、关闭 benchmark、deterministic algorithms）。默认关闭 = 官方行为 |
+| `--max_rounds` | 0 | 总轮数上限，用于提前停止（0 = 完整运行）。仅截断训练循环终点，不改变任何每轮逻辑 |
 
 ## 6. 断点续训（resume）
 
@@ -128,6 +130,84 @@ output/
                 │   └── task_00_end.pth   # 每个任务结束时的快照
                 └── metrics/
                     ├── accuracy_matrix.csv    # 全任务准确率矩阵
+                    ├── summary_metrics.csv    # AA / Forgetting / BWT / per-task retention 汇总（每 client + mean 行）
+                    ├── margins.csv            # 各旧任务 margin 统计（mean / median / p10，全任务评估时追加）
+                    ├── train_log.csv          # 结构化训练日志（round, task, client, accuracy, phase, test_task）
                     ├── client_0_accuracy.csv  # 各客户端准确率
                     └── round_metrics.jsonl    # 每轮指标流水
 ```
+
+## 9. Phase 1 诊断工具（不改变正式训练）
+
+诊断脚本通过共享的 `build_server()` 复刻训练的 RNG 流（seed → model default_cfg → 数据划分 → 建客户端），保证得到与训练完全相同的 client 数据划分。所有命令在项目根目录执行；`<run_dir>` 指 `output/{data_name}/fedta/{run_name}/seed_{seed}`。
+
+### 9.1 提取特征（z_ref / z_op）
+
+```bash
+python diagnostics/extract_features.py \
+    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --checkpoint output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_04_end.pth \
+    --out_dir diagnostics_output \
+    --split both
+```
+
+- 输出 `diagnostics_output/features_{data_name}_{ckpt名}.npz`（z_ref = frozen ViT 特征、z_op = 当前 prompt 增强的 pre-anchor 特征；含 labels / client_ids / task_ids / round_ids / splits / sample_idx）+ 同名 `.json` 元信息（含 round、client_class_masks、public classes）
+- `--checkpoint` 缺省时自动使用 `checkpoints/latest.pth`；`--data_path` / `--device` 可覆盖 args.json 中的值
+
+### 9.2 多模态分析（SSE / NLL / BIC / silhouette / rho / D_cover / client entropy）
+
+```bash
+python diagnostics/analyze_multimodality.py \
+    --features diagnostics_output/features_cifar100_task_04_end.npz \
+    --plot_dir diagnostics_output/plots
+```
+
+- 默认只分析 public classes（出现在 ≥2 个 client 的类），加 `--all_classes` 分析全部；只用 TRAIN split 发现 semantic modes
+- 每类统计：`sse/delta_sse`、80/20 heldout `nll/delta_nll`、`bic/delta_bic`（p_K = K·d + K + (K−1)）、`silhouette`、`mode_distance`、`rho`（mode separation）、`mode1/mode2_mass`、`coverage_distortion`（单原型失真 D_cover）、每 mode 的 `client_entropy`（spatial heterogeneity 证据），另保留 S_W/S_B/H_c
+- 输出（默认在特征文件同目录，可用 `--out_csv` / `--aggregate_json` 覆盖）：
+  - `multimodality_summary.csv` — 每 (feature_type, class) 一行
+  - `multimodality_aggregate.json` — 各指标 mean / median / std / p25 / p75 / bootstrap 95% CI
+- `--plot_dir` 可选：每类 PCA 散点图（颜色=client，marker=task，星=FedTA 单原型，叉=K2 mode 中心）；PCA 仅用于可视化，不参与任何指标
+
+### 9.3 兼容性 2x2 诊断（prompt × key-anchor）
+
+```bash
+python diagnostics/compatibility_drift.py \
+    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --old_ckpt output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_02_end.pth \
+    --new_ckpt output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_04_end.pth \
+    --old_task 2
+```
+
+- 评估 old/current prompt × old/current key-anchor 四种组合（旧 task 始终用对应 task-specific Chead）
+- 输出默认写到 `<run_dir>/metrics/compatibility_2x2.csv`；`--old_task` 缺省时从 old_ckpt 推断
+
+### 9.4 Oracle-K2 受控实验
+
+```bash
+python diagnostics/oracle_k2.py \
+    --features diagnostics_output/features_cifar100_task_04_end.npz \
+    --out_dir diagnostics_output/oracle_k2 \
+    --deltas 0,0.25,0.5,1.0,2.0 \
+    --methods fedta_k1,oracle_k2
+```
+
+- 纯特征级联邦持续学习模拟：FedTA-K1 vs Oracle-K2（z' = z + s·δ·v_c，s 只依赖 seed/client/task/样本，两法严格一致）
+- 输出 `oracle_k2_results.csv`（每轮各任务 accuracy/margin）、`oracle_k2_summary.csv`（AA / Forgetting / BWT / retention / mode separation）、`oracle_k2_meta.json`
+- 服务器上先跑小 delta 网格确认流程，再跑完整网格
+
+## 10. Resume 回归测试（Phase 0）
+
+```bash
+python tests/test_resume_regression.py \
+    --data_name cifar100 \
+    --data_path ./local_datasets \
+    --rounds 4 --split_at 2 \
+    --global_epoch 2 --task_num 2 --local_epoch 2 \
+    --device cuda
+```
+
+- A = 连续跑 4 轮；B = 用 `--max_rounds 2` 跑 2 轮后 `--resume auto` 续跑 2 轮
+- 自动附加 `--deterministic`，逐项比较最终 model / head / prompt / protos / fix_keys / 各 client tail_anchor / RNG states / accuracy_matrix.csv / 数据划分索引
+- 输出 `output/regression/metrics/baseline_verification.json`：两个 run 的 baseline 记录（outer split hash、每 client/task train/test index hash、protos / head / prompt / key / anchor / RNG checksum、accuracy matrix hash）+ 比较字段（`accuracy_max_diff`、`global_proto_max_diff`、`prompt_max_diff`、`head_max_diff`、`key_max_diff`、`anchor_max_diff`、`split_equal`）
+- **Gate 0**：`result != PASS` 时禁止进入 Phase 1

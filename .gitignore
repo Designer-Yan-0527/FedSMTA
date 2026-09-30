@@ -16,6 +16,7 @@ local_datasets/
 # ===== 训练产物（run 目录：日志 / checkpoint / 指标）=====
 output/
 runs/
+diagnostics_output/
 *.log
 
 # ===== 模型权重 =====

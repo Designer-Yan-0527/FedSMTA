@@ -99,7 +99,13 @@ class Server_DF(object):
         used = []
         start_round = self.start_round
 
-        for i in range(start_round, self.task_num * self.global_epoch):
+        # Phase 0: --max_rounds lets the resume regression test stop a run
+        # early; it never changes what happens inside a round.
+        total_rounds = self.task_num * self.global_epoch
+        max_rounds = int(getattr(self.args, 'max_rounds', 0) or 0)
+        end_round = total_rounds if max_rounds <= 0 else min(total_rounds, max_rounds)
+
+        for i in range(start_round, end_round):
             self.thisclients = [i for i in range(self.client_num)]
 
             # if len(used) ==0:
@@ -804,6 +810,7 @@ class Server_DF(object):
         rng_snapshot = rng_state_dict()
         try:
             all_client_results = {}
+            margin_rows = []
             for client in self.clients:
                 results = client.evaluate_all_seen_tasks(self.args.nb_classes)
                 all_client_results[client.id] = results
@@ -814,11 +821,24 @@ class Server_DF(object):
                         "test_task": test_task,
                         "accuracy": acc,
                     })
+                # Phase 1: per-task margin stats recorded by evaluate()
+                for test_task, stats in getattr(
+                        client, "last_margin_stats_by_task", {}).items():
+                    if not stats:
+                        continue
+                    margin_rows.append({
+                        "client_id": client.id,
+                        "after_task": after_task,
+                        "test_task": test_task,
+                        "accuracy": results.get(test_task),
+                        **stats,
+                    })
         finally:
             restore_rng_state(rng_snapshot)
         if self.run_manager is not None:
             self.run_manager.write_accuracy_csvs(
                 self.accuracy_records, self.task_num)
+            self.run_manager.append_margin_rows(margin_rows)
         return all_client_results
 
     def append_round_metrics(self, round_id):

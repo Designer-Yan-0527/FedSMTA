@@ -131,6 +131,14 @@ def get_args_parser(subparsers):
                                  'latest.pth and task_XX_end.pth are always kept')
     subparsers.add_argument('--eval_all_every', default=0, type=int,
                             help='Evaluate all seen tasks every N global rounds (0 = only at task end)')
+    subparsers.add_argument('--deterministic', action='store_true',
+                            help='Optional deterministic mode (cudnn.deterministic=True, '
+                                 'benchmark=False). Default OFF = official FedTA behavior. '
+                                 'Only needed for the resume regression test.')
+    subparsers.add_argument('--max_rounds', default=0, type=int,
+                            help='Stop after N global rounds (0 = full task_num*global_epoch). '
+                                 'Engineering-only switch for the resume regression test; '
+                                 'does not change per-round training logic.')
 
 
 
