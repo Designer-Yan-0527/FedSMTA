@@ -267,15 +267,25 @@ def main():
     surro_data = iCIFAR100c(subset=surro_data)
     args.nb_classes = 100
 
+    # NOTE: the official main.py creates BOTH models with pretrained=False
+    # and then loads the .npz weights EXPLICITLY via
+    # model.load_pretrained('pretrain_model/ViT-B_16.npz') (the l2p
+    # _load_weights Flax loader defined in the official ViT file itself).
+    # It never uses timm's pretrained=True path, and the official
+    # _create_vision_transformer lacks the pretrained_custom_load adapter
+    # the fork added — new timm would torch.load() the .npz and crash.
+    # The fork instead uses create_model(pretrained=True) + custom load,
+    # which ends up in the SAME _load_weights(); both paths are RNG-neutral
+    # and produce bit-identical initial weights.
     print("Creating original model: %s" % args.model)
     original_model = create_model(
-        args.model, pretrained=True, pretrained_cfg=pretrained_cfg,
+        args.model, pretrained=False,
         num_classes=args.nb_classes, drop_rate=args.drop,
         drop_path_rate=args.drop_path, drop_block_rate=None)
 
     print("Creating model: %s" % args.model)
     model = create_model(
-        args.model, pretrained=True, pretrained_cfg=pretrained_cfg,
+        args.model, pretrained=False,
         num_classes=args.nb_classes, drop_rate=args.drop,
         drop_path_rate=args.drop_path, drop_block_rate=None,
         prompt_length=args.length, embedding_key=args.embedding_key,
@@ -284,6 +294,16 @@ def main():
         top_k=args.top_k, batchwise_prompt=args.batchwise_prompt,
         prompt_key_init=args.prompt_key_init, head_type=args.head_type,
         use_prompt_mask=args.use_prompt_mask)
+
+    # official main.py: explicit npz load after pretrained=False creation
+    pretrained_path = 'pretrain_model/ViT-B_16.npz'
+    if not os.path.isfile(pretrained_path):
+        raise SystemExit(
+            "[parity-driver] missing %s under the official repo" %
+            pretrained_path)
+    print("Loading pretrained weights from %s" % pretrained_path)
+    original_model.load_pretrained(pretrained_path)
+    model.load_pretrained(pretrained_path)
 
     original_model.to(device)
     model.to(device)
