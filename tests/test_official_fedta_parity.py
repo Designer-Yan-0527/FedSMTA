@@ -449,6 +449,16 @@ def run_main(extra):
         raise RuntimeError(f"command failed: {' '.join(cmd)}")
 
 
+def torch_load_compat(path):
+    """torch.load that works on old torch (no weights_only kwarg) and on
+    torch>=2.6 (where weights_only defaults to True and would reject the
+    argparse.Namespace inside our checkpoints/dumps)."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # older torch without the weights_only kwarg
+        return torch.load(path, map_location="cpu")
+
+
 def main():
     args = parse_args()
     # Gate 0A seal: parity against the official FedTA is only defined for
@@ -557,9 +567,8 @@ def main():
                 "--max_rounds", str(args.rounds)]
         run_main(base + ["--run_name", "parity_fedta"])
 
-        dump = torch.load(dump_path, map_location="cpu", weights_only=False)
-        ckpt = torch.load(run_dir / "checkpoints" / "latest.pth",
-                          map_location="cpu", weights_only=False)
+        dump = torch_load_compat(dump_path)
+        ckpt = torch_load_compat(run_dir / "checkpoints" / "latest.pth")
 
         # ---------- Gate 0A seals (hard asserts, no vacuous pass) ----------
         assert ckpt["args"].get("no_instrumentation") is True, (

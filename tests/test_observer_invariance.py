@@ -86,6 +86,16 @@ def client_prompt_diff(clients_a, clients_b):
     return max(diffs) if diffs else 0.0
 
 
+def torch_load_compat(path):
+    """torch.load that works on old torch (no weights_only kwarg) and on
+    torch>=2.6 (where weights_only defaults to True and would reject the
+    argparse.Namespace inside our checkpoints)."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # older torch without the weights_only kwarg
+        return torch.load(path, map_location="cpu")
+
+
 def main():
     args = parse_args()
     rounds = args.rounds if args.rounds > 0 else args.global_epoch + 1
@@ -118,10 +128,8 @@ def main():
     # B: Phase-0 instrumentation ON (default)
     run_main(base + ["--run_name", "obs_on"])
 
-    ckpt_off = torch.load(run_off / "checkpoints" / "latest.pth",
-                          map_location="cpu", weights_only=False)
-    ckpt_on = torch.load(run_on / "checkpoints" / "latest.pth",
-                         map_location="cpu", weights_only=False)
+    ckpt_off = torch_load_compat(run_off / "checkpoints" / "latest.pth")
+    ckpt_on = torch_load_compat(run_on / "checkpoints" / "latest.pth")
 
     # Gate 0C seal: prove run A really ran with instrumentation OFF and
     # run B with ON — otherwise the comparison below is vacuous.

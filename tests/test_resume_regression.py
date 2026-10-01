@@ -259,6 +259,16 @@ def baseline_records(run_dir, ckpt):
     }
 
 
+def torch_load_compat(path):
+    """torch.load that works on old torch (no weights_only kwarg) and on
+    torch>=2.6 (where weights_only defaults to True and would reject the
+    argparse.Namespace inside our checkpoints)."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # older torch without the weights_only kwarg
+        return torch.load(path, map_location="cpu")
+
+
 def main():
     args = parse_args()
     if args.split_at >= args.rounds:
@@ -293,10 +303,8 @@ def main():
     run_main(base + ["--run_name", "reg_split", "--resume", "auto",
                      "--max_rounds", str(args.rounds)])
 
-    ckpt_a = torch.load(run_a / "checkpoints" / "latest.pth",
-                        map_location="cpu", weights_only=False)
-    ckpt_b = torch.load(run_b / "checkpoints" / "latest.pth",
-                        map_location="cpu", weights_only=False)
+    ckpt_a = torch_load_compat(run_a / "checkpoints" / "latest.pth")
+    ckpt_b = torch_load_compat(run_b / "checkpoints" / "latest.pth")
 
     # ---------- comparison (doc-named fields) ----------
     # false-pass guards: core states that MUST exist after >= 1 round
