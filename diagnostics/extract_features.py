@@ -13,12 +13,15 @@ splits, sample_idx_relative) plus a .json meta file (class masks, public
 classes, run info, checkpoint round, deterministic runtime state)
 consumable by analyze_multimodality.py / synthetic_oracle_k2.py.
 
-sample_idx_relative semantics: position within the client's
-data_split_indices[t][split] sequence, i.e. an index into
-client.train_data[t] (the class-filtered iCIFAR100c). Raw CIFAR-100 /
-ImageNet-R dataset indices are NOT recoverable here (iCIFAR100c drops
-the Subset layer at construction); sample_idx_relative is sufficient to
-re-locate any sample deterministically within the federated split.
+sample_idx_relative semantics: the VALUE stored in the client's
+data_split_indices[t][split], i.e. an index into client.train_data[t]
+(the class-filtered iCIFAR100c) -- NOT a position within the split
+sequence. Raw CIFAR-100 / ImageNet-R dataset indices are NOT
+recoverable here (iCIFAR100c drops the Subset layer at construction);
+(client, task, sample_idx_relative) is sufficient to re-locate any
+sample deterministically within the federated split, and is the same
+coordinate system used by check_feature_batch_sensitivity.py's
+per-sample CSV (join key).
 
 The formal extraction runs under deterministic execution (cudnn +
 CUBLAS + deterministic algorithms), matching the condition under which
@@ -211,10 +214,12 @@ def main():
                 "CUBLAS_WORKSPACE_CONFIG", ""),
         },
         "sample_idx_relative_note": (
-            "position within the client's data_split_indices[t][split] "
-            "sequence (index into client.train_data[t], the class-filtered "
-            "iCIFAR100c). Raw dataset indices are NOT recoverable "
-            "(iCIFAR100c drops the Subset layer at construction)."),
+            "the VALUE stored in data_split_indices[t][split] (an index "
+            "into client.train_data[t], the class-filtered iCIFAR100c; "
+            "NOT a position within the split sequence). Raw dataset "
+            "indices are NOT recoverable (iCIFAR100c drops the Subset "
+            "layer at construction). Same coordinate system as "
+            "check_feature_batch_sensitivity.py's per-sample CSV."),
         "feature_note": "z_ref = frozen pretrained ViT feat; "
                         "z_op = current prompt-enhanced pre-anchor feat",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),

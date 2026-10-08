@@ -153,7 +153,7 @@ python diagnostics/extract_features.py \
     --out_dir diagnostics_output
 ```
 
-- 输出 `diagnostics_output/features_{data_name}_{ckpt名}.npz`（z_ref = frozen ViT 特征、z_op = 当前 prompt 增强的 pre-anchor 特征；含 labels / client_ids / task_ids / round_ids / splits / **sample_idx_relative**——client-task 内层划分序列中的位置，raw dataset index 不可恢复）+ 同名 `.json` 元信息（含 round、client_class_masks、public classes、**deterministic 运行态实读记录**）
+- 输出 `diagnostics_output/features_{data_name}_{ckpt名}.npz`（z_ref = frozen ViT 特征、z_op = 当前 prompt 增强的 pre-anchor 特征；含 labels / client_ids / task_ids / round_ids / splits / **sample_idx_relative**——`data_split_indices` 存储的**值**（client.train_data[t] 的索引），raw dataset index 不可恢复；与 precheck per-sample CSV 同坐标系，(client, task, sample_idx_relative) 可直接 join）+ 同名 `.json` 元信息（含 round、client_class_masks、public classes、**deterministic 运行态实读记录**）
 - **正式 Phase 1 协议默认值：`--split train`、`--batch_size 16`**（z_op 依赖 batch 组成，B 必须与 precheck 通过的取值一致；`--split` 的 test/both 仅限非诊断用途，多模态分析侧已硬性只接受 train）
 - **deterministic extraction**：与 precheck 脚本同协议（CUBLAS env 前置 + cudnn flags 在 bootstrap 后设置），保证正式提取与 precheck 测 floor 时的执行条件一致
 - `--checkpoint` 缺省时自动使用 `checkpoints/latest.pth`；`--data_path` / `--device` 可覆盖 args.json 中的值
@@ -299,7 +299,7 @@ python diagnostics/check_feature_batch_sensitivity.py \
   - **组批对照**：B=16 恒定、`--composition_seeds 0 1 2 3 4` 五次 deterministic permutation vs identity，隔离"组批效应"与"batch size 效应"，杜绝单次 permutation 恰好没换 major prompt 的低估
   - 样本选择：**class-stratified deterministic sampling**（固定种子，非"前 N 个 sorted index"）
 - 输出 `metrics/feature_batch_sensitivity.csv` + `.json`：每 (client, task) 与汇总（ALL）的 delta/cosine 的 mean/median/std/**p05**/p95/**min**/max（delta 看 p95/max 尾部，cosine 看 p05/min 尾部）；**另增 class-level 行**（scope=`class_{label}`，跨 client-task 按类聚合，`is_public` 列标注 public 类——全局稳定 ⇏ 每个目标类稳定，Phase 1 是 class-wise 分析，25 个 public classes 的逐类稳定性是关键）；JSON 含 `public_classes` 清单、`class_level` 汇总与 reading_guide（归因规则：只有 `zop` 漂移 ≫ 两个 floor 才能归因 batchwise prompt；class-level 判读规则同列）
-- 输出 `metrics/feature_batch_sensitivity_samples.csv`：**每样本完整记录**（client / task / label / sample_pos / comparison / delta / cos），可定位"某个 public class 的哪些样本不稳定"（画异常样本、debug 模式时用；约 10 万行量级）
+- 输出 `metrics/feature_batch_sensitivity_samples.csv`：**每样本完整记录**（client / task / label / sample_pos / sample_idx_relative / comparison / delta / cos）。`sample_pos` = 排序后样本列表内的位置（重放分层抽样用）；`sample_idx_relative` = `data_split_indices` 的值（client.train_data[t] 的索引），**与 `features_*.npz` 同坐标系**，(client, task, sample_idx_relative) 可直接 join 定位"某个 public class 的哪些样本不稳定"（约 10 万行量级）
 - **deterministic 设置顺序（v7 修复）**：`cudnn.deterministic / benchmark / use_deterministic_algorithms` 必须在 `bootstrap_server()` **之后**设置——`diag_utils` 会强制 `args.deterministic=False`，`build_server()` → `setup_determinism(False)` 会重开 `cudnn.benchmark=True`，静默覆盖 bootstrap 前设的任何 flags；`CUBLAS_WORKSPACE_CONFIG` 则必须在任何 CUDA context 创建**之前**写入 env。JSON 中的 `cudnn` 字段从 `torch.backends` **实读**（不硬编码），可直接验证运行时真实状态
 - 解读（决策见 roadmap §5.9，看到数字前不擅自改用 z_ref / 不关 batchwise_prompt）：$\bar{\Delta}_B \approx 0$ → `z_op` 可直接用于 Phase 1；显著非零且 ≫ floor → 需重新决定 Semantic Bank 用 `z_ref` / sample-wise prompt feature / 严格定义 prompt context
 - 注意：`--run_dir` 指向**已有完整训练产物**的 run（如 Gate 0B 的 `reg_full`），不是新开训练

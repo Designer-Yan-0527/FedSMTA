@@ -36,6 +36,12 @@ Protocol (all on TRAIN split only, same checkpoint, cudnn deterministic):
      does NOT imply every target class is stable, and Phase 1 is
      class-wise multimodality -- so per-class summaries and a full
      per-sample CSV are written alongside the client-task/ALL summary.
+     The per-sample CSV stores BOTH sample_pos (position inside the
+     sorted-index sample list, for replaying the stratified selection)
+     AND sample_idx_relative (the data_split_indices value, i.e. an
+     index into client.train_data[t] -- the same coordinate system as
+     extract_features.py's sample_idx_relative, so the two files join
+     directly on (client, task, sample_idx_relative)).
 
 Diagnostic only: no training logic is touched, no z_ref switch, no
 batchwise_prompt changes (decision comes after seeing the numbers).
@@ -227,10 +233,13 @@ def main():
     t0 = time.time()
 
     def collect(comparison, delta, cos, client_id=None, task=None,
-                labels=None, positions=None):
+                labels=None, positions=None, idx_rel=None):
         """Pool a per-sample (delta, cos) pair into the overall aggregate;
         when labels/positions are given, also record the per-sample rows
-        and the class-level pools."""
+        and the class-level pools. `positions` are positions inside the
+        sorted-index sample list (sample_pos); `idx_rel` are the
+        data_split_indices values (sample_idx_relative, the join key with
+        extract_features.py)."""
         overall.setdefault(comparison, ([], []))
         overall[comparison][0].append(delta)
         overall[comparison][1].append(cos)
@@ -241,6 +250,7 @@ def main():
             sample_rows.append({
                 "client": client_id, "task": task, "label": lb,
                 "sample_pos": int(positions[j]),
+                "sample_idx_relative": int(idx_rel[j]),
                 "comparison": comparison,
                 "delta": float(delta[j]), "cos": float(cos[j])})
             bc = by_class.setdefault((lb, comparison), ([], []))
@@ -275,6 +285,9 @@ def main():
                 targets_all, args_cli.max_samples, SAMPLING_SEED)
             images = images_all[torch.from_numpy(sel)]
             labels_sel = targets_all[sel]  # labels of the selected samples
+            # join key with extract_features.py: the data_split_indices
+            # VALUE for each selected sample (index into train_data[t])
+            sample_idx_rel = np.asarray(indices, dtype=np.int64)[sel]
             n = images.shape[0]
             scope = f"c{client.id}_t{t}"
 
@@ -292,7 +305,7 @@ def main():
                     rows.append(make_row(scope, client.id, t, n, comp,
                                          delta, cos))
                     collect(comp, delta, cos, client.id, t,
-                            labels_sel, sel)
+                            labels_sel, sel, sample_idx_rel)
 
             # 2) repeat-run floor: identical batching, run twice
             zr_rep, zo_rep = extract_feats(
@@ -300,11 +313,13 @@ def main():
             delta, cos = pair_metrics(zo_rep, z_op_by_b[CONTROL_BATCH_SIZE])
             comp = f"zop_repeat_B={CONTROL_BATCH_SIZE}_run2_vs_run1"
             rows.append(make_row(scope, client.id, t, n, comp, delta, cos))
-            collect(comp, delta, cos, client.id, t, labels_sel, sel)
+            collect(comp, delta, cos, client.id, t, labels_sel, sel,
+                    sample_idx_rel)
             delta, cos = pair_metrics(zr_rep, z_ref_by_b[CONTROL_BATCH_SIZE])
             comp = f"zref_repeat_B={CONTROL_BATCH_SIZE}_run2_vs_run1"
             rows.append(make_row(scope, client.id, t, n, comp, delta, cos))
-            collect(comp, delta, cos, client.id, t, labels_sel, sel)
+            collect(comp, delta, cos, client.id, t, labels_sel, sel,
+                    sample_idx_rel)
 
             # 3) composition controls: fixed B, permuted deterministic order
             for seed in args_cli.composition_seeds:
@@ -320,7 +335,8 @@ def main():
                         f"_vs_identity")
                 rows.append(make_row(scope, client.id, t, n, comp,
                                      delta, cos))
-                collect(comp, delta, cos, client.id, t, labels_sel, sel)
+                collect(comp, delta, cos, client.id, t, labels_sel, sel,
+                        sample_idx_rel)
 
             print(f"client {client.id} task {t}: {n} samples done "
                   f"({time.time()-t0:.0f}s)")
@@ -366,10 +382,15 @@ def main():
         w.writerows(rows)
 
     # full per-sample record: client / task / label / sample_pos /
-    # comparison / delta / cos (sample_pos = position within the
-    # client-task sample list after stratified selection)
+    # sample_idx_relative / comparison / delta / cos.
+    #   sample_pos          = position within the client-task sorted-index
+    #                         sample list (replays the stratified selection)
+    #   sample_idx_relative = the data_split_indices VALUE (index into
+    #                         client.train_data[t]) -- same coordinate
+    #                         system as extract_features.py, so the two
+    #                         files join on (client, task, sample_idx_relative)
     sample_fields = ["client", "task", "label", "sample_pos",
-                     "comparison", "delta", "cos"]
+                     "sample_idx_relative", "comparison", "delta", "cos"]
     with open(samples_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=sample_fields)
         w.writeheader()
