@@ -9,9 +9,20 @@ SAME samples:
 Per the Phase-1 spec, [z; anchor] mixed features are NEVER used here.
 
 Output: one .npz (z_ref, z_op, labels, client_ids, task_ids, round_ids,
-splits, sample_idx) plus a .json meta file (class masks, public classes,
-run info, checkpoint round) consumable by analyze_multimodality.py /
-synthetic_oracle_k2.py.
+splits, sample_idx_relative) plus a .json meta file (class masks, public
+classes, run info, checkpoint round, deterministic runtime state)
+consumable by analyze_multimodality.py / synthetic_oracle_k2.py.
+
+sample_idx_relative semantics: position within the client's
+data_split_indices[t][split] sequence, i.e. an index into
+client.train_data[t] (the class-filtered iCIFAR100c). Raw CIFAR-100 /
+ImageNet-R dataset indices are NOT recoverable here (iCIFAR100c drops
+the Subset layer at construction); sample_idx_relative is sufficient to
+re-locate any sample deterministically within the federated split.
+
+The formal extraction runs under deterministic execution (cudnn +
+CUBLAS + deterministic algorithms), matching the condition under which
+check_feature_batch_sensitivity.py measured its floors.
 
 Usage (from repo root, on the server):
   python diagnostics/extract_features.py \
@@ -25,6 +36,7 @@ override after the batch-sensitivity precheck justifies it).
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -60,10 +72,26 @@ def parse_args():
 
 def main():
     args_cli = parse_args()
+    # CUBLAS deterministic workspace must be configured BEFORE any CUDA
+    # context is created (i.e. before bootstrap builds models / loads data).
+    # Same protocol as check_feature_batch_sensitivity.py: the sensitivity
+    # floors were measured under deterministic execution, so the formal
+    # extraction must run under the SAME execution condition.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     ckpt_path = resolve_checkpoint(args_cli.run_dir, args_cli.checkpoint)
     run_args, server = bootstrap_server(
         args_cli.run_dir, checkpoint=ckpt_path,
         data_path=args_cli.data_path, device=args_cli.device)
+
+    # deterministic flags MUST be applied AFTER bootstrap_server: diag_utils
+    # resets args.deterministic=False and build_server() ->
+    # setup_determinism(False) re-enables cudnn.benchmark=True, silently
+    # undoing any flags set before bootstrap.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
     device = torch.device(run_args.device)
 
     # round the checkpoint corresponds to (start_round = completed_round + 1
@@ -142,7 +170,7 @@ def main():
         task_ids=np.concatenate(tasks_all) if tasks_all else np.zeros((0,), np.int64),
         round_ids=np.concatenate(rounds_all) if rounds_all else np.zeros((0,), np.int64),
         splits=np.concatenate(splits_all) if splits_all else np.zeros((0,), np.int64),
-        sample_idx=np.concatenate(idx_all) if idx_all else np.zeros((0,), np.int64),
+        sample_idx_relative=np.concatenate(idx_all) if idx_all else np.zeros((0,), np.int64),
     )
 
     # meta: class masks + public classes.
@@ -175,6 +203,18 @@ def main():
             for c in server.clients},
         "public_classes": public_classes,
         "split_encoding": {"0": "train", "1": "test"},
+        "deterministic": {  # actual runtime state (read back, never hardcoded)
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "deterministic_algorithms": True,
+            "cublas_workspace_config": os.environ.get(
+                "CUBLAS_WORKSPACE_CONFIG", ""),
+        },
+        "sample_idx_relative_note": (
+            "position within the client's data_split_indices[t][split] "
+            "sequence (index into client.train_data[t], the class-filtered "
+            "iCIFAR100c). Raw dataset indices are NOT recoverable "
+            "(iCIFAR100c drops the Subset layer at construction)."),
         "feature_note": "z_ref = frozen pretrained ViT feat; "
                         "z_op = current prompt-enhanced pre-anchor feat",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),

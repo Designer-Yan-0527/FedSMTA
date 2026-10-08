@@ -32,6 +32,10 @@ Protocol (all on TRAIN split only, same checkpoint, cudnn deterministic):
      cosine similarity; aggregated mean/median/std/p05/p95/min/max per
      (client, task) and overall (cosine: p05/min are the informative
      tail; delta: p95/max).
+  6. Class-level aggregation (esp. the public classes): global stability
+     does NOT imply every target class is stable, and Phase 1 is
+     class-wise multimodality -- so per-class summaries and a full
+     per-sample CSV are written alongside the client-task/ALL summary.
 
 Diagnostic only: no training logic is touched, no z_ref switch, no
 batchwise_prompt changes (decision comes after seeing the numbers).
@@ -161,9 +165,11 @@ def pair_metrics(z_a, z_b):
     return delta, cos
 
 
-def make_row(scope, client_id, task, n, comparison, delta, cos):
+def make_row(scope, client_id, task, n, comparison, delta, cos,
+             is_public=""):
     row = {"scope": scope, "client": client_id, "task": task,
-           "n_samples": n, "comparison": comparison}
+           "n_samples": n, "comparison": comparison,
+           "is_public": is_public}
     for k, v in summarize(delta).items():
         row[f"delta_{k}"] = v
     for k, v in summarize(cos).items():
@@ -200,14 +206,46 @@ def main():
     server.origin_model.to(device)
     server.origin_model.eval()
 
+    # public classes per the federated protocol (same rule as
+    # extract_features.py): a class is public iff it appears in >= 2
+    # clients' class masks. Class-level stability matters most for these.
+    class_to_clients = {}
+    for c in server.clients:
+        c_classes = set()
+        for task_classes in c.class_mask:
+            c_classes.update(int(x) for x in task_classes)
+        for cls in c_classes:
+            class_to_clients.setdefault(cls, set()).add(c.id)
+    public_classes = sorted(
+        cls for cls, cs in class_to_clients.items() if len(cs) >= 2)
+    public_set = set(public_classes)
+
     rows = []
     overall = {}  # comparison key -> list of per-client-task arrays
+    by_class = {}  # (label, comparison) -> ([deltas], [coss])
+    sample_rows = []  # per-sample rows for the samples CSV
     t0 = time.time()
 
-    def collect(comparison, delta, cos):
+    def collect(comparison, delta, cos, client_id=None, task=None,
+                labels=None, positions=None):
+        """Pool a per-sample (delta, cos) pair into the overall aggregate;
+        when labels/positions are given, also record the per-sample rows
+        and the class-level pools."""
         overall.setdefault(comparison, ([], []))
         overall[comparison][0].append(delta)
         overall[comparison][1].append(cos)
+        if labels is None:
+            return
+        for j in range(len(delta)):
+            lb = int(labels[j])
+            sample_rows.append({
+                "client": client_id, "task": task, "label": lb,
+                "sample_pos": int(positions[j]),
+                "comparison": comparison,
+                "delta": float(delta[j]), "cos": float(cos[j])})
+            bc = by_class.setdefault((lb, comparison), ([], []))
+            bc[0].append(delta[j])
+            bc[1].append(cos[j])
 
     for client in server.clients:
         if client.task_id < 0:
@@ -236,6 +274,7 @@ def main():
             sel = stratified_selection(
                 targets_all, args_cli.max_samples, SAMPLING_SEED)
             images = images_all[torch.from_numpy(sel)]
+            labels_sel = targets_all[sel]  # labels of the selected samples
             n = images.shape[0]
             scope = f"c{client.id}_t{t}"
 
@@ -252,7 +291,8 @@ def main():
                     comp = f"{name}_B={bsz}_vs_B=1"
                     rows.append(make_row(scope, client.id, t, n, comp,
                                          delta, cos))
-                    collect(comp, delta, cos)
+                    collect(comp, delta, cos, client.id, t,
+                            labels_sel, sel)
 
             # 2) repeat-run floor: identical batching, run twice
             zr_rep, zo_rep = extract_feats(
@@ -260,11 +300,11 @@ def main():
             delta, cos = pair_metrics(zo_rep, z_op_by_b[CONTROL_BATCH_SIZE])
             comp = f"zop_repeat_B={CONTROL_BATCH_SIZE}_run2_vs_run1"
             rows.append(make_row(scope, client.id, t, n, comp, delta, cos))
-            collect(comp, delta, cos)
+            collect(comp, delta, cos, client.id, t, labels_sel, sel)
             delta, cos = pair_metrics(zr_rep, z_ref_by_b[CONTROL_BATCH_SIZE])
             comp = f"zref_repeat_B={CONTROL_BATCH_SIZE}_run2_vs_run1"
             rows.append(make_row(scope, client.id, t, n, comp, delta, cos))
-            collect(comp, delta, cos)
+            collect(comp, delta, cos, client.id, t, labels_sel, sel)
 
             # 3) composition controls: fixed B, permuted deterministic order
             for seed in args_cli.composition_seeds:
@@ -280,7 +320,7 @@ def main():
                         f"_vs_identity")
                 rows.append(make_row(scope, client.id, t, n, comp,
                                      delta, cos))
-                collect(comp, delta, cos)
+                collect(comp, delta, cos, client.id, t, labels_sel, sel)
 
             print(f"client {client.id} task {t}: {n} samples done "
                   f"({time.time()-t0:.0f}s)")
@@ -294,18 +334,46 @@ def main():
                                 "delta": summarize(d), "cos": summarize(c)}
         rows.append(make_row("ALL", -1, -1, int(d.size), key, d, c))
 
+    # class-level aggregates (scope=class_{label}); global stability does
+    # NOT imply every target class is stable -- Phase 1 is class-wise
+    # multimodality, so the per-class view (esp. public classes) matters
+    class_summary = {}
+    for (lb, key) in sorted(by_class.keys()):
+        deltas, coss = by_class[(lb, key)]
+        d = np.asarray(deltas, dtype=np.float64)
+        c = np.asarray(coss, dtype=np.float64)
+        is_pub = lb in public_set
+        rows.append(make_row(f"class_{lb}", -1, -1, int(d.size), key,
+                             d, c, is_public="yes" if is_pub else "no"))
+        class_summary.setdefault(str(lb), {})[key] = {
+            "n_samples": int(d.size),
+            "is_public": bool(is_pub),
+            "delta": summarize(d), "cos": summarize(c)}
+
     out_dir = Path(args_cli.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "feature_batch_sensitivity.csv"
     json_path = out_dir / "feature_batch_sensitivity.json"
+    samples_path = out_dir / "feature_batch_sensitivity_samples.csv"
 
-    fieldnames = ["scope", "client", "task", "n_samples", "comparison"] + \
+    fieldnames = ["scope", "client", "task", "n_samples", "comparison",
+                  "is_public"] + \
         [f"delta_{k}" for k in STAT_KEYS] + \
         [f"cos_{k}" for k in STAT_KEYS]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
+
+    # full per-sample record: client / task / label / sample_pos /
+    # comparison / delta / cos (sample_pos = position within the
+    # client-task sample list after stratified selection)
+    sample_fields = ["client", "task", "label", "sample_pos",
+                     "comparison", "delta", "cos"]
+    with open(samples_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=sample_fields)
+        w.writeheader()
+        w.writerows(sample_rows)
 
     payload = {
         "run_dir": str(Path(args_cli.run_dir).resolve()),
@@ -327,7 +395,9 @@ def main():
                 "CUBLAS_WORKSPACE_CONFIG", ""),
         },
         "split": "train",
+        "public_classes": public_classes,
         "overall": overall_summary,
+        "class_level": class_summary,
         "reading_guide": {
             "zref_B=*_vs_B=1": "numerical floor (origin_model is "
                                "batch-independent in principle)",
@@ -339,6 +409,10 @@ def main():
                                           "routing)",
             "attribution rule": "blame batchwise prompting only if "
                                 "zop drift >> both floors",
+            "class_level": "global stability does NOT imply every class "
+                           "is stable; check class_level / the samples "
+                           "CSV before using z_op for per-class "
+                           "multimodality (esp. public classes)",
         },
         "note": "Diagnostic only - interpretation and any z_op/z_ref "
                 "decision come after review (roadmap §5.9).",
@@ -349,12 +423,28 @@ def main():
 
     print(f"\nsaved {csv_path}")
     print(f"saved {json_path}")
+    print(f"saved {samples_path} ({len(sample_rows)} rows)")
     print("\n===== overall summary (all client-tasks pooled) =====")
     for key, s in overall_summary.items():
         print(f"{key}: delta_mean={s['delta']['mean']:.6f} "
               f"delta_p95={s['delta']['p95']:.6f} "
               f"cos_p05={s['cos']['p05']:.6f} "
               f"cos_min={s['cos']['min']:.6f}")
+
+    # worst PUBLIC class per comparison by delta_p95: the pooled summary
+    # can look fine while a specific public class is unstable
+    print("\n===== worst public class by delta_p95 (per comparison) =====")
+    for key in overall_summary:
+        worst = None
+        for lb_str, comps in class_summary.items():
+            entry = comps.get(key)
+            if not entry or not entry["is_public"]:
+                continue
+            dp = entry["delta"]["p95"]
+            if not np.isnan(dp) and (worst is None or dp > worst[1]):
+                worst = (lb_str, dp)
+        if worst is not None:
+            print(f"{key}: class {worst[0]} delta_p95={worst[1]:.6f}")
 
 
 if __name__ == "__main__":
