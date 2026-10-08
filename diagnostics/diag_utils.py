@@ -65,7 +65,11 @@ def resolve_checkpoint(run_dir, checkpoint=None):
             ckpt = run_dir / checkpoint
     if not ckpt.is_file():
         raise FileNotFoundError(f"checkpoint not found: {ckpt}")
-    return str(ckpt)
+    # absolute path: makes repeated resolution idempotent (scripts may
+    # pre-resolve and pass the result to bootstrap_server, which resolves
+    # again -- a relative return value would be re-joined with run_dir and
+    # double the path)
+    return str(ckpt.resolve())
 
 
 def bootstrap_server(run_dir, checkpoint=None, data_path=None, device=None):
