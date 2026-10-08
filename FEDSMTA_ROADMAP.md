@@ -730,6 +730,7 @@ GPT 对仓库多轮源码级审查（官方 FedTA vs FedSMTA 逐文件对照）�
 | 24 | **temp_protos "非 None" 断言误伤（第 18 项加固的错误前提）**（服务器 Gate 0B 二跑暴露：resume 路径修复后两侧均完整跑完 "All Process completes"，但测试在 `assert ck["temp_protos"] is not None` 崩溃）：第 18 项加固依据的前提"fuse_protos / 训练每轮必然写入"是**错误的**——`fuse_protos()` 在官方与 fork 中均为死代码（全库无任何调用点），`self.temp_protos` 自 `__init__` 置 None 后从未被写入，每个 checkpoint 里都合法地为 None；Gate 0A 调试期已发现该事实（temp_protos 恒 None 的假 PASS），但未同步撤掉 B/C 的非 None 断言 | B/C 测试删去 `temp_protos is not None` 断言，保留"字段必须存在于 checkpoint"的存在性检查；`protos_diff(None, None)=0` 的相等比较本身就是真实不变量（连续/resume、OFF/ON 两侧必须一致地为 None），不是假 PASS。此为第 18 项的勘误：temp_protos 的正确预期值就是 None |
 | 25 | **numpy RNG 状态比较触发歧义真值**（服务器 Gate 0B 三跑暴露：B1/B2 训练与全部字段比较均通过，最终在 `rng_a["numpy"] == rng_b["numpy"]` 崩溃 `ValueError: The truth value of an array ... is ambiguous`）：`np.random.get_state()` 返回 `('MT19937', ndarray, pos, has_gauss, cached)` 元组，元组 `==` 对内嵌 ndarray 做逐元素比较返回数组，无法取标量真值；B/C 两文件的 `deep_equal()` 也缺 ndarray 分支（会落到 `a == b` 同样崩） | `deep_equal()` 增加 ndarray 分支（shape/dtype 相同 + `(a==b).all()`）；B/C 的 `rng_diffs["numpy"]` 改用 `deep_equal()` 比较（0C 从 0B import 该函数，一处修复两处生效）。本地已验证：相同 state→True、发散 state→False |
 | 26 | **Phase 1 diagnostic 层审计（第六轮复核，三 Gate 全 PASS + tag 之后、正式 Phase 1 之前；全部属实并修复，仅动 diagnostic 文件，不碰 baseline）**：(a) batch sensitivity 脚本单一 composition seed（单次 permutation 恰好没换 major prompt 会低估）、无 z_ref numerical control（无法把 drift 归因于 batchwise prompt 而非 GPU 数值效应）、cosine 缺 p05/min 尾部、"前 256 个 sorted index" 选样可能携带数据组织结构、cudnn 非确定性混入 1e-3~1e-2 级测量；(b) analyzer 缺 roadmap v2 要求的 `D_cover^rel`、Dirichlet 校正指标（normalized entropy / JS / 条件互信息——raw client entropy 被 CIFAR public class 的 Dirichlet non-IID 混淆，只能做描述性指标）；(c) SSE 用 held-out GMM 中心（只见 80% fit 集）在全量上计算，`SSE_2 ≤ SSE_1` 数学性质不保；(d) stability 未实现（单 seed + bootstrap 是 class-mean CI，回答不了"该类在不同 split/初始化下是否始终支持 K=2"）；(e) public class silent fallback 从特征样本反推协议属性 | **check_feature_batch_sensitivity.py**：`--composition_seeds 0-4` 五次组批对照 + z_ref 数值 floor + B=16 同序重复运行 floor + cosine p05/min + class-stratified deterministic sampling + 脚本内强制 cudnn deterministic + JSON reading_guide（归因规则：zop drift ≫ 两个 floor 才归因 batchwise prompt）。**analyze_multimodality.py**：`coverage_distortion_rel`、`normalized_client_entropy_k`、`js_divergence_k`、`client_mode_mi`（I(I;K\|C=c)）四项补齐；SSE 改由全量 TRAIN 专用 KMeans(K=2) 计算（K=1 解是 K=2 可行特例，严格保证 SSE₂≤SSE₁；held-out GMM 只出 NLL/BIC，两个目的分离）；`--heldout_seeds 0-4` × `--gmm_seeds 0-2` 配对轮转 5 runs 出 per-class `p_nll`/`p_bic`/`rho_median`/`dcover_rel_median` + robust multimodal 判定（p≥0.8 且 rho>1.0 且 D_rel>0.1，阈值可调）；public_classes 缺失直接 RuntimeError（不再 silent fallback）。新数学函数已本地单元验证（JS 边界值 / MI 完全关联=ln2 完全独立=0 / SSE 不等式 / 分层抽样确定性） |
+| 27 | **Phase 1 diagnostic 层第七轮复核（全部属实并修复，仅动 diagnostic 文件）**：(a) 🔴 **deterministic 设置顺序 bug**——batch sensitivity 脚本把 `cudnn.deterministic=True / benchmark=False` 设在 `bootstrap_server()` **之前**，而 `diag_utils` 强制 `args.deterministic=False`、`build_server()` → `setup_determinism(False)` 会重开 `cudnn.benchmark=True`，静默覆盖脚本 flags，注释声称的 deterministic 运行态实际不成立；(b) 🟠 **stability 只做了一半**——5 runs 的 `p_nll/p_bic/rho_median` 已实现，但 CSV/aggregate/console 的 `delta_nll/delta_bic/rho/silhouette/coverage_distortion/client_mode_mi/...` 与 `n_delta_*_positive` 计数仍取 `run_stats[0]`（heldout seed 0 + GMM seed 0 单次结果），run-0 恰好失败时出现 "p_NLL=0.8 robust=True 但 delta_nll<0" 的自相矛盾；(c) 🟠 **GMM mode label switching**——GaussianMixture component 0/1 无语义，`mode1_mass/client_entropy_mode1/js_divergence_mode1` 等字段跨 seed/class 直接聚合没有可比性；(d) 🟡 `normalized_client_entropy` 命名误导（H_k/H(p(i\|c)) 可 >1，非 [0,1] 归一化）；(e) 🟡 robust 阈值缺敏感性检查；(f) 🟡 `extract_features.py` 默认 `--split both --batch_size 64` 与正式协议（train / B=16）不一致，易误操作 | **check_feature_batch_sensitivity.py**：`CUBLAS_WORKSPACE_CONFIG` 前置到任何 CUDA context 之前 + cudnn flags / `use_deterministic_algorithms(True, warn_only=True)` 移到 bootstrap **之后** + JSON `cudnn` 字段从 `torch.backends` 实读（可验证运行时真实状态，不再硬编码）。**analyze_multimodality.py**：fit_stats 内 canonical ordering（`order = argsort(-weights)`，mode1 = major mode，π₁≥π₂；weights/means/covariances 重排 + predict 标签 remap）+ 新增 label-invariant 指标 `mode_mass_minor`（min πₖ）与 `js_weighted`（Σₖ πₖ·D_JSₖ）；主报告口径改为跨 run **median**（`*_median` + `*_std`，`STABILITY_KEYS` 15 项全部覆盖），run-0 快照降级为 `*_primary` debug 列；`n_delta_*_positive` 与 robust 判定均用 median；`normalized_client_entropy_k` 更名 `client_entropy_ratio_k`（明确 ratio 语义、可 >1、辅助指标；主证据 = MI + js_weighted）；aggregate 增加 `robust_sensitivity` 网格（ρ∈{0.75,1.0,1.25} × D_rel∈{0.05,0.10,0.15}，operational thresholds 非理论阈值）。**extract_features.py**：默认改为正式协议 `--split train --batch_size 16`。canonical ordering 已本地单元验证：构造数学上完全相同、仅 component 标签交换的两个 GMM，18 个字段（canonical + label-invariant + ΔNLL/ΔBIC）全部逐位一致 |
 
 第五轮复核同时确认：CIFAR-100 冻结协议下 Client 两阶段训练 / Tail Anchor / InfoNCE / Global Prompt（含 batchwise majority routing）/ BGPS（`threshold=0.25` 时）/ SIKF（`global_epoch=5` 时）/ FedAvg head / CIFAR partition 均与官方一致；单客户端 SIKF 分支的 `client.prompts` bugfix 在标准 5-client 全参与协议下不触发；ImageNet-R 不宣称 strict official parity。
 
@@ -762,7 +763,7 @@ GPT 对仓库多轮源码级审查（官方 FedTA vs FedSMTA 逐文件对照）�
 
 ## 13. 当前状态与下一步
 
-### 状态快照（截至 2026-10-08，v7）
+### 状态快照（截至 2026-10-08，v8）
 
 $$\boxed{\text{Phase 0 三 Gate 全部 PASS，baseline 已冻结（tag: phase0-fedta-baseline）}}$$
 
@@ -770,45 +771,15 @@ $$\boxed{\text{Phase 0 三 Gate 全部 PASS，baseline 已冻结（tag: phase0-f
 - **Gate 0B（resume 等价）**：**PASS**（2026-10-08 服务器，22 项全绿：全部模型组件 / protos / prompt / key / anchor / heads / accuracy matrix / inner+outer split manifest / torch+numpy+python+cuda 四路 RNG 均逐位一致；过程中排障记录见 §12.2 第 23–25 项）
 - **Gate 0C（observer 不变性）**：**PASS**（2026-10-08 服务器，29 项全绿：21 项训练轨迹逐位一致 + 4 组 artifact 区分验证：train_log.csv / round_metrics.jsonl / accuracy_matrix.csv / margins.csv 仅 ON 侧存在、OFF 侧确证缺失；报告存 `output/regression/metrics/observer_invariance.json`）
 - **Phase 0 Freeze**：已打 tag `phase0-fedta-baseline`；`--method fedta` 从此视为 read-only scientific baseline
-- **Phase 1**：第六轮审计（第 26 项）修复全部落地——precheck 脚本三层对照加固（composition seeds / z_ref floor / repeat floor / 分层抽样 / cudnn deterministic）、analyzer 补齐 `D_cover^rel` + Dirichlet 校正指标 + per-class stability + robust 判定、SSE 定义分离（全量 KMeans）。待办：服务器跑 precheck → `z_op` 稳定则正式提取（B=16, train）→ 跑 25 public classes 诊断
-- **Phase 2+**：未开始，**一行 Phase 2 代码都不要继续加**（synthetic_oracle_k2.py 仅为 synthetic sanity check，不计入）
+- **Phase 1**：第六轮（第 26 项）+ 第七轮（第 27 项）审计修复全部落地——precheck 脚本三层对照加固（composition seeds / z_ref floor / repeat floor / 分层抽样）+ **deterministic 设置顺序修复**（flags 移到 bootstrap 后、JSON 实读运行态）；analyzer 补齐 `D_cover^rel` + Dirichlet 校正指标 + per-class stability（**median 主报告口径**）+ **GMM canonical ordering**（mode1 = major mode，π₁≥π₂；label-invariant 主证据 = MI + js_weighted）+ robust_sensitivity 阈值网格；`extract_features.py` 默认改为正式协议（train / B=16）。canonical ordering 已单元验证（18 字段 label-switching 不变）。**Phase 1 diagnostic implementation = ready**。待办：服务器跑 precheck → `z_op` 稳定则正式提取（B=16, train）→ 跑 25 public classes 诊断
+- **Phase 2+**：未开始，**一行 Phase 2 代码都不要继续加**（synthetic_oracle_k2.py 仅为 synthetic sanity check，不计入）；是否启动 Oracle-K2 等 Phase 1 真实 $P_{NLL}/P_{BIC}/\rho/D_{\rm cover}^{rel}/{\rm MI}$ 结果出来再决定
 
 ### 下一步行动（按序）
 
-1. 服务器按顺序跑通三个 Gate（实现完成 ≠ Gate 通过；Gate 0A 强制 `global_epoch=5`，smoke 先行）：
-   ```bash
-   # Gate 0A smoke：官方 parity（需 --official_repo 指向官方 FedTA 仓库本地克隆）
-   python tests/test_official_fedta_parity.py \
-       --official_repo /path/to/official_FedTA \
-       --data_path ./local_datasets \
-       --global_epoch 5 --task_num 1 --rounds 5 --local_epoch 1 \
-       --batch_size 16 --surrogate_num 20 --threshold 0.25 \
-       --seed 42 --device cuda
-
-   # Gate 0A 正式短程（覆盖 task transition）
-   python tests/test_official_fedta_parity.py \
-       --official_repo /path/to/official_FedTA \
-       --data_path ./local_datasets \
-       --global_epoch 5 --task_num 2 --rounds 10 --local_epoch 1 \
-       --batch_size 16 --surrogate_num 20 --threshold 0.25 \
-       --seed 42 --device cuda
-
-   # Gate 0B：resume 回归（resume 正好跨 task boundary；ours vs ours，global_epoch=2 合法）
-   python tests/test_resume_regression.py \
-       --data_name cifar100 --data_path ./local_datasets \
-       --rounds 4 --split_at 2 --global_epoch 2 --task_num 2 --local_epoch 2 \
-       --seed 42 --device cuda
-
-   # Gate 0C：observer 不变性（rounds=3 跨 task 边界，覆盖 next-task split）
-   python tests/test_observer_invariance.py \
-       --data_name cifar100 --data_path ./local_datasets \
-       --rounds 3 --global_epoch 2 --task_num 2 --local_epoch 2 \
-       --seed 42 --device cuda
-   ```
-2. 三个 Gate 全部 PASS 后打 tag `phase0-fedta-baseline`，冻结 baseline（`--method fedta` 从此视为 read-only scientific baseline）
-3. 实现 `diagnostics/check_feature_batch_sensitivity.py`（§5.9 规格）并运行，确认 $z_{\rm op}$ 是否为稳定的 sample-level semantic representation（**Phase 1-precheck**，不是 Phase 0 Gate）
-4. 跑 Phase 1 真实诊断：25 public classes × ($z_{\rm ref}$, $z_{\rm op}$)，产出 $\Delta NLL$、$\Delta BIC$、$\rho$、$D_{\rm cover}^{\rm rel}$、client-mode MI / JS divergence 及 bootstrap CI（Gate 判据见 §5.10）
-5. **看到真实 multimodality 结果之前，不开发 Semantic-K2 / UOT / dynamic K；现在一行 Phase 2 代码都不要继续加**
+1. **Phase 1-precheck**（服务器，命令见 `RUNCOMMANDS.md` 第 14 节）：跑 `diagnostics/check_feature_batch_sensitivity.py`，按 JSON `reading_guide` 归因规则读数（`zop` 漂移 ≫ z_ref floor 与 repeat floor 两个 floor 才归因 batchwise prompt）；先检查 JSON `cudnn` 字段确证 deterministic 运行态真实生效
+2. precheck 通过后，**正式特征提取**：`diagnostics/extract_features.py`（默认即正式协议 `--split train --batch_size 16`，用 `task_04_end.pth`）
+3. 跑 25 public classes 多模态诊断：`diagnostics/analyze_multimodality.py`，主看 median 口径的 $P_{NLL}$、$P_{BIC}$、$\rho_{\rm median}$、$D_{\rm cover,median}^{rel}$、client_mode_mi / js_weighted 及 robust prevalence（Gate 判据见 §5.10；阈值用 `robust_sensitivity` 网格做敏感性检查）
+4. **看到真实 multimodality 结果之前，不开发 Oracle-K2 / Semantic-K2 / UOT / dynamic K；现在一行 Phase 2 代码都不要继续加**——Oracle-K2 是否启动由 Phase 1 真实数据决定
 
 ### 给后续开发的硬约束（再次强调）
 

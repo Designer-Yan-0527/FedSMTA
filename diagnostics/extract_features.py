@@ -18,6 +18,9 @@ Usage (from repo root, on the server):
       --run_dir output/cifar100/fedta/<run_name>/seed_42 \
       --checkpoint checkpoints/task_04_end.pth \
       --out_dir diagnostics_output
+
+Formal Phase-1 protocol defaults: --split train --batch_size 16 (only
+override after the batch-sensitivity precheck justifies it).
 """
 
 import argparse
@@ -41,9 +44,14 @@ def parse_args():
                         "(default: checkpoints/latest.pth)")
     p.add_argument("--out_dir", default="diagnostics_output",
                    help="output directory (default: diagnostics_output)")
-    p.add_argument("--split", default="both", choices=["train", "test", "both"],
-                   help="which split of each client task to extract (default: both)")
-    p.add_argument("--batch_size", default=64, type=int)
+    p.add_argument("--split", default="train", choices=["train", "test", "both"],
+                   help="which split of each client task to extract "
+                        "(default: train -- the formal Phase-1 protocol; "
+                        "test extraction is only for post-hoc reporting)")
+    p.add_argument("--batch_size", default=16, type=int,
+                   help="extraction batch size (default: 16 -- the formal "
+                        "Phase-1 protocol; see the batch-sensitivity "
+                        "precheck before changing)")
     p.add_argument("--data_path", default=None,
                    help="override dataset root (default: value from args.json)")
     p.add_argument("--device", default=None, help="override device (default: from args.json)")

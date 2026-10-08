@@ -150,11 +150,11 @@ output/
 python diagnostics/extract_features.py \
     --run_dir output/cifar100/fedta/<run_name>/seed_42 \
     --checkpoint output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_04_end.pth \
-    --out_dir diagnostics_output \
-    --split both
+    --out_dir diagnostics_output
 ```
 
 - 输出 `diagnostics_output/features_{data_name}_{ckpt名}.npz`（z_ref = frozen ViT 特征、z_op = 当前 prompt 增强的 pre-anchor 特征；含 labels / client_ids / task_ids / round_ids / splits / sample_idx）+ 同名 `.json` 元信息（含 round、client_class_masks、public classes）
+- **正式 Phase 1 协议默认值：`--split train`、`--batch_size 16`**（z_op 依赖 batch 组成，B 必须与 precheck 通过的取值一致；`--split` 的 test/both 仅限非诊断用途，多模态分析侧已硬性只接受 train）
 - `--checkpoint` 缺省时自动使用 `checkpoints/latest.pth`；`--data_path` / `--device` 可覆盖 args.json 中的值
 
 ### 9.2 多模态分析（NLL / BIC / rho / D_cover(+rel) / Dirichlet 校正指标 / stability）
@@ -167,8 +167,8 @@ python diagnostics/analyze_multimodality.py \
 
 - 默认只分析 public classes（类出现在 ≥2 个 client 的 class mask 中，由数据协议定义），加 `--all_classes` 分析全部；**metadata 缺失 `public_classes` 时直接 RuntimeError**（public/private 是联邦协议属性，禁止从特征样本反推）；**只用 TRAIN split 发现 semantic modes——`--split` 仅接受 `train`，test/all 已被硬性禁止（test-leakage 防护）**
 - **模型选择与描述性几何严格分离**：held-out GMM（80/20）只出 `nll/delta_nll`、`bic/delta_bic`（p_K = K·d + K + (K−1)）；`sse/delta_sse` 由全量 TRAIN 上的专用 KMeans(K=2) 计算（K=1 解是 K=2 的可行特例，数学上严格保证 SSE₂ ≤ SSE₁；held-out GMM 的中心只见 80% 数据，不得用于 SSE）
-- 每类统计：`delta_sse`、`delta_nll`、`delta_bic`、`silhouette`、`mode_distance`、`rho`、`mode1/mode2_mass`、`coverage_distortion`（D_cover）+ **`coverage_distortion_rel`**（失真占类内散度比例）、每 mode 的 `client_entropy` + **Dirichlet 校正指标**：`normalized_client_entropy_k`（H_k / H(p(i|c))）、`js_divergence_k`（D_JS(p(i|c,k) ‖ p(i|c))）、`client_mode_mi`（I(I;K|C=c)），另保留 S_W/S_B/H_c
-- **per-class stability**（`--heldout_seeds 0 1 2 3 4` × `--gmm_seeds 0 1 2` 配对轮转，共 5 runs）：每类输出 `p_nll` / `p_bic`（Δ>0 的 run 比例）、`rho_median`、`dcover_rel_median`；**robust multimodal** 判定 = p_nll ≥ 0.8 且 p_bic ≥ 0.8 且 rho_median > `--rho_threshold`(默认 1.0) 且 dcover_rel_median > `--dcover_rel_threshold`(默认 0.1)
+- 每类统计：`delta_sse`、`delta_nll`、`delta_bic`、`silhouette`、`mode_distance`、`rho`、`mode1/mode2_mass`（**canonical ordering：mode1 = major mode，π₁ ≥ π₂**，否则 GMM component label 跨 seed/class 不可比——label switching）、`mode_mass_minor`（label-invariant）、`coverage_distortion`（D_cover）+ **`coverage_distortion_rel`**（失真占类内散度比例）、每 mode 的 `client_entropy` + Dirichlet 校正指标：**`client_mode_mi`（I(I;K|C=c)）与 `js_weighted`（Σₖ πₖ·D_JSₖ）为主证据（均 label-invariant）**，辅助 `client_entropy_ratio_k`（H_k / H(p(i|c))，**是 ratio 而非 [0,1] 归一化，可 >1**）与 `js_divergence_k`，另保留 S_W/S_B/H_c
+- **报告口径 = 跨 run median**（`--heldout_seeds 0 1 2 3 4` × `--gmm_seeds 0 1 2` 配对轮转共 5 runs）：每类正式指标为 `*_median`（附 `*_std`），CSV 中 run-0 快照降级为 `*_primary` **debug 列**，不作为论文主结果；`p_nll` / `p_bic`（Δ>0 的 run 比例）同口径；**robust multimodal** 判定 = p_nll ≥ 0.8 且 p_bic ≥ 0.8 且 `rho_median` > `--rho_threshold`(默认 1.0) 且 `dcover_rel_median` > `--dcover_rel_threshold`(默认 0.1)——**这些是 operational thresholds 而非理论阈值**，aggregate JSON 内含 `robust_sensitivity` 网格（ρ ∈ {0.75, 1.0, 1.25} × D_rel ∈ {0.05, 0.10, 0.15}）供阈值敏感性检查
 - 输出（默认在特征文件同目录，可用 `--out_csv` / `--aggregate_json` 覆盖）：
   - `multimodality_summary.csv` — 每 (feature_type, class) 一行（含 stability 列与 robust 标志）
   - `multimodality_aggregate.json` — 各指标 mean / median / std / p25 / p75 / bootstrap 95% CI + **robust 类计数/比例/清单（prevalence，Phase 1 Gate 判据）**
@@ -298,6 +298,7 @@ python diagnostics/check_feature_batch_sensitivity.py \
   - **组批对照**：B=16 恒定、`--composition_seeds 0 1 2 3 4` 五次 deterministic permutation vs identity，隔离"组批效应"与"batch size 效应"，杜绝单次 permutation 恰好没换 major prompt 的低估
   - 样本选择：**class-stratified deterministic sampling**（固定种子，非"前 N 个 sorted index"）
 - 输出 `metrics/feature_batch_sensitivity.csv` + `.json`：每 (client, task, 对照) 与汇总（ALL）的 delta/cosine 的 mean/median/std/**p05**/p95/**min**/max（delta 看 p95/max 尾部，cosine 看 p05/min 尾部）；JSON 含 reading_guide（归因规则：只有 `zop` 漂移 ≫ 两个 floor 才能归因 batchwise prompt）
+- **deterministic 设置顺序（v7 修复）**：`cudnn.deterministic / benchmark / use_deterministic_algorithms` 必须在 `bootstrap_server()` **之后**设置——`diag_utils` 会强制 `args.deterministic=False`，`build_server()` → `setup_determinism(False)` 会重开 `cudnn.benchmark=True`，静默覆盖 bootstrap 前设的任何 flags；`CUBLAS_WORKSPACE_CONFIG` 则必须在任何 CUDA context 创建**之前**写入 env。JSON 中的 `cudnn` 字段从 `torch.backends` **实读**（不硬编码），可直接验证运行时真实状态
 - 解读（决策见 roadmap §5.9，看到数字前不擅自改用 z_ref / 不关 batchwise_prompt）：$\bar{\Delta}_B \approx 0$ → `z_op` 可直接用于 Phase 1；显著非零且 ≫ floor → 需重新决定 Semantic Bank 用 `z_ref` / sample-wise prompt feature / 严格定义 prompt context
 - 注意：`--run_dir` 指向**已有完整训练产物**的 run（如 Gate 0B 的 `reg_full`），不是新开训练
 

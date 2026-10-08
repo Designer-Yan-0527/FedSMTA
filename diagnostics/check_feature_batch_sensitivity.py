@@ -46,6 +46,7 @@ Usage (from repo root, on the server):
 import argparse
 import csv
 import json
+import os
 import time
 from pathlib import Path
 
@@ -177,16 +178,24 @@ def main():
     if CONTROL_BATCH_SIZE not in args_cli.batch_sizes:
         args_cli.batch_sizes.append(CONTROL_BATCH_SIZE)
 
-    # numerical-nondeterminism floor must be minimized before interpreting
-    # 1e-3..1e-2 level drift (diag_utils resets args.deterministic, so set
-    # the cudnn flags explicitly here, for this diagnostic only)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # CUBLAS deterministic workspace must be configured BEFORE any CUDA
+    # context is created (i.e. before bootstrap builds models / loads data)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     ckpt_path = resolve_checkpoint(args_cli.run_dir, args_cli.checkpoint)
     run_args, server = bootstrap_server(
         args_cli.run_dir, checkpoint=ckpt_path,
         data_path=args_cli.data_path, device=args_cli.device)
+
+    # deterministic flags MUST be applied AFTER bootstrap_server: diag_utils
+    # resets args.deterministic=False and build_server() ->
+    # setup_determinism(False) re-enables cudnn.benchmark=True, silently
+    # undoing any flags set before bootstrap. The 1e-3..1e-2 level drift we
+    # measure here demands the nondeterminism floor be minimized.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
     device = torch.device(run_args.device)
     server.origin_model.to(device)
     server.origin_model.eval()
@@ -310,7 +319,13 @@ def main():
         "sampling": {"strategy": "class-stratified deterministic",
                      "seed": SAMPLING_SEED,
                      "max_samples_per_client_task": args_cli.max_samples},
-        "cudnn": {"deterministic": True, "benchmark": False},
+        "cudnn": {  # actual runtime state (read back, never hardcoded)
+            "deterministic": bool(torch.backends.cudnn.deterministic),
+            "benchmark": bool(torch.backends.cudnn.benchmark),
+            "deterministic_algorithms": True,
+            "cublas_workspace_config": os.environ.get(
+                "CUBLAS_WORKSPACE_CONFIG", ""),
+        },
         "split": "train",
         "overall": overall_summary,
         "reading_guide": {

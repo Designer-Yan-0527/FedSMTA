@@ -21,15 +21,23 @@ pre-anchor features (z_ref and/or z_op -- NEVER [z;anchor]):
   - client-mode association, Dirichlet-corrected (raw entropies alone are
     confounded by the federated split's client imbalance):
         r_i,k = n_i,k / sum_j n_j,k ;  H_k = -sum_i r_i,k log r_i,k
-        normalized_client_entropy_k = H_k / H(p(i|c))
+        client_entropy_ratio_k = H_k / H(p(i|c))   (auxiliary; can exceed 1)
         js_divergence_k = D_JS( p(i|c,k) || p(i|c) )
-        client_mode_mi = I(I; K | C=c)
+        js_weighted = sum_k pi_k * D_JS_k          (label-invariant)
+        client_mode_mi = I(I; K | C=c)             (label-invariant)
+  - GMM mode labels are canonically ordered: mode 1 = MAJOR mode
+    (pi_1 >= pi_2); without this, mode1/mode2 fields would be
+    incomparable across seeds/classes (label switching)
   - per-class stability across repeated (heldout_seed, gmm_seed) runs:
         P_c^NLL = frac of runs with delta_nll > 0
         P_c^BIC = frac of runs with delta_bic > 0
+        REPORTED per-class values = medians across runs (*_median, plus
+        *_std); run-0 snapshots kept as *_primary debug columns only
         robust multimodal: P^NLL >= 0.8 AND P^BIC >= 0.8 AND
                            median rho > rho_threshold AND
                            median D_cover_rel > dcover_rel_threshold
+        (thresholds are operational, not theoretical; the aggregate JSON
+        includes a robust_sensitivity grid over rho x D_cover_rel)
 
 Outputs:
   - multimodality_summary.csv   (default: alongside the features .npz)
@@ -53,13 +61,34 @@ from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 
-METRICS_FOR_AGGREGATE = [
-    "delta_sse", "delta_nll", "delta_bic", "silhouette", "mode_distance",
-    "rho", "mode1_mass", "coverage_distortion", "coverage_distortion_rel",
-    "client_entropy_mode1", "client_entropy_mode2",
-    "normalized_client_entropy_mode1", "normalized_client_entropy_mode2",
+# per-class metrics aggregated across the (heldout_seed, gmm_seed) runs;
+# the REPORTED value is the median (+ std for spread). mode1/mode2 fields
+# are comparable across runs only because of the canonical ordering
+# (mode 1 = major mode, pi_1 >= pi_2) inside fit_stats.
+STABILITY_KEYS = [
+    "delta_nll", "delta_bic", "rho", "mode_distance", "silhouette",
+    "mode1_mass", "mode_mass_minor",
+    "coverage_distortion", "coverage_distortion_rel",
+    "client_mode_mi", "js_weighted",
     "js_divergence_mode1", "js_divergence_mode2",
-    "client_mode_mi", "H_c",
+    "client_entropy_ratio_mode1", "client_entropy_ratio_mode2",
+]
+# run-0 snapshots kept as debug columns ONLY (a single run can disagree
+# with the majority, e.g. robust=True with a negative run-0 delta_nll)
+DEBUG_PRIMARY_KEYS = [
+    "delta_nll", "delta_bic", "rho", "silhouette",
+    "coverage_distortion", "coverage_distortion_rel",
+    "client_mode_mi", "js_weighted",
+]
+METRICS_FOR_AGGREGATE = [
+    "delta_sse", "delta_nll_median", "delta_bic_median",
+    "mode_distance_median", "rho_median", "mode1_mass_median",
+    "mode_mass_minor_median",
+    "coverage_distortion_median", "coverage_distortion_rel_median",
+    "silhouette_median", "client_mode_mi_median", "js_weighted_median",
+    "js_divergence_mode1_median", "js_divergence_mode2_median",
+    "client_entropy_ratio_mode1_median", "client_entropy_ratio_mode2_median",
+    "H_c",
 ]
 EPS = 1e-12
 
@@ -170,12 +199,16 @@ def client_mode_stats(client_ids_c, lab):
             H_k = float(-(r[r > 0] * np.log(r[r > 0])).sum())
             p_ick = {i: counts_k[i] / tot for i in clients if counts_k[i] > 0}
             out[f"client_entropy_mode{k + 1}"] = H_k
-            out[f"normalized_client_entropy_mode{k + 1}"] = (
+            # RATIO, not a [0,1] normalization: a mode can be MORE
+            # client-spread than the class baseline (ratio > 1).
+            # Auxiliary metric -- MI + weighted JS are the primary
+            # Dirichlet-corrected evidence.
+            out[f"client_entropy_ratio_mode{k + 1}"] = (
                 H_k / H_pc if H_pc > 0 else float("nan"))
             out[f"js_divergence_mode{k + 1}"] = js_divergence(p_ick, p_i)
         else:
             out[f"client_entropy_mode{k + 1}"] = float("nan")
-            out[f"normalized_client_entropy_mode{k + 1}"] = float("nan")
+            out[f"client_entropy_ratio_mode{k + 1}"] = float("nan")
             out[f"js_divergence_mode{k + 1}"] = float("nan")
     return out
 
@@ -226,21 +259,35 @@ def fit_stats(z, client_ids_c, gmm_seed, heldout_seed):
     out["delta_nll"] = out["nll1"] - out["nll2"]   # > 0 favors K=2
 
     gm2 = gms[2]
-    lab = gm2.predict(z)                            # hard K=2 assignment
+    # canonical ordering: mode 1 = MAJOR mode (pi_1 >= pi_2). GMM component
+    # labels are arbitrary -- without canonicalization, mode1/mode2 fields
+    # are incomparable across seeds and classes (label switching). We
+    # reorder only the arrays we read (model internals stay untouched) and
+    # remap the hard assignments accordingly.
+    order = np.argsort(-gm2.weights_)
+    pi = gm2.weights_[order]
+    mu_k = gm2.means_[order]                        # (2, d)
+    var = gm2.covariances_[order]
+    lab_raw = gm2.predict(z)
+    lab = np.zeros_like(lab_raw)                    # hard K=2 assignment
+    for new_k, old_k in enumerate(order):
+        lab[lab_raw == old_k] = new_k
 
     if len(np.unique(lab)) >= 2:
         out["silhouette"] = float(silhouette_score(z, lab))
     else:
         out["silhouette"] = float("nan")
 
-    # mode geometry (from the held-out GMM)
-    v1, v2 = float(gm2.covariances_[0]), float(gm2.covariances_[1])
-    pi1, pi2 = float(gm2.weights_[0]), float(gm2.weights_[1])
-    mu_k = gm2.means_                               # (2, d)
+    # mode geometry (from the held-out GMM). Label-invariant metrics are
+    # marked; canonical metrics are only comparable BECAUSE of the ordering
+    # above. mode1 = major mode, mode2 = minor mode.
+    v1, v2 = float(var[0]), float(var[1])
+    pi1, pi2 = float(pi[0]), float(pi[1])
     md = float(np.linalg.norm(mu_k[0] - mu_k[1]))
-    out["mode_distance"] = md
-    out["rho"] = float(md / np.sqrt(d * (v1 + v2) / 2.0 + EPS))
-    out["mode1_mass"], out["mode2_mass"] = pi1, pi2
+    out["mode_distance"] = md                       # label-invariant
+    out["rho"] = float(md / np.sqrt(d * (v1 + v2) / 2.0 + EPS))  # invariant
+    out["mode1_mass"], out["mode2_mass"] = pi1, pi2  # canonical
+    out["mode_mass_minor"] = float(min(pi1, pi2))   # label-invariant
 
     # single-prototype coverage distortion (raw + relative)
     mu_single = pi1 * mu_k[0] + pi2 * mu_k[1]
@@ -254,6 +301,13 @@ def fit_stats(z, client_ids_c, gmm_seed, heldout_seed):
 
     # Dirichlet-corrected client-mode association
     out.update(client_mode_stats(client_ids_c, lab))
+    # label-invariant weighted JS: the primary evidence alongside MI
+    # (both are immune to the mode label permutation)
+    js1, js2 = out["js_divergence_mode1"], out["js_divergence_mode2"]
+    if not (np.isnan(js1) or np.isnan(js2)):
+        out["js_weighted"] = float(pi1 * js1 + pi2 * js2)
+    else:
+        out["js_weighted"] = float("nan")
     return out
 
 
@@ -392,44 +446,51 @@ def main():
             z = feats[sel]
             cids_c = client_ids[sel]
 
-            # repeated (heldout, gmm) seed runs -> stability
+            # repeated (heldout, gmm) seed runs -> per-class stability.
+            # REPORTED values are medians across runs; a single run can
+            # disagree with the majority (e.g. robust=True while run 0
+            # happens to give delta_nll < 0), so run-0 snapshots are kept
+            # as *_primary debug columns only, never as paper numbers.
             run_stats = [fit_stats(z, cids_c, gs, hs) for hs, gs in runs]
-            primary = run_stats[0]
             p_nll = float(np.mean([s["delta_nll"] > 0 for s in run_stats]))
             p_bic = float(np.mean([s["delta_bic"] > 0 for s in run_stats]))
-            rho_median = float(np.median([s["rho"] for s in run_stats]))
-            dcover_rel_median = float(np.median(
-                [s["coverage_distortion_rel"] for s in run_stats]))
+            stab = {}
+            for k in STABILITY_KEYS:
+                vals = [s[k] for s in run_stats if not np.isnan(s[k])]
+                if vals:
+                    stab[f"{k}_median"] = float(np.median(vals))
+                    stab[f"{k}_std"] = (float(np.std(vals))
+                                        if len(vals) > 1 else 0.0)
             robust = bool(
                 p_nll >= args.p_stability_threshold
                 and p_bic >= args.p_stability_threshold
-                and rho_median > args.rho_threshold
-                and dcover_rel_median > args.dcover_rel_threshold)
+                and stab["rho_median"] > args.rho_threshold
+                and stab["coverage_distortion_rel_median"]
+                > args.dcover_rel_threshold)
 
+            primary = run_stats[0]  # plots only + debug columns
             row = {
                 "feature_type": ft, "class_id": c,
                 "n_clients": len(z_by_client), "sample_num": int(N),
                 "S_W": S_W, "S_B": S_B, "H_c": H_c,
                 "n_runs": len(run_stats),
-                "p_nll": p_nll, "p_bic": p_bic,
-                "rho_median": rho_median,
-                "dcover_rel_median": dcover_rel_median,
-                "robust": robust,
+                "p_nll": p_nll, "p_bic": p_bic, "robust": robust,
+                "n_fit": primary["n_fit"], "n_val": primary["n_val"],
             }
+            row.update(stab)
             # descriptive SSE from a dedicated all-data KMeans (never the
             # held-out GMM); KMeans seed follows the primary gmm seed
             row.update(descriptive_sse(z, args.gmm_seeds[0]))
-            # per-class statistics from the primary run (run 0); stability
-            # summaries above capture the cross-run variation
-            for k, v in primary.items():
-                if k not in ("mu_single", "mode_centers"):
-                    row[k] = v
+            # run-0 snapshots: debug only (NOT paper numbers)
+            for k in DEBUG_PRIMARY_KEYS:
+                row[f"{k}_primary"] = primary[k]
             rows.append(row)
             print(f"[{ft}] class {c:3d}: N={N:5d} clients={len(z_by_client)} "
-                  f"dBIC={row['delta_bic']:.1f} dNLL={row['delta_nll']:.4f} "
-                  f"rho={row['rho']:.2f} D_cov={row['coverage_distortion']:.2f} "
-                  f"D_cov_rel={row['coverage_distortion_rel']:.3f} "
-                  f"MI={row['client_mode_mi']:.3f} "
+                  f"dBIC={row['delta_bic_median']:.1f} "
+                  f"dNLL={row['delta_nll_median']:.4f} "
+                  f"rho={row['rho_median']:.2f} "
+                  f"D_cov_rel={row['coverage_distortion_rel_median']:.3f} "
+                  f"MI={row['client_mode_mi_median']:.3f} "
                   f"P_nll={p_nll:.1f} P_bic={p_bic:.1f} "
                   f"robust={robust}")
             if plot_dir is not None:
@@ -444,18 +505,12 @@ def main():
         return
 
     fields = ["feature_type", "class_id", "n_clients", "sample_num",
-              "n_runs", "p_nll", "p_bic", "rho_median", "dcover_rel_median",
-              "robust",
-              "sse1", "sse2", "delta_sse", "n_fit", "n_val",
-              "nll1", "nll2", "delta_nll", "bic1", "bic2", "delta_bic",
-              "silhouette", "mode_distance", "rho",
-              "mode1_mass", "mode2_mass", "coverage_distortion",
-              "coverage_distortion_rel",
-              "client_entropy_mode1", "client_entropy_mode2",
-              "normalized_client_entropy_mode1", "normalized_client_entropy_mode2",
-              "js_divergence_mode1", "js_divergence_mode2",
-              "client_mode_mi",
-              "S_W", "S_B", "H_c"]
+              "n_runs", "p_nll", "p_bic", "robust", "n_fit", "n_val",
+              "sse1", "sse2", "delta_sse"]
+    for k in STABILITY_KEYS:
+        fields += [f"{k}_median", f"{k}_std"]
+    fields += [f"{k}_primary" for k in DEBUG_PRIMARY_KEYS]
+    fields += ["S_W", "S_B", "H_c"]
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -478,11 +533,27 @@ def main():
         robust_ids = [int(r["class_id"]) for r in sub if r["robust"]]
         entry = {
             "n_classes": len(sub),
-            "n_delta_bic_positive": int(sum(r["delta_bic"] > 0 for r in sub)),
-            "n_delta_nll_positive": int(sum(r["delta_nll"] > 0 for r in sub)),
+            "n_delta_bic_positive": int(sum(
+                r["delta_bic_median"] > 0 for r in sub)),
+            "n_delta_nll_positive": int(sum(
+                r["delta_nll_median"] > 0 for r in sub)),
             "n_robust_multimodal": len(robust_ids),
             "robust_fraction": len(robust_ids) / len(sub),
             "robust_class_ids": robust_ids,
+            # operational-threshold sensitivity: the robust counts across a
+            # rho x D_cover_rel grid. These thresholds are ENGINEERING
+            # choices, not theoretical multimodality boundaries -- the
+            # paper should show the continuous distributions and this grid
+            # to demonstrate the conclusion is not threshold-fragile.
+            "robust_sensitivity": {
+                f"rho>{rt:g},drel>{dt:g}": int(sum(
+                    r["p_nll"] >= args.p_stability_threshold
+                    and r["p_bic"] >= args.p_stability_threshold
+                    and r["rho_median"] > rt
+                    and r["coverage_distortion_rel_median"] > dt
+                    for r in sub))
+                for rt in (0.75, 1.0, 1.25)
+                for dt in (0.05, 0.10, 0.15)},
         }
         for m in METRICS_FOR_AGGREGATE:
             a = aggregate([r.get(m) for r in sub], args.boot_seed, args.n_boot)
@@ -500,19 +571,20 @@ def main():
             continue
         robust_ids = [int(r["class_id"]) for r in sub if r["robust"]]
         print(f"\n===== {ft}: {len(sub)} classes =====")
-        print(f"classes with delta_bic > 0 (K=2 favored): "
-              f"{sum(r['delta_bic'] > 0 for r in sub)}/{len(sub)}")
-        print(f"classes with delta_nll > 0 (K=2 favored): "
-              f"{sum(r['delta_nll'] > 0 for r in sub)}/{len(sub)}")
+        print(f"classes with delta_bic_median > 0 (K=2 favored): "
+              f"{sum(r['delta_bic_median'] > 0 for r in sub)}/{len(sub)}")
+        print(f"classes with delta_nll_median > 0 (K=2 favored): "
+              f"{sum(r['delta_nll_median'] > 0 for r in sub)}/{len(sub)}")
         print(f"robust multimodal classes: {len(robust_ids)}/{len(sub)} "
               f"({100*len(robust_ids)/len(sub):.0f}%) -> {robust_ids}")
-        print(f"mean rho = {np.mean([r['rho'] for r in sub]):.3f}, "
-              f"mean D_cover = "
-              f"{np.mean([r['coverage_distortion'] for r in sub]):.3f}, "
+        print(f"mean rho = "
+              f"{np.mean([r['rho_median'] for r in sub]):.3f}, "
               f"mean D_cover_rel = "
-              f"{np.mean([r['coverage_distortion_rel'] for r in sub]):.3f}, "
+              f"{np.mean([r['coverage_distortion_rel_median'] for r in sub]):.3f}, "
               f"mean client_mode_MI = "
-              f"{np.nanmean([r['client_mode_mi'] for r in sub]):.3f}")
+              f"{np.nanmean([r['client_mode_mi_median'] for r in sub]):.3f}, "
+              f"mean weighted JS = "
+              f"{np.nanmean([r['js_weighted_median'] for r in sub]):.3f}")
     print(f"\nsaved {out_csv}")
     print(f"saved {agg_json}")
     if plot_dir is not None:
