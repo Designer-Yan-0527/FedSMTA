@@ -102,6 +102,12 @@ def deep_equal(a, b):
         return (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
                 and a.dtype == b.dtype and a.shape == b.shape
                 and torch.equal(a, b))
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        # np.random.get_state() embeds an ndarray; bare `a == b` returns an
+        # array whose truth value is ambiguous
+        return (isinstance(a, np.ndarray) and isinstance(b, np.ndarray)
+                and a.shape == b.shape and a.dtype == b.dtype
+                and bool((a == b).all()))
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(deep_equal(a[k], b[k]) for k in a)
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
@@ -311,8 +317,10 @@ def main():
     for ck, lbl in ((ckpt_a, str(run_a)), (ckpt_b, str(run_b))):
         assert "temp_protos" in ck, (
             f"{lbl}: checkpoint missing temp_protos (false-pass guard)")
-        assert ck["temp_protos"] is not None, (
-            f"{lbl}: temp_protos is None (fuse_protos never ran?)")
+        # NOTE: fuse_protos() is dead code in official FedTA (never called),
+        # so temp_protos is legitimately None in every checkpoint. Only the
+        # field's presence is enforced; the None==None equality below is the
+        # true invariant (resume must not corrupt it), not a false pass.
         assert "existing_class" in ck, (
             f"{lbl}: checkpoint missing existing_class (false-pass guard)")
 
@@ -406,7 +414,7 @@ def main():
     rng_a, rng_b = ckpt_a["rng_state"], ckpt_b["rng_state"]
     rng_diffs = {
         "torch": max_diff(rng_a["torch"], rng_b["torch"]),
-        "numpy": 0.0 if rng_a["numpy"] == rng_b["numpy"] else float("inf"),
+        "numpy": 0.0 if deep_equal(rng_a["numpy"], rng_b["numpy"]) else float("inf"),
         "python": 0.0 if rng_a["python"] == rng_b["python"] else float("inf"),
     }
     if rng_a.get("cuda") is not None:

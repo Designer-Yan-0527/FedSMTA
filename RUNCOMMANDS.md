@@ -280,5 +280,24 @@ git push origin main
 git push origin phase0-fedta-baseline
 ```
 
+## 14. Phase 1-precheck：z_op batch sensitivity 诊断（tag 之后、正式 Phase 1 之前）
+
+```bash
+python diagnostics/check_feature_batch_sensitivity.py \
+    --run_dir output/regression/cifar100/fedta/reg_full/seed_42 \
+    --checkpoint checkpoints/latest.pth \
+    --device cuda
+```
+
+- 背景（roadmap §5.9）：`batchwise_prompt=True` 下 `z_op(x) = f(x; B)` 依赖 batch 组成；若不稳定，后续 K=2 结论可能是 prompt routing 伪影而非真实语义多模态
+- 协议：同一 checkpoint、TRAIN split 固定顺序样本，batch size = 1/8/16/32/64 各提取一遍 `z_op`，逐样本算 $\Delta_B(x) = \|z_{\rm op}^{(B)}(x) - z_{\rm op}^{(1)}(x)\|_2 / \|z_{\rm op}^{(1)}(x)\|_2$；另做 B=16 恒定、不同 deterministic 组批（identity vs 固定种子 permutation）的对照，隔离"组批效应"与"batch size 效应"
+- 输出 `metrics/feature_batch_sensitivity.csv` + `.json`：每 (client, task, B) 与汇总（ALL）的 delta/cosine 的 mean/median/std/p95/max
+- 解读（决策见 roadmap §5.9，看到数字前不擅自改用 z_ref / 不关 batchwise_prompt）：$\bar{\Delta}_B \approx 0$ → `z_op` 可直接用于 Phase 1；显著非零 → 需重新决定 Semantic Bank 用 `z_ref` / sample-wise prompt feature / 严格定义 prompt context
+- 注意：`--run_dir` 指向**已有完整训练产物**的 run（如 Gate 0B 的 `reg_full`），不是新开训练
+
+- 正式 Phase 1 的特征提取 / 多模态分析命令见第 9 节（`extract_features.py` / `analyze_multimodality.py`），在 precheck 结论通过后执行
+
+## 15. Freeze 后的硬约束（长期有效）
+
 - 从 tag 起，`--method fedta` 视为 **read-only scientific baseline**：不得改动 FedTA loss / optimizer / BGPS / SIKF / FedAvg head / Tail Anchor 结构 / prompt 逻辑 / CIFAR 联邦划分
 - 之后的顺序：`diagnostics/check_feature_batch_sensitivity.py`（Phase 1-precheck）→ 正式 Phase 1；z_op batch sensitivity 属于 Phase 1-precheck，不是 Phase 0 Gate

@@ -795,6 +795,12 @@ class Server_DF(object):
         self.existing_class = set(checkpoint.get("existing_class", []))
 
         if checkpoint.get("global_head") is not None:
+            # During training fed_avg_head() replaces global_head with a
+            # deepcopy of clients[0].vit.head (a plain Linear) every round,
+            # so the checkpoint stores Linear keys {weight, bias}. __init__
+            # created a Chead here; rebuild the training-time structure
+            # before loading, otherwise the key sets do not match.
+            self.global_head = deepcopy(self.clients[0].vit.head)
             self.global_head.load_state_dict(checkpoint["global_head"])
         if checkpoint.get("server_model") is not None:
             self.model.load_state_dict(checkpoint["server_model"])

@@ -244,6 +244,11 @@ class Client_DF(object):
         # save local classifier
         self.heads[self.task_id] = deepcopy(self.model.get_head())
 
+        # Official FedTA (GitHub main) calls evaluate unconditionally twice
+        # here (evaluate(0) + evaluate(task_id)); on task 0 this evaluates
+        # task 0 twice. This is intentional baseline behavior: evaluate()'s
+        # test loader uses shuffle=True and consumes the global torch RNG,
+        # so the call count MUST stay identical to the official code.
         self.evaluate( 0,args.nb_classes)
         self.evaluate(self.task_id, args.nb_classes)
 
