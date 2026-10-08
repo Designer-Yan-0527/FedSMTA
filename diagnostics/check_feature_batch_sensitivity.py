@@ -12,18 +12,26 @@ later K=2 finding could be a batchwise-prompt-routing artifact instead of
 real semantic multimodality. This script measures that instability BEFORE
 any GMM is fitted.
 
-Protocol (all on TRAIN split only, fixed sample order, same checkpoint):
-  1. For batch sizes B in {1, 8, 16, 32, 64} extract z_op for the same
-     samples in the same order, batching sequentially.
-  2. For every sample x and every B > 1:
-         Delta_B(x) = ||z_op^(B)(x) - z_op^(1)(x)||_2
-                      / (||z_op^(1)(x)||_2 + eps)
-     plus cosine similarity between the two.
-  3. Control at fixed B=16: two DIFFERENT deterministic compositions
-     (identity order vs fixed-seed permutation), same samples, same batch
-     size -> isolates the pure batch-composition effect from the
-     batch-size effect.
-  4. Aggregate mean/median/std/p95/max per (client, task, B) and overall.
+Protocol (all on TRAIN split only, same checkpoint, cudnn deterministic):
+  1. Class-stratified deterministic sample selection per (client, task)
+     (fixed seed; NOT "first N sorted indices" -- those may carry
+     dataset-order structure that biases the composition study).
+  2. Batch-size sweep B in {1, 8, 16, 32, 64}: extract z_op AND z_ref for
+     the same fixed-order samples.
+       - z_ref control: origin_model is batch-independent in principle,
+         so Delta_B^ref is the GPU numerical floor. Only
+         Delta_B^op >> Delta_B^ref justifies attributing drift to
+         batchwise prompt routing.
+  3. Repeat-run floor: B=16, identical order, run twice -- pure GPU
+     nondeterminism floor for the z_op path.
+  4. Composition controls: B fixed at 16, several deterministic
+     permutations (--composition_seeds, default 5 seeds) vs identity
+     order -- isolates the batch-COMPOSITION effect from the batch-SIZE
+     effect and avoids underestimation from a single lucky permutation.
+  5. Per-sample Delta_B(x) = ||z^B(x) - z^1(x)||_2 / ||z^1(x)||_2 plus
+     cosine similarity; aggregated mean/median/std/p05/p95/min/max per
+     (client, task) and overall (cosine: p05/min are the informative
+     tail; delta: p95/max).
 
 Diagnostic only: no training logic is touched, no z_ref switch, no
 batchwise_prompt changes (decision comes after seeing the numbers).
@@ -45,12 +53,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from diag_utils import bootstrap_server, resolve_checkpoint, REPO_ROOT
+from diag_utils import bootstrap_server, resolve_checkpoint
 
 EPS = 1e-8
 DEFAULT_BATCH_SIZES = (1, 8, 16, 32, 64)
 CONTROL_BATCH_SIZE = 16
-CONTROL_PERM_SEED = 12345
+SAMPLING_SEED = 2026
+STAT_KEYS = ("mean", "median", "std", "p05", "p95", "min", "max")
 
 
 def parse_args():
@@ -63,9 +72,13 @@ def parse_args():
     p.add_argument("--batch_sizes", type=int, nargs="+",
                    default=list(DEFAULT_BATCH_SIZES),
                    help="batch sizes to audit (must contain 1 as baseline)")
+    p.add_argument("--composition_seeds", type=int, nargs="+",
+                   default=[0, 1, 2, 3, 4],
+                   help="seeds for the B=16 permutation composition "
+                        "controls (default: 5 seeds)")
     p.add_argument("--max_samples", type=int, default=256,
-                   help="cap on samples per (client, task) to keep the "
-                        "B=1 pass cheap (default: 256)")
+                   help="cap on samples per (client, task), class-"
+                        "stratified deterministic sampling (default: 256)")
     p.add_argument("--out_dir", default="metrics",
                    help="output directory (default: metrics)")
     p.add_argument("--data_path", default=None,
@@ -76,38 +89,63 @@ def parse_args():
 
 
 def summarize(values):
-    """mean/median/std/p95/max of a 1-D array (spec §5.9 aggregate)."""
+    """mean/median/std/p05/p95/min/max of a 1-D array.
+
+    For relative distance the bad tail is p95/max; for cosine similarity
+    the bad tail is p05/min -- reporting both tails covers both metrics."""
     v = np.asarray(values, dtype=np.float64)
     if v.size == 0:
-        return {k: float("nan") for k in
-                ("mean", "median", "std", "p95", "max")}
+        return {k: float("nan") for k in STAT_KEYS}
     return {
         "mean": float(np.mean(v)),
         "median": float(np.median(v)),
         "std": float(np.std(v)),
+        "p05": float(np.percentile(v, 5)),
         "p95": float(np.percentile(v, 95)),
+        "min": float(np.min(v)),
         "max": float(np.max(v)),
     }
 
 
-def extract_z_op(client, server, images, task_id, batch_size, device):
-    """Forward a fixed image tensor through the client's CURRENT prompt
-    state (same call signature as extract_features.py) and return z_op as
-    an [N, 768] float32 numpy array. `images` is a CPU float tensor in a
-    FIXED order; batches are sequential slices of it, so the composition
-    is fully determined by (order, batch_size)."""
-    n = images.shape[0]
-    out = np.zeros((n, 768), dtype=np.float32)
+def stratified_selection(targets, max_samples, seed):
+    """Deterministic class-stratified positions into the local sample list.
+
+    Proportional per-class rounding (>=1 per class), fixed RandomState,
+    sorted output order. Never depends on dataset file order structure
+    beyond the (already fixed) split indices order."""
+    targets = np.asarray(targets)
+    n = len(targets)
+    if max_samples <= 0 or n <= max_samples:
+        return np.arange(n, dtype=np.int64)
+    rng = np.random.RandomState(seed)
+    picked = []
+    for cls in np.unique(targets):
+        idx = np.where(targets == cls)[0]
+        take = max(1, int(round(max_samples * len(idx) / n)))
+        take = min(take, len(idx))
+        picked.extend(rng.choice(idx, size=take, replace=False).tolist())
+    picked = sorted(set(picked))
+    if len(picked) > max_samples:  # proportional rounding overflow
+        picked = picked[:max_samples]
+    return np.asarray(picked, dtype=np.int64)
+
+
+def extract_feats(client, server, images, task_id, batch_size, device):
+    """Forward a fixed image tensor, batched sequentially, through BOTH
+    the frozen origin model (z_ref) and the client's CURRENT prompt state
+    (z_op; same call signature as extract_features.py). Returns
+    (z_ref, z_op) as [N, d] float32 arrays, row-aligned with `images`."""
+    zr, zo = [], []
     with torch.no_grad():
-        for i in range(0, n, batch_size):
+        for i in range(0, images.shape[0], batch_size):
             inp = images[i:i + batch_size].to(device, non_blocking=True)
             out_ref = server.origin_model(inp)
             out_op = client.vit(
                 inp, task_id=task_id,
                 cls_features=out_ref["pre_logits"], train=True)
-            b = inp.shape[0]
-            out[i:i + b] = out_op["feat"].float().cpu().numpy()
-    return out
+            zr.append(out_ref["feat"].float().cpu().numpy())
+            zo.append(out_op["feat"].float().cpu().numpy())
+    return np.concatenate(zr), np.concatenate(zo)
 
 
 def pair_metrics(z_a, z_b):
@@ -122,12 +160,28 @@ def pair_metrics(z_a, z_b):
     return delta, cos
 
 
+def make_row(scope, client_id, task, n, comparison, delta, cos):
+    row = {"scope": scope, "client": client_id, "task": task,
+           "n_samples": n, "comparison": comparison}
+    for k, v in summarize(delta).items():
+        row[f"delta_{k}"] = v
+    for k, v in summarize(cos).items():
+        row[f"cos_{k}"] = v
+    return row
+
+
 def main():
     args_cli = parse_args()
     if 1 not in args_cli.batch_sizes:
         raise SystemExit("--batch_sizes must contain 1 (the baseline)")
     if CONTROL_BATCH_SIZE not in args_cli.batch_sizes:
         args_cli.batch_sizes.append(CONTROL_BATCH_SIZE)
+
+    # numerical-nondeterminism floor must be minimized before interpreting
+    # 1e-3..1e-2 level drift (diag_utils resets args.deterministic, so set
+    # the cudnn flags explicitly here, for this diagnostic only)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     ckpt_path = resolve_checkpoint(args_cli.run_dir, args_cli.checkpoint)
     run_args, server = bootstrap_server(
@@ -137,10 +191,14 @@ def main():
     server.origin_model.to(device)
     server.origin_model.eval()
 
-    rows = []          # CSV rows
-    json_detail = []   # per (client, task) JSON records
-    overall = {}       # key -> (delta, cos) arrays
+    rows = []
+    overall = {}  # comparison key -> list of per-client-task arrays
     t0 = time.time()
+
+    def collect(comparison, delta, cos):
+        overall.setdefault(comparison, ([], []))
+        overall[comparison][0].append(delta)
+        overall[comparison][1].append(cos)
 
     for client in server.clients:
         if client.task_id < 0:
@@ -155,73 +213,66 @@ def main():
                              client.data_split_indices[t]["train"])
             if not indices:
                 continue
-            if args_cli.max_samples > 0:
-                indices = indices[:args_cli.max_samples]
             subset = Subset(client.train_data[t], indices)
-            # materialize the fixed-order image tensor once
-            images = []
-            for inp, _ in DataLoader(subset, batch_size=64, shuffle=False,
-                                     num_workers=run_args.num_workers):
-                images.append(inp)
-            images = torch.cat(images, dim=0)
+            # materialize the fixed-order images + targets once
+            xs, ys = [], []
+            for inp, tgt in DataLoader(subset, batch_size=64, shuffle=False,
+                                       num_workers=run_args.num_workers):
+                xs.append(inp)
+                ys.append(tgt.numpy())
+            images_all = torch.cat(xs, dim=0)
+            targets_all = np.concatenate(ys)
+
+            # class-stratified deterministic sampling (roadmap audit P0-1D)
+            sel = stratified_selection(
+                targets_all, args_cli.max_samples, SAMPLING_SEED)
+            images = images_all[torch.from_numpy(sel)]
             n = images.shape[0]
+            scope = f"c{client.id}_t{t}"
 
-            # 1) batch-size sweep (sequential composition per B)
-            z_by_b = {}
+            # 1) batch-size sweep: z_ref (numerical control) and z_op
+            z_ref_by_b, z_op_by_b = {}, {}
             for bsz in sorted(set(args_cli.batch_sizes)):
-                z_by_b[bsz] = extract_z_op(
+                z_ref_by_b[bsz], z_op_by_b[bsz] = extract_feats(
                     client, server, images, t, bsz, device)
-            base = z_by_b[1]
-
-            # 2) control: fixed B, different deterministic composition
-            perm = np.random.RandomState(CONTROL_PERM_SEED).permutation(n)
-            z_perm = extract_z_op(
-                client, server, images[torch.from_numpy(perm)],
-                t, CONTROL_BATCH_SIZE, device)
-            # map permuted rows back to original sample positions
-            z_ctrl = np.zeros_like(z_perm)
-            z_ctrl[perm] = z_perm
-
-            record = {"client": client.id, "task": t, "n_samples": n,
-                      "batch_sizes": {}}
             for bsz in sorted(set(args_cli.batch_sizes)):
                 if bsz == 1:
                     continue
-                delta, cos = pair_metrics(z_by_b[bsz], base)
-                row = {"scope": f"c{client.id}_t{t}", "client": client.id,
-                       "task": t, "n_samples": n,
-                       "comparison": f"B={bsz}_vs_B=1"}
-                for k, v in summarize(delta).items():
-                    row[f"delta_{k}"] = v
-                for k, v in summarize(cos).items():
-                    row[f"cos_{k}"] = v
-                rows.append(row)
-                record["batch_sizes"][str(bsz)] = {
-                    "delta": summarize(delta), "cos": summarize(cos)}
-                overall.setdefault(f"B={bsz}_vs_B=1", ([], []))
-                overall[f"B={bsz}_vs_B=1"][0].append(delta)
-                overall[f"B={bsz}_vs_B=1"][1].append(cos)
+                for name, table in (("zref", z_ref_by_b), ("zop", z_op_by_b)):
+                    delta, cos = pair_metrics(table[bsz], table[1])
+                    comp = f"{name}_B={bsz}_vs_B=1"
+                    rows.append(make_row(scope, client.id, t, n, comp,
+                                         delta, cos))
+                    collect(comp, delta, cos)
 
-            # control comparison: same B, permuted composition
-            delta_c, cos_c = pair_metrics(z_ctrl, z_by_b[CONTROL_BATCH_SIZE])
-            row = {"scope": f"c{client.id}_t{t}", "client": client.id,
-                   "task": t, "n_samples": n,
-                   "comparison": f"B={CONTROL_BATCH_SIZE}_perm_vs_B={CONTROL_BATCH_SIZE}_identity"}
-            for k, v in summarize(delta_c).items():
-                row[f"delta_{k}"] = v
-            for k, v in summarize(cos_c).items():
-                row[f"cos_{k}"] = v
-            rows.append(row)
-            record["control"] = {
-                "comparison": f"B={CONTROL_BATCH_SIZE}: permuted_vs_identity",
-                "perm_seed": CONTROL_PERM_SEED,
-                "delta": summarize(delta_c), "cos": summarize(cos_c)}
-            overall.setdefault(
-                f"B={CONTROL_BATCH_SIZE}_perm_vs_identity", ([], []))
-            overall[f"B={CONTROL_BATCH_SIZE}_perm_vs_identity"][0].append(delta_c)
-            overall[f"B={CONTROL_BATCH_SIZE}_perm_vs_identity"][1].append(cos_c)
+            # 2) repeat-run floor: identical batching, run twice
+            zr_rep, zo_rep = extract_feats(
+                client, server, images, t, CONTROL_BATCH_SIZE, device)
+            delta, cos = pair_metrics(zo_rep, z_op_by_b[CONTROL_BATCH_SIZE])
+            comp = f"zop_repeat_B={CONTROL_BATCH_SIZE}_run2_vs_run1"
+            rows.append(make_row(scope, client.id, t, n, comp, delta, cos))
+            collect(comp, delta, cos)
+            delta, cos = pair_metrics(zr_rep, z_ref_by_b[CONTROL_BATCH_SIZE])
+            comp = f"zref_repeat_B={CONTROL_BATCH_SIZE}_run2_vs_run1"
+            rows.append(make_row(scope, client.id, t, n, comp, delta, cos))
+            collect(comp, delta, cos)
 
-            json_detail.append(record)
+            # 3) composition controls: fixed B, permuted deterministic order
+            for seed in args_cli.composition_seeds:
+                perm = np.random.RandomState(seed).permutation(n)
+                _, zo_perm = extract_feats(
+                    client, server, images[torch.from_numpy(perm)],
+                    t, CONTROL_BATCH_SIZE, device)
+                zo_ctrl = np.zeros_like(zo_perm)  # map back to sample pos
+                zo_ctrl[perm] = zo_perm
+                delta, cos = pair_metrics(
+                    zo_ctrl, z_op_by_b[CONTROL_BATCH_SIZE])
+                comp = (f"zop_perm{seed}_B={CONTROL_BATCH_SIZE}"
+                        f"_vs_identity")
+                rows.append(make_row(scope, client.id, t, n, comp,
+                                     delta, cos))
+                collect(comp, delta, cos)
+
             print(f"client {client.id} task {t}: {n} samples done "
                   f"({time.time()-t0:.0f}s)")
 
@@ -232,13 +283,7 @@ def main():
         c = np.concatenate(coss) if coss else np.zeros(0)
         overall_summary[key] = {"n_samples": int(d.size),
                                 "delta": summarize(d), "cos": summarize(c)}
-        row = {"scope": "ALL", "client": -1, "task": -1,
-               "n_samples": int(d.size), "comparison": key}
-        for k, v in summarize(d).items():
-            row[f"delta_{k}"] = v
-        for k, v in summarize(c).items():
-            row[f"cos_{k}"] = v
-        rows.append(row)
+        rows.append(make_row("ALL", -1, -1, int(d.size), key, d, c))
 
     out_dir = Path(args_cli.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -246,8 +291,8 @@ def main():
     json_path = out_dir / "feature_batch_sensitivity.json"
 
     fieldnames = ["scope", "client", "task", "n_samples", "comparison"] + \
-        [f"delta_{k}" for k in ("mean", "median", "std", "p95", "max")] + \
-        [f"cos_{k}" for k in ("mean", "median", "std", "p95", "max")]
+        [f"delta_{k}" for k in STAT_KEYS] + \
+        [f"cos_{k}" for k in STAT_KEYS]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -260,15 +305,27 @@ def main():
         "data_name": run_args.data_name,
         "seed": run_args.seed,
         "batch_sizes": sorted(set(args_cli.batch_sizes)),
-        "control": {"batch_size": CONTROL_BATCH_SIZE,
-                    "perm_seed": CONTROL_PERM_SEED},
+        "composition_seeds": list(args_cli.composition_seeds),
+        "control_batch_size": CONTROL_BATCH_SIZE,
+        "sampling": {"strategy": "class-stratified deterministic",
+                     "seed": SAMPLING_SEED,
+                     "max_samples_per_client_task": args_cli.max_samples},
+        "cudnn": {"deterministic": True, "benchmark": False},
         "split": "train",
-        "max_samples_per_client_task": args_cli.max_samples,
         "overall": overall_summary,
-        "per_client_task": json_detail,
-        "note": "Delta_B(x)=||z_op^B(x)-z_op^1(x)||/||z_op^1(x)||; "
-                "control isolates batch-composition effect at fixed B. "
-                "Diagnostic only - interpretation and any z_op/z_ref "
+        "reading_guide": {
+            "zref_B=*_vs_B=1": "numerical floor (origin_model is "
+                               "batch-independent in principle)",
+            "zop_repeat_B=16_run2_vs_run1": "GPU nondeterminism floor "
+                                            "for the z_op path",
+            "zop_B=*_vs_B=1": "batch-SIZE effect on z_op",
+            "zop_perm*_B=16_vs_identity": "batch-COMPOSITION effect at "
+                                          "fixed B (batchwise prompt "
+                                          "routing)",
+            "attribution rule": "blame batchwise prompting only if "
+                                "zop drift >> both floors",
+        },
+        "note": "Diagnostic only - interpretation and any z_op/z_ref "
                 "decision come after review (roadmap §5.9).",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -281,8 +338,8 @@ def main():
     for key, s in overall_summary.items():
         print(f"{key}: delta_mean={s['delta']['mean']:.6f} "
               f"delta_p95={s['delta']['p95']:.6f} "
-              f"delta_max={s['delta']['max']:.6f} "
-              f"cos_mean={s['cos']['mean']:.6f}")
+              f"cos_p05={s['cos']['p05']:.6f} "
+              f"cos_min={s['cos']['min']:.6f}")
 
 
 if __name__ == "__main__":

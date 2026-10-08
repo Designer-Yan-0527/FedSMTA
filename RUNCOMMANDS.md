@@ -157,7 +157,7 @@ python diagnostics/extract_features.py \
 - 输出 `diagnostics_output/features_{data_name}_{ckpt名}.npz`（z_ref = frozen ViT 特征、z_op = 当前 prompt 增强的 pre-anchor 特征；含 labels / client_ids / task_ids / round_ids / splits / sample_idx）+ 同名 `.json` 元信息（含 round、client_class_masks、public classes）
 - `--checkpoint` 缺省时自动使用 `checkpoints/latest.pth`；`--data_path` / `--device` 可覆盖 args.json 中的值
 
-### 9.2 多模态分析（SSE / NLL / BIC / silhouette / rho / D_cover / client entropy）
+### 9.2 多模态分析（NLL / BIC / rho / D_cover(+rel) / Dirichlet 校正指标 / stability）
 
 ```bash
 python diagnostics/analyze_multimodality.py \
@@ -165,11 +165,13 @@ python diagnostics/analyze_multimodality.py \
     --plot_dir diagnostics_output/plots
 ```
 
-- 默认只分析 public classes（类出现在 ≥2 个 client 的 class mask 中，由数据协议定义），加 `--all_classes` 分析全部；**只用 TRAIN split 发现 semantic modes——`--split` 仅接受 `train`，test/all 已被硬性禁止（test-leakage 防护）**
-- 每类统计：`sse/delta_sse`、80/20 heldout `nll/delta_nll`、`bic/delta_bic`（p_K = K·d + K + (K−1)）、`silhouette`、`mode_distance`、`rho`（mode separation）、`mode1/mode2_mass`、`coverage_distortion`（单原型失真 D_cover）、每 mode 的 `client_entropy`（spatial heterogeneity 证据），另保留 S_W/S_B/H_c
+- 默认只分析 public classes（类出现在 ≥2 个 client 的 class mask 中，由数据协议定义），加 `--all_classes` 分析全部；**metadata 缺失 `public_classes` 时直接 RuntimeError**（public/private 是联邦协议属性，禁止从特征样本反推）；**只用 TRAIN split 发现 semantic modes——`--split` 仅接受 `train`，test/all 已被硬性禁止（test-leakage 防护）**
+- **模型选择与描述性几何严格分离**：held-out GMM（80/20）只出 `nll/delta_nll`、`bic/delta_bic`（p_K = K·d + K + (K−1)）；`sse/delta_sse` 由全量 TRAIN 上的专用 KMeans(K=2) 计算（K=1 解是 K=2 的可行特例，数学上严格保证 SSE₂ ≤ SSE₁；held-out GMM 的中心只见 80% 数据，不得用于 SSE）
+- 每类统计：`delta_sse`、`delta_nll`、`delta_bic`、`silhouette`、`mode_distance`、`rho`、`mode1/mode2_mass`、`coverage_distortion`（D_cover）+ **`coverage_distortion_rel`**（失真占类内散度比例）、每 mode 的 `client_entropy` + **Dirichlet 校正指标**：`normalized_client_entropy_k`（H_k / H(p(i|c))）、`js_divergence_k`（D_JS(p(i|c,k) ‖ p(i|c))）、`client_mode_mi`（I(I;K|C=c)），另保留 S_W/S_B/H_c
+- **per-class stability**（`--heldout_seeds 0 1 2 3 4` × `--gmm_seeds 0 1 2` 配对轮转，共 5 runs）：每类输出 `p_nll` / `p_bic`（Δ>0 的 run 比例）、`rho_median`、`dcover_rel_median`；**robust multimodal** 判定 = p_nll ≥ 0.8 且 p_bic ≥ 0.8 且 rho_median > `--rho_threshold`(默认 1.0) 且 dcover_rel_median > `--dcover_rel_threshold`(默认 0.1)
 - 输出（默认在特征文件同目录，可用 `--out_csv` / `--aggregate_json` 覆盖）：
-  - `multimodality_summary.csv` — 每 (feature_type, class) 一行
-  - `multimodality_aggregate.json` — 各指标 mean / median / std / p25 / p75 / bootstrap 95% CI
+  - `multimodality_summary.csv` — 每 (feature_type, class) 一行（含 stability 列与 robust 标志）
+  - `multimodality_aggregate.json` — 各指标 mean / median / std / p25 / p75 / bootstrap 95% CI + **robust 类计数/比例/清单（prevalence，Phase 1 Gate 判据）**
 - `--plot_dir` 可选：每类 PCA 散点图（颜色=client，marker=task，星=FedTA 单原型，叉=K2 mode 中心）；PCA 仅用于可视化，不参与任何指标
 
 ### 9.3 兼容性 2x2 诊断（prompt × key-anchor）
@@ -290,9 +292,13 @@ python diagnostics/check_feature_batch_sensitivity.py \
 ```
 
 - 背景（roadmap §5.9）：`batchwise_prompt=True` 下 `z_op(x) = f(x; B)` 依赖 batch 组成；若不稳定，后续 K=2 结论可能是 prompt routing 伪影而非真实语义多模态
-- 协议：同一 checkpoint、TRAIN split 固定顺序样本，batch size = 1/8/16/32/64 各提取一遍 `z_op`，逐样本算 $\Delta_B(x) = \|z_{\rm op}^{(B)}(x) - z_{\rm op}^{(1)}(x)\|_2 / \|z_{\rm op}^{(1)}(x)\|_2$；另做 B=16 恒定、不同 deterministic 组批（identity vs 固定种子 permutation）的对照，隔离"组批效应"与"batch size 效应"
-- 输出 `metrics/feature_batch_sensitivity.csv` + `.json`：每 (client, task, B) 与汇总（ALL）的 delta/cosine 的 mean/median/std/p95/max
-- 解读（决策见 roadmap §5.9，看到数字前不擅自改用 z_ref / 不关 batchwise_prompt）：$\bar{\Delta}_B \approx 0$ → `z_op` 可直接用于 Phase 1；显著非零 → 需重新决定 Semantic Bank 用 `z_ref` / sample-wise prompt feature / 严格定义 prompt context
+- 协议（三层对照 + 两个 floor）：
+  - **batch-size 扫描**：B = 1/8/16/32/64，同时提取 `z_op` 与 `z_ref`——`zref_B=*_vs_B=1` 是 GPU 数值 floor（origin_model 理论上 batch 无关）
+  - **重复运行 floor**：B=16 同一顺序跑两遍（`zop_repeat_*_run2_vs_run1`）——纯 GPU 非确定性 floor（脚本内已强制 cudnn deterministic）
+  - **组批对照**：B=16 恒定、`--composition_seeds 0 1 2 3 4` 五次 deterministic permutation vs identity，隔离"组批效应"与"batch size 效应"，杜绝单次 permutation 恰好没换 major prompt 的低估
+  - 样本选择：**class-stratified deterministic sampling**（固定种子，非"前 N 个 sorted index"）
+- 输出 `metrics/feature_batch_sensitivity.csv` + `.json`：每 (client, task, 对照) 与汇总（ALL）的 delta/cosine 的 mean/median/std/**p05**/p95/**min**/max（delta 看 p95/max 尾部，cosine 看 p05/min 尾部）；JSON 含 reading_guide（归因规则：只有 `zop` 漂移 ≫ 两个 floor 才能归因 batchwise prompt）
+- 解读（决策见 roadmap §5.9，看到数字前不擅自改用 z_ref / 不关 batchwise_prompt）：$\bar{\Delta}_B \approx 0$ → `z_op` 可直接用于 Phase 1；显著非零且 ≫ floor → 需重新决定 Semantic Bank 用 `z_ref` / sample-wise prompt feature / 严格定义 prompt context
 - 注意：`--run_dir` 指向**已有完整训练产物**的 run（如 Gate 0B 的 `reg_full`），不是新开训练
 
 - 正式 Phase 1 的特征提取 / 多模态分析命令见第 9 节（`extract_features.py` / `analyze_multimodality.py`），在 precheck 结论通过后执行
