@@ -765,23 +765,40 @@ GPT 对仓库多轮源码级审查（官方 FedTA vs FedSMTA 逐文件对照）�
 
 ## 13. 当前状态与下一步
 
-### 状态快照（截至 2026-10-08，v8）
+### 状态快照（截至 2026-10-09，v9）
 
 $$\boxed{\text{Phase 0 三 Gate 全部 PASS，baseline 已冻结（tag: phase0-fedta-baseline）}}$$
+
+$$\boxed{\text{Phase 1 诊断执行完毕：CIFAR-100 robust multimodal prevalence = 0/25（z\_ref 与 z\_op 一致）——多模态主线在 CIFAR-100 上不成立，触发 §5.10 停止判据}}$$
 
 - **Gate 0A（官方 parity）**：**PASS**（2026-10-07 服务器，smoke + 正式双跑全绿，13 项 D=0；过程中排障记录见 §12.2 第 20–22 项，官方基准仓库已用 GitHub 原版覆盖）
 - **Gate 0B（resume 等价）**：**PASS**（2026-10-08 服务器，22 项全绿：全部模型组件 / protos / prompt / key / anchor / heads / accuracy matrix / inner+outer split manifest / torch+numpy+python+cuda 四路 RNG 均逐位一致；过程中排障记录见 §12.2 第 23–25 项）
 - **Gate 0C（observer 不变性）**：**PASS**（2026-10-08 服务器，29 项全绿：21 项训练轨迹逐位一致 + 4 组 artifact 区分验证：train_log.csv / round_metrics.jsonl / accuracy_matrix.csv / margins.csv 仅 ON 侧存在、OFF 侧确证缺失；报告存 `output/regression/metrics/observer_invariance.json`）
 - **Phase 0 Freeze**：已打 tag `phase0-fedta-baseline`；`--method fedta` 从此视为 read-only scientific baseline
-- **Phase 1**：第六至九轮审计（第 26–29 项）修复全部落地，**第九轮对官方主训练 / checkpoint 恢复链 / z_ref-z_op 提取位置 / Phase 1 全部数学的全量复审整体 PASS**——precheck 三层对照 + deterministic 顺序修复 + class-level / per-sample 稳定性输出 + **sample ID 坐标系对齐**（per-sample CSV 与 features npz 在 (client, task, sample_idx_relative) 上可直接 join）；analyzer 补齐 `D_cover^rel` + Dirichlet 校正指标 + per-class stability（median 主报告口径）+ GMM canonical ordering + robust_sensitivity 阈值网格；`extract_features.py` 默认正式协议（train / B=16）+ deterministic extraction。**Phase 1 代码封版：不再改任何 diagnostic 代码（含 analyze_multimodality.py 数学主体），进入执行阶段**。待办：服务器跑 precheck → 拿三份产物（csv/json/samples.csv）做 z_op PASS/WARNING/FAIL 数据判决 → 按判决决定正式提取以 z_op 还是 z_ref 为主 → 跑 25 public classes 诊断
-- **Phase 2+**：未开始，**一行 Phase 2 代码都不要继续加**（synthetic_oracle_k2.py 仅为 synthetic sanity check，不计入）；是否启动 Oracle-K2 等 Phase 1 真实 $P_{NLL}/P_{BIC}/\rho/D_{\rm cover}^{rel}/{\rm MI}$ 结果出来再决定
+- **Phase 1**：第六至九轮审计（第 26–29 项）修复全部落地，**第九轮对官方主训练 / checkpoint 恢复链 / z_ref-z_op 提取位置 / Phase 1 全部数学的全量复审整体 PASS**——precheck 三层对照 + deterministic 顺序修复 + class-level / per-sample 稳定性输出 + **sample ID 坐标系对齐**（per-sample CSV 与 features npz 在 (client, task, sample_idx_relative) 上可直接 join）；analyzer 补齐 `D_cover^rel` + Dirichlet 校正指标 + per-class stability（median 主报告口径）+ GMM canonical ordering + robust_sensitivity 阈值网格；`extract_features.py` 默认正式协议（train / B=16）+ deterministic extraction。**Phase 1 代码封版：不再改任何 diagnostic 代码（含 analyze_multimodality.py 数学主体），进入执行阶段**。执行完毕（2026-10-09）：标准 Phase 0 训练 run（`cifar100_fedta_c5_t5_ge5_le30_lr0.001_seed42_951bdc3b`，最终 avg_accuracy=78.62 / forgetting=18.89，与论文 Table 1 的差距属"论文口径 vs 官方代码默认配置"，Gate 0A 已证明代码逐位一致）→ precheck PASS → 正式提取（train / B=16 / task_04_end.pth）→ 25 public classes 诊断完成，**判决见下方 Phase 1 判决小节**
+- **Phase 2+**：未开始，**一行 Phase 2 代码都不要继续加**（synthetic_oracle_k2.py 仅为 synthetic sanity check，不计入）；§5.10 停止判据已触发（见下方 Phase 1 判决），Oracle-K2 / Semantic-K2 的原始动机（联邦异质性导致 public class 多模态）在 CIFAR-100 上没有数据支持，**Phase 2 是否以及以何种形式重启，待研究方向重讨论后决定**
+
+### Phase 1 判决（2026-10-09，宿主 run: cifar100_fedta_c5_t5_ge5_le30_lr0.001_seed42_951bdc3b，checkpoint: task_04_end.pth）
+
+**Phase 1-precheck（z_op batch sensitivity）**：**PASS**——repeat / permutation floor 精确为 0；`zop` delta_p95（3e-6）≈ z_ref 数值 floor（2e-6），cos_p05=1.0；B=16 固定协议下 z_op 是完全确定的函数。留档注意事项：存在 <5% 样本子集在 "B=1 vs 进 batch" 对比下发生 prompt routing 离散跳变（cos_min=0.2299，四个 B 值完全相同 = 同一批边界样本），不阻塞固定 B=16 协议。
+
+**Multimodality 诊断（25 public classes）**：**阴性（触发 §5.10 停止判据）**，五条证据链：
+
+1. **几何无分离**：$\rho_{\rm median}$ 均值 z_ref=0.589 / z_op=0.599（阈值 1.0），最好的类 z_op class 1 也只有 0.92——两个 mode 间距小于类内散度，中间无谷
+2. **失真无后果**：$D_{\rm cover}^{rel}$ 均值 z_ref=0.070 / z_op=0.073（阈值 0.1）——即使硬分两模态，单原型覆盖失真只占类内散度 ~7%
+3. **联邦无归因**：client_mode_mi ≈ 0.005–0.007、js_weighted ≈ 0.002——mode 归属与 client 身份几乎完全独立，"公共类按客户端分化" 不成立
+4. **切分形态 = 椭球对半切而非子群**：mode_mass_minor ≈ 0.35–0.48（跨 seed 稳定）——K=2 GMM 是沿主轴把一个各向异性单峰云团切成两个重叠的两半（BIC/NLL 25/25 偏好 K=2 只是 GMM 拟合椭圆度的灵活性）；PCA 目检确认（class 1 = 连续带状云团无分界、class 37 = 单团弥散，client 颜色全区域混匀）
+5. **z_op ≈ z_ref 对照**：两者几乎相同（ρ +0.010、D_cov_rel +0.003），且纯预训练的 z_ref 同样 25/25 BIC 偏好 K=2——弱双峰信号是预训练 ViT 特征空间的固有形状，FedTA 训练没有放大它，联邦没有制造它
+
+**阈值敏感性**：最宽阈值（ρ>0.75, D_rel>0.05）下 z_ref 1/25、z_op 1/25（仅 class 1）；默认阈值及以上全部 0/25——结论对阈值不敏感。
+
+**科学结论**：论文逻辑链前半段"时空语义异质性 → 多模态类分布 → 单原型系统性扭曲"在 CIFAR-100 上不成立；FedTA 的单原型在该基准上没有被证伪。ImageNet-R 因 $|C_p|=0$（无 public classes），此跨客户端多模态分析不适用。
 
 ### 下一步行动（按序）
 
-1. **Phase 1-precheck**（服务器，命令见 `RUNCOMMANDS.md` 第 14 节）：跑 `diagnostics/check_feature_batch_sensitivity.py`，按 JSON `reading_guide` 归因规则读数（`zop` 漂移 ≫ z_ref floor 与 repeat floor 两个 floor 才归因 batchwise prompt）；先检查 JSON `cudnn` 字段确证 deterministic 运行态真实生效
-2. precheck 通过后，**正式特征提取**：`diagnostics/extract_features.py`（默认即正式协议 `--split train --batch_size 16`，用 `task_04_end.pth`）
-3. 跑 25 public classes 多模态诊断：`diagnostics/analyze_multimodality.py`，主看 median 口径的 $P_{NLL}$、$P_{BIC}$、$\rho_{\rm median}$、$D_{\rm cover,median}^{rel}$、client_mode_mi / js_weighted 及 robust prevalence（Gate 判据见 §5.10；阈值用 `robust_sensitivity` 网格做敏感性检查）
-4. **看到真实 multimodality 结果之前，不开发 Oracle-K2 / Semantic-K2 / UOT / dynamic K；现在一行 Phase 2 代码都不要继续加**——Oracle-K2 是否启动由 Phase 1 真实数据决定
+1. **研究方向重讨论**（必须先做，用户决策）：候选方向包括 (a) 接受 CIFAR-100 阴性结果并转向 ImageNet-R 的替代分析形态（无 public classes，需重新定义"跨端异质性"的可测量对象，如私有类的时序漂移 / compatibility 2x2）；(b) 质疑诊断的作用空间（mode 可能存在于 key/anchor 空间而非特征空间，但需先论证为什么那是语义子群的正确度量）；(c) 重新框定研究问题（如从 margin / retention / compatibility 角度寻找 FedTA 的真实痛点）
+2. 方向确定前：**不开发 Oracle-K2 / Semantic-K2 / UOT / dynamic K，一行 Phase 2 代码都不加**
+3. 遗留工程小项（不阻塞）：`diag_utils.resolve_checkpoint` 对 cwd 相对路径的兼容修复（当前相对路径一律按 run_dir 解析，`RUNCOMMANDS.md` §9.1 示例的全路径形式会触发 double-resolution 报错；工作区临时用 run_dir 相对形式 `checkpoints/task_04_end.pth`）
 
 ### 给后续开发的硬约束（再次强调）
 
