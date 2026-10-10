@@ -239,6 +239,8 @@ D0 是 D1 的前置 gateway：**slot id = class id 假设已判死**（diag_shar
 
 **新方法 flag**：`--method fedta_a2` + `--a2_arm {key,anchor,both}`；`--method fedta` 基线路径保持只读（Phase 0 冻结约束）。
 
+**实现状态（2026-10-10，代码完成待服务器运行）**：`Models/Client_DF.py`（`_a2_init_task_protection` / `_a2_post_step_restore` + checkpoint 持久化 `a2_state`，resume 中途任务时恢复任务开始快照而非重算；arm 不一致 resume 拒绝）。A1 脚本 `diagnostics/a1_snapshot_eval.py`（纯推理，含同 seed baseline 对照）。命令见 RUNCOMMANDS.md §16。smoke 顺序：A2 smoke（task_num=1，应输出 `protected 0/200 slots` 且与 control 轨迹一致）→ `--method fedta` 路径未变回归（Gate 0B/0C 快检）→ 三臂正式训练。
+
 **世代共适应风险**（§4.6）：both 臂压缩新任务可用槽位，若 cc 显著受损则冻结路线让位于 A3 校准路线——此为 A3 的存在性判据。
 
 **证伪也是产出**：任何臂方向反号或量级严重偏离三因子模型排序（anchor > key）→ 相关模型未含全部损伤路径，回补诊断并按预注册留档。

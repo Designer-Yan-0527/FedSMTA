@@ -371,3 +371,35 @@ git push origin phase0-fedta-baseline
 
 - 从 tag 起，`--method fedta` 视为 **read-only scientific baseline**：不得改动 FedTA loss / optimizer / BGPS / SIKF / FedAvg head / Tail Anchor 结构 / prompt 逻辑 / CIFAR 联邦划分
 - 当前活跃路线：**Phase 4 接口稳定性**（FEDSMTA_ROADMAP.md §6）——A2 干预在新方法 flag（`--method fedta_a2`）下实验；已测验失败方案的命令已从本文件移除，总存档见 FEDSMTA_ROADMAP.md §11
+
+## 16. Phase 4 修复实验（A2 训练臂 + A1 快照评估）
+
+> A2 三臂各自跑一次完整训练（control 复用既有 seed42 baseline run，不新增计算）。
+> A1 为纯推理零重训实验，baseline run 跑完后几分钟即可出结果。
+> 实现机制：post-step restore（等价 freeze + wd 豁免），官方 FedTA 优化器零改动；
+> 保护集 = 已完成任务训练特征经当前 key top-1 路由的支撑槽位并集（D0 定义，运行时计算）。
+> 判读标准（预注册，roadmap §6.2）：anchor 臂 KA_rel 显著下降 = 主通道因果成立；both 臂逼近 co 上界且 cc 不受损。
+
+```bash
+# A2 三臂训练（CIFAR-100，seed 42；逐臂依次运行）
+python main.py --method fedta_a2 --a2_arm anchor --seed 42 --global_epoch 5 --threshold 0.25 --data-path <DATA_PATH>
+python main.py --method fedta_a2 --a2_arm key    --seed 42 --global_epoch 5 --threshold 0.25 --data-path <DATA_PATH>
+python main.py --method fedta_a2 --a2_arm both   --seed 42 --global_epoch 5 --threshold 0.25 --data-path <DATA_PATH>
+
+# ImageNet-R（固定 surrogate_num 5）
+python main.py --method fedta_a2 --a2_arm anchor --seed 42 --global_epoch 5 --threshold 0.25 --surrogate_num 5 --data-path <DATA_PATH>
+
+# A2 smoke（先验证接线：1 任务应输出 protected 0/200 slots 并与 control 无差异）
+python main.py --method fedta_a2 --a2_arm both --seed 42 --task_num 1 --global_epoch 5 --local_epoch 1 --run_name a2_smoke
+
+# A1 快照评估（纯推理；对 baseline run 或 A2 run 均可运行）
+python diagnostics/a1_snapshot_eval.py \
+    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --out_csv diagnostics_output/a1_snapshot_eval.csv
+```
+
+注意事项：
+- `--a2_arm` 仅在 `--method fedta_a2` 下生效；`--method fedta` 路径零改动（A2 代码全部藏在 method flag 后）
+- A2 checkpoint 含保护快照（a2_state），跨 arm resume 会被 arm 一致性检查拒绝（RuntimeError）
+- A1 预期结果 = 2×2 co 组合预注册值（T1 71.4→93.9 等）；显著偏离时先查 batchwise_prompt 噪声（±2pp 内正常）
+- A2 判读需配合 D1 脚本在 A2 run 上重算 KA_rel / 路由保持率，与 seed42 baseline 对照

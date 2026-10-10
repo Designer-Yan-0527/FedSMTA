@@ -105,7 +105,15 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--print_freq', type=int, default=10, help = 'The frequency of printing')
 
     # Ours
-    subparsers.add_argument('--method', type=str, default='fedta', help='The method of Prompt')
+    subparsers.add_argument('--method', type=str, default='fedta', choices=['fedta', 'fedta_a2'],
+                            help='fedta = frozen Phase-0 baseline (read-only); '
+                                 'fedta_a2 = Phase 4 A2 routing-interface protection arms')
+    subparsers.add_argument('--a2_arm', type=str, default='anchor', choices=['key', 'anchor', 'both'],
+                            help='A2 protection arm (only used with --method fedta_a2): '
+                                 'key = freeze protected key rows; anchor = freeze protected '
+                                 'anchor rows; both = freeze both. Implemented as post-step '
+                                 'restore (= freeze + weight-decay exemption), leaving the '
+                                 'official FedTA optimizer untouched.')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
     subparsers.add_argument('--client_num', default=5, type=int,

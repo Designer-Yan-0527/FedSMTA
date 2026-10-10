@@ -65,6 +65,14 @@ class Client_DF(object):
         # (observer-only), never by the official evaluate()
         self.last_margin_stats = None
 
+        # Phase 4 A2 (--method fedta_a2): routing-interface protection state.
+        # All of this is ONLY touched when self.method == 'fedta_a2'; the
+        # frozen FedTA baseline never enters these code paths.
+        self.a2_arm = getattr(args, 'a2_arm', 'anchor')
+        self._a2_protected_slots = None   # LongTensor: protected slot ids
+        self._a2_key_snapshot = None      # frozen key rows (arm key/both)
+        self._a2_anchor_snapshot = None   # frozen anchor rows (arm anchor/both)
+        self._a2_task_id = None           # task the current protection belongs to
 
         self.head = Chead(args.nb_classes)
 
@@ -104,6 +112,109 @@ class Client_DF(object):
             # only cifar100 / ImageNet-R are supported in this project
             self.get_data(task)
             self.task_id = task
+            # Phase 4 A2: entering a new task -> recompute the protected slot
+            # set + row snapshots from the CURRENT (post-previous-task) key /
+            # anchor state. No-op for task 0 (empty protection set).
+            if self.method == 'fedta_a2':
+                self._a2_init_task_protection(args)
+
+    def _a2_init_task_protection(self, args):
+        """A2: compute the protected slot set and row snapshots at task start.
+
+        Protection set (pre-registered, roadmap S6.2) = union over all
+        completed tasks t' < task_id of the top-1 routing destinations of
+        their train-split features under the CURRENT key (= D0 emergent
+        support, B_t > 0). The snapshot is taken once at task start and the
+        protected rows are restored after every Tail_Anchor optimizer step
+        for the whole task (post-step restore == freeze + weight-decay
+        exemption; the official optimizer is never modified).
+
+        The feature pass is RNG-neutral: sequential loader (shuffle=False,
+        num_workers=0) + torch RNG state snapshot/restore.
+        """
+        self._a2_task_id = self.task_id
+        completed = [t for t in range(self.task_id)
+                     if t in self.data_split_indices]
+        if not completed:
+            self._a2_protected_slots = None
+            self._a2_key_snapshot = None
+            self._a2_anchor_snapshot = None
+            return
+
+        # RNG-neutral: snapshot CPU + CUDA torch RNG streams around the pass
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = (torch.cuda.get_rng_state()
+                    if torch.cuda.is_available() else None)
+        vit_was_training = self.vit.training
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            self.model.to(self.device)
+            self.vit.to(self.device)
+            # well-defined prompt state (same convention as train())
+            if self.prompts is not None:
+                self.vit.load_prompts(self.prompts)
+
+            hit_slots = []
+            for t in completed:
+                dataset = Subset(self.train_data[t],
+                                 self.data_split_indices[t]["train"])
+                loader = DataLoader(dataset, batch_size=16, num_workers=0,
+                                    shuffle=False)
+                feats = []
+                for input, _target in loader:
+                    input = input.to(self.device, non_blocking=True)
+                    with torch.no_grad():
+                        output = self.original_model(input)
+                        cls_features = output['pre_logits']
+                        output = self.vit(input, task_id=self.task_id,
+                                          cls_features=cls_features, train=True)
+                    feats.append(output['feat'].to(self.device))
+                if not feats:
+                    continue
+                feat = torch.cat(feats, dim=0)
+                # routing exactly as Tail_Anchor.forward: l2-normalized
+                # feature vs l2-normalized key rows, top-1
+                x_embed_norm = self.model.l2_normalize(feat, dim=1)
+                key = self.model.key.reshape(-1, self.model.key_size)
+                key_norm = self.model.l2_normalize(key, dim=1)
+                similarity = torch.matmul(x_embed_norm, key_norm.t())
+                _, index = torch.topk(similarity, k=1)
+                hit_slots.append(index.reshape(-1))
+
+            if hit_slots:
+                slots = torch.unique(torch.cat(hit_slots)).to(self.device)
+            else:
+                slots = None
+            self._a2_protected_slots = slots
+            self._a2_key_snapshot = (self.model.key.data[slots].clone()
+                                     if (slots is not None and
+                                         self.a2_arm in ('key', 'both'))
+                                     else None)
+            self._a2_anchor_snapshot = (self.model.anchor_pool.data[slots].clone()
+                                        if (slots is not None and
+                                            self.a2_arm in ('anchor', 'both'))
+                                        else None)
+            n = 0 if slots is None else int(slots.numel())
+            print(f'[A2] client {self.id} task {self.task_id} arm={self.a2_arm}: '
+                  f'protected {n}/{self.model.key.shape[0]} slots')
+        finally:
+            # restore RNG streams and module modes (train() never sets
+            # vit.train(); leaving eval() on would silently change training)
+            self.vit.train(vit_was_training)
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng)
+
+    def _a2_post_step_restore(self):
+        """A2: restore protected key/anchor rows after a Tail_Anchor
+        optimizer step. Only called when method == 'fedta_a2'."""
+        if self._a2_protected_slots is None or self._a2_task_id != self.task_id:
+            return
+        if self.a2_arm in ('key', 'both') and self._a2_key_snapshot is not None:
+            self.model.key.data[self._a2_protected_slots] = self._a2_key_snapshot
+        if self.a2_arm in ('anchor', 'both') and self._a2_anchor_snapshot is not None:
+            self.model.anchor_pool.data[self._a2_protected_slots] = self._a2_anchor_snapshot
 
 
     def train(self, round, args):
@@ -208,6 +319,10 @@ class Client_DF(object):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                # Phase 4 A2: restore protected key/anchor rows after the
+                # Tail_Anchor step. No-op for the frozen fedta baseline.
+                if self.method == 'fedta_a2':
+                    self._a2_post_step_restore()
 
 
         target_list = []
@@ -495,7 +610,51 @@ class Client_DF(object):
             "class_mask": self.class_mask,
 
             "data_split_indices": self.data_split_indices,
+
+            # Phase 4 A2 protection state (None for the fedta baseline).
+            # Required so a mid-task resume restores the task-start snapshot
+            # instead of recomputing it from the already-drifted state.
+            "a2_state": self._a2_state_for_checkpoint(),
         }
+
+    def _a2_state_for_checkpoint(self):
+        """Serialize A2 protection state; None unless method == 'fedta_a2'
+        and a protection set has been computed."""
+        if self.method != 'fedta_a2' or self._a2_task_id is None:
+            return None
+        return {
+            "a2_arm": self.a2_arm,
+            "task_id": self._a2_task_id,
+            "protected_slots": (None if self._a2_protected_slots is None
+                                else self._a2_protected_slots.cpu().tolist()),
+            "key_snapshot": (None if self._a2_key_snapshot is None
+                             else self._a2_key_snapshot.detach().cpu()),
+            "anchor_snapshot": (None if self._a2_anchor_snapshot is None
+                                else self._a2_anchor_snapshot.detach().cpu()),
+        }
+
+    def _a2_load_checkpoint_state(self, state):
+        """Restore A2 protection state saved by _a2_state_for_checkpoint()."""
+        if self.method != 'fedta_a2':
+            return
+        a2 = state.get("a2_state") if state else None
+        if not a2:
+            return
+        if a2.get("a2_arm") != self.a2_arm:
+            raise RuntimeError(
+                f"client {self.id}: A2 arm mismatch on resume "
+                f"(checkpoint={a2.get('a2_arm')}, current={self.a2_arm})")
+        self._a2_task_id = a2.get("task_id")
+        slots = a2.get("protected_slots")
+        self._a2_protected_slots = (None if slots is None
+                                    else torch.tensor(slots, dtype=torch.long,
+                                                      device=self.device))
+        key_snap = a2.get("key_snapshot")
+        self._a2_key_snapshot = (None if key_snap is None
+                                 else key_snap.to(self.device))
+        anchor_snap = a2.get("anchor_snapshot")
+        self._a2_anchor_snapshot = (None if anchor_snap is None
+                                    else anchor_snap.to(self.device))
 
     def load_checkpoint_state(self, state):
         if state["id"] != self.id:
@@ -539,6 +698,10 @@ class Client_DF(object):
 
         # rebuild all seen-task test loaders + current traindata
         self.rebuild_data_from_indices()
+
+        # Phase 4 A2: restore protection snapshot AFTER task_id is restored,
+        # so update_data() does not recompute it mid-task.
+        self._a2_load_checkpoint_state(state)
 
     def rebuild_data_from_indices(self):
         """Rebuild test_loader[0..task_id] and the current traindata from the
