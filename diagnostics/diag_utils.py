@@ -55,21 +55,30 @@ def load_args_from_run_dir(run_dir, data_path=None, device=None):
 
 
 def resolve_checkpoint(run_dir, checkpoint=None):
-    """Return the checkpoint path: explicit arg, or run_dir/checkpoints/latest.pth."""
+    """Return the checkpoint path: explicit arg, or run_dir/checkpoints/latest.pth.
+
+    A relative checkpoint argument is accepted in two forms: relative to the
+    current working directory (full-path form used in RUNCOMMANDS.md) or
+    relative to run_dir. The returned path is absolute so repeated resolution
+    (scripts may pre-resolve and pass the result to bootstrap_server, which
+    resolves again) stays idempotent.
+    """
     run_dir = Path(run_dir)
     if checkpoint is None:
-        ckpt = run_dir / "checkpoints" / "latest.pth"
+        candidates = [run_dir / "checkpoints" / "latest.pth"]
     else:
         ckpt = Path(checkpoint)
-        if not ckpt.is_absolute():
-            ckpt = run_dir / checkpoint
-    if not ckpt.is_file():
-        raise FileNotFoundError(f"checkpoint not found: {ckpt}")
-    # absolute path: makes repeated resolution idempotent (scripts may
-    # pre-resolve and pass the result to bootstrap_server, which resolves
-    # again -- a relative return value would be re-joined with run_dir and
-    # double the path)
-    return str(ckpt.resolve())
+        if ckpt.is_absolute():
+            candidates = [ckpt]
+        else:
+            # cwd-relative first, then run_dir-relative
+            candidates = [ckpt, run_dir / ckpt]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand.resolve())
+    raise FileNotFoundError(
+        f"checkpoint not found (tried: "
+        f"{', '.join(str(c) for c in candidates)})")
 
 
 def bootstrap_server(run_dir, checkpoint=None, data_path=None, device=None):

@@ -18,6 +18,16 @@ The task-specific Chead of task r is ALWAYS used (per the Phase-1 spec:
   (1) vs (2)  anchor/key drift alone
   (1) vs (3)  prompt drift alone
 
+Notes:
+  - current key/anchor tensors are CLONED from client.model.state_dict()
+    (state_dict shares storage with live params; without cloning, combo1's
+    load_state_dict would overwrite the "current" snapshot in place).
+  - each (client, old_task) combo set is evaluated under a FIXED torch seed,
+    so all 4 combos see the identical batch order and batchwise prompt
+    voting noise (~±2pp) cancels in the combo differences. As a side
+    effect combo(1) may differ from the training-time after-task margin
+    snapshot by that same ~±2pp shuffle noise.
+
 Output CSV: client_id, old_task, new_task, prompt, key_anchor,
 accuracy, margin_mean, margin_median, margin_p10.
 
@@ -61,7 +71,8 @@ def resolve(run_dir, ckpt):
         path = Path(run_dir) / ckpt
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint not found: {path}")
-    return str(path)
+    # absolute so bootstrap_server's resolve_checkpoint stays idempotent
+    return str(path.resolve())
 
 
 def main():
@@ -109,7 +120,11 @@ def main():
 
             # --- key / anchor tensors ---
             old_ka = old_state["tail_anchor_model"]
-            cur_ka = client.model.state_dict()
+            # state_dict() returns tensors SHARING STORAGE with the live
+            # parameters; load_state_dict() below copies in place and would
+            # silently overwrite this snapshot (combo1's old-ka load would
+            # pollute "current"). Clone every tensor to make it independent.
+            cur_ka = {k: v.clone() for k, v in client.model.state_dict().items()}
 
             prompt_variants = [("old", old_prompt), ("current", cur_prompt)]
             ka_variants = [("old", old_ka), ("current", cur_ka)]
@@ -123,6 +138,12 @@ def main():
                     client.model.load_state_dict(
                         {"key": ka["key"], "anchor_pool": ka["anchor_pool"]},
                         strict=False)  # head untouched: evaluate() loads heads[old_task]
+                    # Deterministic batching: same seed for all 4 combos of
+                    # this (client, old_task) so every combo evaluates the
+                    # exact same batch order. batchwise prompt voting makes
+                    # accuracy batch-composition dependent (~±2pp); fixing
+                    # the order cancels that noise in combo differences.
+                    torch.manual_seed(9700 + 100 * cid + old_task)
                     # observer-only diagnostics: use evaluate_with_margin so
                     # last_margin_stats is populated (evaluate() is now the
                     # pure official accuracy path)

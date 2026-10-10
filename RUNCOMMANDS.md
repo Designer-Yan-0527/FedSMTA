@@ -188,6 +188,36 @@ python diagnostics/compatibility_drift.py \
 - 评估 old/current prompt × old/current key-anchor 四种组合（旧 task 始终用对应 task-specific Chead）
 - 输出默认写到 `<run_dir>/metrics/compatibility_2x2.csv`；`--old_task` 缺省时从 old_ckpt 推断
 
+### 9.3.1 4 组合 per-class 通道分解（public vs private × 4 组合，联邦独有机制判决实验）
+
+```bash
+python diagnostics/analyze_class_retention.py \
+    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --old_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth \
+    --new_ckpt checkpoints/task_04_end.pth \
+    --out_csv diagnostics_output/class_retention_4combo.csv
+```
+
+- 对每个 (client, old task) 评估 **4 组合**（old/old、old/cur、cur/old、cur/cur，顺序与 compatibility_drift 一致，旧 task 始终用 task-specific Chead），做 **per-class** 精度评估（复刻 evaluate 的 mask/target 语义，`predicts`/`target` 均为全局 class id）
+- 通道定义：P 通道 = oo−co（聚合 prompt 漂移，联邦独有候选）；KA 通道 = oo−oc（本地 key/anchor 漂移，架构固有）；总漂移 = oo−cc
+- public/private 身份由 `outer_split_manifest` 自证：出现在 >1 个客户端的类 = public（协议定义），缺失 manifest 时直接 RuntimeError
+- 固定 shuffle 种子 `9700+100*cid+old_task`（与 compatibility_drift 一致，四组合同 batch 顺序）；全程 RNG snapshot/restore；评估后恢复 current 组件
+- 判决目标：public 类超额损伤（相对 private）若集中在 P 通道 → 聚合介导的跨客户端接口失配坐实（联邦独有机制）；若同样在 KA 通道 → 机制架构固有，联邦只是调制项，论文降级措辞
+- 聚合必须样本加权（本地测试集 Dirichlet 切到类级）；脚本 per-client 值与 compatibility_drift 输出精确对账
+- 输出 CSV 列：client_id, old_task, class_id, scope, n_clients, n_test, prompt, key_anchor, acc（每类每组合一行）；console 汇总按 (task, scope) 样本加权通道分解 + public/private 判决 + 各客户端任务构成
+
+### 9.3.2 子机制判别探针（公共类 KA 超额损伤的归因，消费 9.3.1 的 CSV）
+
+```bash
+python diagnostics/probe_channel_correlates.py \
+    --csv diagnostics_output/class_retention_4combo.csv
+```
+
+- 在 4combo CSV 上按 (client, old_task, class) 单元计算 `KA_c=oo−oc`、`P_c=oo−co`，检验两个候选子机制：(i) 间接共适应（匹配强度下 public KA > private、KA_c~P_c 正相关）；(ii) 协议结构性脆弱（KA_c~n_test 负相关）
+- 交互表：n_test 分桶（1-15/16-40/41-80/81-171）× scope 的加权 KA/oo，plus 匹配强度对比（public n_test≥40 vs private all）与逐客户端对照
+- 汇总指标另存 `channel_correlates.json`（与输入 CSV 同目录）
+- 判决（seed42）：(ii) 否证（方向相反：r=+0.346，n_test≤15 公共类近乎免疫 wKA=+1.8）；(i) 修正版成立（匹配强度下 public +19.7 vs private +11.4，4/5 客户端，P 通道协同抬升）
+
 ### 9.4 Synthetic Oracle-K2 压力测试（sanity check，**非真实 Oracle-K2**）
 
 ```bash
