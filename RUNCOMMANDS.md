@@ -258,6 +258,23 @@ python diagnostics/analyze_landing_spots.py \
 - **已得判决（2026-10-10）**：R1/R5 证伪（落点去向无预测力，与支撑集暴露同死）、R2 存活（support_preserve FE rho=−0.197, p=0.014，迄今最强类级保护因子）、R3 单边坍缩（90.4% 强绑定类 modal_preserve<0.2，但损伤量级远小于坍缩量级）、R4 强确认（32 旧类 modal 坍缩到 4–8 个吸引子槽，top-10 落点槽承载 86–96% 质量，64.6% 落入未训练噪声区）
 - 秒级本地运行，无 GPU；描述性审计，因果主张待 A2 干预
 
+### 9.3.4 TKR 精确口径复算（verify_tkr.py，零 GPU，消费 train_log.csv）
+
+```bash
+python diagnostics/verify_tkr.py \
+    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --out_prefix diagnostics_output/tkr_seed42
+# 或直接指定 train_log.csv：
+python diagnostics/verify_tkr.py \
+    --train_log <path>/train_log.csv --global_epoch 5 \
+    --out_prefix diagnostics_output/tkr_seed42
+```
+
+- **目的**：按 FedTA 作者 2026-10-10 issue 回复的定义复算 TKR——分母 = round4 **聚合全局模型**在 task 0 本地测试集精度（`phase=server, test_task=0, round=4` 行），分子 = t>0 后**本地模型**回评 task 0（`phase=local, test_task=0, round=t*5+4` 行，本地训练后、聚合前的状态）
+- **注意**：task-end checkpoint 存的是广播后 prompt，无法重建分子态，train_log.csv 是唯一数据源（要求 run 开着 instrumentation）
+- 输出三口径（author local/global、local/local、server/server）× 两种聚合（ratio-of-means、mean-of-ratios）+ t=0 client-drift premium
+- **已得判决（2026-10-10，seed 42）**：author 口径 = 84.6/92.2/95.3/95.6%——**未复现论文 105–115%**，local/global prompt 不对称解释被实证否证（Roadmap §4.10）；server/server 口径与此前部署态 KRt（88.6/93.0/90.1/90.7）精确吻合，交叉验证通过
+
 ### 9.3.3 slot 级碰撞诊断 —— 已删除（已测验失败）
 
 - **原版 D1（slot_collision_diagnostic.py）已被 D1 v2（§9.3.3b collision_exposure_diagnostic.py）取代**：其"slot id ≈ class id"单槽归因设计在 D0 判死后即不可用（diag_share=0.000），且核心假说（hits→位移→损伤线性劫持链）被 D1-lite / D1 v2 FE 判决证伪。存档见 FEDSMTA_ROADMAP.md §11；原命令见 git 历史。
