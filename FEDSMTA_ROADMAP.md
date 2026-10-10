@@ -239,7 +239,7 @@ D0 是 D1 的前置 gateway：**slot id = class id 假设已判死**（diag_shar
 
 **新方法 flag**：`--method fedta_a2` + `--a2_arm {key,anchor,both}`；`--method fedta` 基线路径保持只读（Phase 0 冻结约束）。
 
-**实现状态（2026-10-10，代码完成待服务器运行）**：`Models/Client_DF.py`（`_a2_init_task_protection` / `_a2_post_step_restore` + checkpoint 持久化 `a2_state`，resume 中途任务时恢复任务开始快照而非重算；arm 不一致 resume 拒绝）。A1 脚本 `diagnostics/a1_snapshot_eval.py`（纯推理，含同 seed baseline 对照）。命令见 RUNCOMMANDS.md §16。smoke 顺序：A2 smoke（task_num=1，应输出 `protected 0/200 slots` 且与 control 轨迹一致）→ `--method fedta` 路径未变回归（Gate 0B/0C 快检）→ 三臂正式训练。
+**实现状态（2026-10-10，代码完成待服务器运行；经外部代码审查后加固）**：`Models/Client_DF.py`（`_a2_init_task_protection` / `_a2_post_step_restore` + checkpoint 持久化 `a2_state`）。审查加固四项：(a) 保护集特征提取快照/恢复**全部 RNG 流**（torch CPU/CUDA-all + python random + numpy）及 original_model/vit 训练模式，防数据增强流污染臂间对照；(b) resume **fail-closed**——fedta_a2 缺 a2_state / arm 不一致 / 快照行数不符一律 RuntimeError，杜绝"静默降级为无保护 A2"；(c) fedta 基线 **checkpoint schema 不变**（a2_state 仅在 fedta_a2 下写入，__init__ 属性条件创建）；(d) A1 显式加载 current prompt（combo 顺序与 2×2 严格一致）。回归测试三件套：`test_resume_regression.py --method fedta_a2`（a2_state 逐位比较）、`tests/test_a2_rejections.py`（拒绝语义）、`tests/test_a1_parity.py`（A1 与 2×2 逐位对账）。命令见 RUNCOMMANDS.md §16/§16.1。执行顺序：T0 fedta 路径回归 → T1/T2/T3 → A1 正式评估 → A2 三臂。
 
 **世代共适应风险**（§4.6）：both 臂压缩新任务可用槽位，若 cc 显著受损则冻结路线让位于 A3 校准路线——此为 A3 的存在性判据。
 

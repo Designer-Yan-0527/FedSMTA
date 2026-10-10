@@ -58,6 +58,10 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--work_dir", default="output/regression", type=Path)
     p.add_argument("--method", default="fedta")
+    p.add_argument("--a2_arm", default=None,
+                   help="passed through when --method fedta_a2 "
+                        "(key/anchor/both); also tested by the A2 "
+                        "rejection suite")
     return p.parse_args()
 
 
@@ -287,6 +291,10 @@ def main():
             "--local_epoch", str(args.local_epoch),
             "--method", args.method, "--deterministic",
             "--save_every", "1", "--output_dir", str(args.work_dir)]
+    if args.method == "fedta_a2":
+        assert args.a2_arm in ("key", "anchor", "both"), (
+            "--a2_arm is required for --method fedta_a2")
+        base += ["--a2_arm", args.a2_arm]
 
     run_a = args.work_dir / args.data_name / args.method / "reg_full" / f"seed_{args.seed}"
     run_b = args.work_dir / args.data_name / args.method / "reg_split" / f"seed_{args.seed}"
@@ -327,6 +335,7 @@ def main():
     head_diffs = [state_dict_diff(ckpt_a["global_head"], ckpt_b["global_head"])]
     key_diffs, anchor_diffs, ta_state_diffs = [], [], []
     cprompt_diffs, client_gproto_diffs, client_lproto_diffs = [], [], []
+    a2_state_diffs = []
     for ca, cb in zip(ckpt_a["clients"], ckpt_b["clients"]):
         for ha, hb in zip(ca["heads"], cb["heads"]):
             head_diffs.append(state_dict_diff(ha, hb))
@@ -355,6 +364,17 @@ def main():
                                                cb["global_protos"]))
         client_lproto_diffs.append(protos_diff(ca["local_protos"],
                                                cb["local_protos"]))
+        # A2 protection state: must EXIST on both sides for fedta_a2
+        # (false-pass guard mirrors the outer-manifest discipline) and be
+        # bit-identical between continuous and resumed runs
+        if args.method == "fedta_a2":
+            for c, lbl in ((ca, str(run_a)), (cb, str(run_b))):
+                assert isinstance(c.get("a2_state"), dict) and c["a2_state"], (
+                    f"{lbl}: client {c['id']} checkpoint missing a2_state "
+                    "(false-pass guard)")
+            a2_state_diffs.append(
+                0.0 if deep_equal(ca["a2_state"], cb["a2_state"])
+                else float("inf"))
 
     # inner 70/30 splits: fail-fast on missing/empty/invalid state, and
     # every client must carry a split for every task the run reached
@@ -410,6 +430,9 @@ def main():
         "fix_keys_equal": sorted(map(str, ckpt_a["fix_keys"]))
                           == sorted(map(str, ckpt_b["fix_keys"])),
     }
+    if args.method == "fedta_a2":
+        comparison["a2_state_equal"] = (all(d == 0.0 for d in a2_state_diffs)
+                                        if a2_state_diffs else False)
 
     rng_a, rng_b = ckpt_a["rng_state"], ckpt_b["rng_state"]
     rng_diffs = {
@@ -425,7 +448,7 @@ def main():
     report = []
     for name, diff in comparison.items():
         if name in ("split_equal", "outer_split_equal", "existing_class_equal",
-                    "fix_keys_equal"):
+                    "fix_keys_equal", "a2_state_equal"):
             report.append((name, diff is True, 0.0 if diff else float("inf"), ""))
         else:
             report.append((name, diff == 0.0, diff, ""))

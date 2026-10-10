@@ -61,7 +61,13 @@ def resolve(run_dir, ckpt):
 
 def eval_client_task(client, task, nb_classes, tag, rows, ka=None):
     """Evaluate one (client, task) and append a row. ka = optional
-    {key, anchor_pool} state dict to load before evaluating (A1 arm)."""
+    {key, anchor_pool} state dict to load before evaluating (A1 arm).
+
+    Strict combo order (same as compatibility_drift.py so A1 rows are
+    directly comparable with the 2x2 grid):
+      load current prompt -> load KA -> set seed -> evaluate."""
+    if client.prompts is not None:
+        client.vit.load_prompts(client.prompts)
     if ka is not None:
         client.model.load_state_dict(ka, strict=False)  # head untouched
     torch.manual_seed(9700 + 100 * client.id + task)

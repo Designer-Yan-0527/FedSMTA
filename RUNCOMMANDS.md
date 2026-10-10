@@ -399,7 +399,24 @@ python diagnostics/a1_snapshot_eval.py \
 ```
 
 注意事项：
-- `--a2_arm` 仅在 `--method fedta_a2` 下生效；`--method fedta` 路径零改动（A2 代码全部藏在 method flag 后）
-- A2 checkpoint 含保护快照（a2_state），跨 arm resume 会被 arm 一致性检查拒绝（RuntimeError）
+- `--a2_arm` 仅在 `--method fedta_a2` 下生效；`--method fedta` 路径零改动（A2 代码全部藏在 method flag 后；checkpoint schema 也不变——a2_state 仅在 fedta_a2 下写入）
+- A2 checkpoint 含保护快照（a2_state），fail-closed：缺 a2_state / arm 不一致 / 快照行数不符的 resume 一律 RuntimeError
 - A1 预期结果 = 2×2 co 组合预注册值（T1 71.4→93.9 等）；显著偏离时先查 batchwise_prompt 噪声（±2pp 内正常）
 - A2 判读需配合 D1 脚本在 A2 run 上重算 KA_rel / 路由保持率，与 seed42 baseline 对照
+
+### 16.1 A2/A1 回归测试（正式四臂前必须全过）
+
+```bash
+# T1. A2 resume 等价（连续 vs 断点恢复，含 a2_state 逐位比较；复用 Gate 0B harness）
+python tests/test_resume_regression.py --method fedta_a2 --a2_arm anchor --data-path <DATA_PATH>
+
+# T2. A2 fail-closed 拒绝语义（arm mismatch / 缺 a2_state / fedta schema 不变性）
+python tests/test_a2_rejections.py --data-path <DATA_PATH>
+
+# T3. A1 与 2×2 逐位对账（A1 gen t == (current, old)；A1 cur == (current, current)）
+python tests/test_a1_parity.py --data-path <DATA_PATH>
+
+# T0. fedta 基线路径未变回归（Gate 0A smoke + Gate 0B/0C，见第 10/11/12 节，改动后重跑一遍）
+```
+
+执行顺序：T0 → T1 → T2 → T3 → A1 正式评估 → A2 三臂正式训练。
