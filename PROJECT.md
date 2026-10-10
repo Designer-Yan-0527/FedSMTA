@@ -91,3 +91,16 @@ main.py
 - timm（模型创建 / 优化器 / 调度器）
 - torchvision、scikit-learn、numpy、matplotlib、tqdm
 - 无需 deeplake（该依赖原本只用于已删除的 office_home 数据集）
+
+## 5. 已测验失败方案存档（2026-10-10）
+
+以下方案/假说**已经实验检验失败**，命令已从 `RUNCOMMANDS.md` 移除（节号留 tombstone），完整判决依据见 [FEDSMTA_ROADMAP.md §11](file:///d:/MyWork/FedSMTA/FEDSMTA_ROADMAP.md)（唯一汇总处）：
+
+- **多模态主线（Semantic-K2 / Oracle-K2 / UOT，Phase 2 全线）**：Phase 1 判负——robust multimodal prevalence 0/25，halt criterion 触发，主线冻结（`analyze_multimodality.py` / `synthetic_oracle_k2.py` / `check_feature_batch_sensitivity.py` 的命令已删）
+- **"slot id = class id" 显式绑定**：D0 判死（diag_share=0.000，绑定涌现形成）
+- **简单碰撞链 / slot hijacking / 落点流量 / 瞬态命中 / routing instability（KL/JS）/ key 位移直接因果**：Phase 4 D1-lite、D1 v2 与落点分析逐一证伪——损伤主通道为 anchor 内容失配，原版 `slot_collision_diagnostic.py` 被 `collision_exposure_diagnostic.py` 取代
+- **早期假说**：公共类跨客户端强化（retention 反向）、聚合介导机制（85% 走本地 KA 通道）、协议结构性脆弱（方向相反）、supra-baseline KRt 复现（不可达）
+
+失败判决按预注册判据作出、均有数据留档，属论文排除法证据链的组成部分；**存活结论主干**（表观遗忘、KA 主导、anchor 失配三因子模型、公共/私有不对称、A1/A2 修复预注册）不受影响，速查见 Roadmap §11.4。
+
+当前活跃路线：**Phase 4 接口稳定性**（Roadmap §6），下一步为 A2 四臂因果干预实验（`--method fedta_a2`）。

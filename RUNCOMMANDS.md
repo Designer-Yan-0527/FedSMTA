@@ -140,7 +140,7 @@ output/
                     └── round_metrics.jsonl    # 每轮指标流水
 ```
 
-## 9. Phase 1 诊断工具（不改变正式训练）
+## 9. 诊断工具（不改变正式训练）
 
 诊断脚本通过共享的 `build_server()` 复刻训练的 RNG 流（seed → model default_cfg → 数据划分 → 建客户端），保证得到与训练完全相同的 client 数据划分。所有命令在项目根目录执行；`<run_dir>` 指 `output/{data_name}/fedta/{run_name}/seed_{seed}`。
 
@@ -158,22 +158,9 @@ python diagnostics/extract_features.py \
 - **deterministic extraction**：与 precheck 脚本同协议（CUBLAS env 前置 + cudnn flags 在 bootstrap 后设置），保证正式提取与 precheck 测 floor 时的执行条件一致
 - `--checkpoint` 缺省时自动使用 `checkpoints/latest.pth`；`--data_path` / `--device` 可覆盖 args.json 中的值
 
-### 9.2 多模态分析（NLL / BIC / rho / D_cover(+rel) / Dirichlet 校正指标 / stability）
+### 9.2 多模态分析 —— 已删除（已测验失败）
 
-```bash
-python diagnostics/analyze_multimodality.py \
-    --features diagnostics_output/features_cifar100_task_04_end.npz \
-    --plot_dir diagnostics_output/plots
-```
-
-- 默认只分析 public classes（类出现在 ≥2 个 client 的 class mask 中，由数据协议定义），加 `--all_classes` 分析全部；**metadata 缺失 `public_classes` 时直接 RuntimeError**（public/private 是联邦协议属性，禁止从特征样本反推）；**只用 TRAIN split 发现 semantic modes——`--split` 仅接受 `train`，test/all 已被硬性禁止（test-leakage 防护）**
-- **模型选择与描述性几何严格分离**：held-out GMM（80/20）只出 `nll/delta_nll`、`bic/delta_bic`（p_K = K·d + K + (K−1)）；`sse/delta_sse` 由全量 TRAIN 上的专用 KMeans(K=2) 计算（K=1 解是 K=2 的可行特例，数学上严格保证 SSE₂ ≤ SSE₁；held-out GMM 的中心只见 80% 数据，不得用于 SSE）
-- 每类统计：`delta_sse`、`delta_nll`、`delta_bic`、`silhouette`、`mode_distance`、`rho`、`mode1/mode2_mass`（**canonical ordering：mode1 = major mode，π₁ ≥ π₂**，否则 GMM component label 跨 seed/class 不可比——label switching）、`mode_mass_minor`（label-invariant）、`coverage_distortion`（D_cover）+ **`coverage_distortion_rel`**（失真占类内散度比例）、每 mode 的 `client_entropy` + Dirichlet 校正指标：**`client_mode_mi`（I(I;K|C=c)）与 `js_weighted`（Σₖ πₖ·D_JSₖ）为主证据（均 label-invariant）**，辅助 `client_entropy_ratio_k`（H_k / H(p(i|c))，**是 ratio 而非 [0,1] 归一化，可 >1**）与 `js_divergence_k`，另保留 S_W/S_B/H_c
-- **报告口径 = 跨 run median**（`--heldout_seeds 0 1 2 3 4` × `--gmm_seeds 0 1 2` 配对轮转共 5 runs）：每类正式指标为 `*_median`（附 `*_std`），CSV 中 run-0 快照降级为 `*_primary` **debug 列**，不作为论文主结果；`p_nll` / `p_bic`（Δ>0 的 run 比例）同口径；**robust multimodal** 判定 = p_nll ≥ 0.8 且 p_bic ≥ 0.8 且 `rho_median` > `--rho_threshold`(默认 1.0) 且 `dcover_rel_median` > `--dcover_rel_threshold`(默认 0.1)——**这些是 operational thresholds 而非理论阈值**，aggregate JSON 内含 `robust_sensitivity` 网格（ρ ∈ {0.75, 1.0, 1.25} × D_rel ∈ {0.05, 0.10, 0.15}）供阈值敏感性检查
-- 输出（默认在特征文件同目录，可用 `--out_csv` / `--aggregate_json` 覆盖）：
-  - `multimodality_summary.csv` — 每 (feature_type, class) 一行（含 stability 列与 robust 标志）
-  - `multimodality_aggregate.json` — 各指标 mean / median / std / p25 / p75 / bootstrap 95% CI + **robust 类计数/比例/清单（prevalence，Phase 1 Gate 判据）**
-- `--plot_dir` 可选：每类 PCA 散点图（颜色=client，marker=task，星=FedTA 单原型，叉=K2 mode 中心）；PCA 仅用于可视化，不参与任何指标
+- **Phase 1 多模态方向判负（2026-10-10）**：robust multimodal prevalence 0/25（ρ、D_cover、client 归因、切分形态、z_ref 对照五证据链全阴性），halt criterion 触发，Phase 2 主线（Semantic-K2 / Oracle-K2 / UOT）冻结。存档见 FEDSMTA_ROADMAP.md §11；原命令与完整说明见 git 历史。
 
 ### 9.3 兼容性 2x2 诊断（prompt × key-anchor）
 
@@ -218,20 +205,66 @@ python diagnostics/probe_channel_correlates.py \
 - 汇总指标另存 `channel_correlates.json`（与输入 CSV 同目录）
 - 判决（seed42）：(ii) 否证（方向相反：r=+0.346，n_test≤15 公共类近乎免疫 wKA=+1.8）；(i) 修正版成立（匹配强度下 public +19.7 vs private +11.4，4/5 客户端，P 通道协同抬升）
 
-### 9.4 Synthetic Oracle-K2 压力测试（sanity check，**非真实 Oracle-K2**）
+### 9.3.3a 路由结构识别（Phase 4 D0：gateway，先于 D1 的有效性检查）
 
 ```bash
-python diagnostics/synthetic_oracle_k2.py \
-    --features diagnostics_output/features_cifar100_task_04_end.npz \
-    --out_dir diagnostics_output/synthetic_oracle_k2 \
-    --deltas 0,0.25,0.5,1.0,2.0 \
-    --methods fedta_k1,oracle_k2
+python diagnostics/verify_slot_binding.py \
+    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --task_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth,checkpoints/task_04_end.pth \
+    --out_csv diagnostics_output/slot_binding.csv \
+    --out_slot_csv diagnostics_output/slot_binding_slots.csv \
+    --out_npz diagnostics_output/slot_binding_matrices.npz
 ```
 
-- **定位**：人为注入两个 mode（z' = z + s·δ·v_c）并给定 oracle 真值，只回答"K2 anchor 机制能否利用已知的两个 mode"——是 anchor 机制的 synthetic sanity check，**不能**作为"真实数据多模态性提升 FedTA"的证据。真正的 Phase 2 Oracle-K2 必须等 Phase 1 结果出来后，用真实 train features 构建的 semantic modes
-- 纯特征级联邦持续学习模拟：FedTA-K1 vs Oracle-K2（s 只依赖 seed/client/task/样本，两法严格一致）
-- 输出 `oracle_k2_results.csv`（每轮各任务 accuracy/margin）、`oracle_k2_summary.csv`（AA / Forgetting / BWT / retention / mode separation）、`oracle_k2_meta.json`（含 `experiment: synthetic_oracle_k2_stress_test` 标记与 synthetic 定位说明）
-- 服务器上先跑小 delta 网格确认流程，再跑完整网格
+- **动机**：`Tail_Anchor.forward(x, class_mask)` 的 class_mask 形参在函数体内未使用——路由纯相似度、无显式类绑定；slot i ↔ class i 只能涌现形成。D0 是**描述性路由结构识别实验**，输出决定 D1 用单槽位归因、加权多槽位归因还是完整路由分布分析；脚本本身不输出机制结论
+- **固定输入协议**：train_data 带 RandomResizedCrop+HorizontalFlip——先在固定种子下物化**一份**增强视图（张量缓存），t_end 状态与部署态（task_04_end prompt+key）两次路由共用同一批输入 → routing_stability 纯测模型状态变化，增强噪声完全隔离
+- 四个维度输出：①绑定集中度（diag_share、modal_share、routing entropy）；②槽位共享（within-task + **cross-task** purity/sharing——task 3 抢 task 0 槽位是劫持核心形态，within-task 看不见）；③**路由 2×2 分解**（R_oo/R_oc = key 漂移、R_oo/R_co = feature/prompt 漂移、R_oo/R_cc = 总 routing flip + 非可加性交互——与 accuracy 2×2 同坐标系，直接对桥 KA/P 通道分解）；④完整 class×slot 绑定矩阵 B（.npz：per task + per client 全序列 + top 跨任务争抢槽位表）
+- 槽位池大小取自 key.shape[0]（200，含 100–199 未训练噪声槽）；prompt 恢复在 finally 内；空结果硬报错
+- **无自动判决**：0.9/0.8 等阈值仅作描述性分组；人工读取三个输出文件后决定 D1 归因形态
+
+### 9.3.3b D1 v2 离线碰撞暴露诊断（collision_exposure_diagnostic.py，零前向）
+
+```bash
+python diagnostics/collision_exposure_diagnostic.py \
+    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --task_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth,checkpoints/task_04_end.pth \
+    --binding_csv diagnostics_output/slot_binding.csv \
+    --binding_npz diagnostics_output/slot_binding_matrices.npz \
+    --combo_csv diagnostics_output/class_retention_4combo.csv \
+    --out_csv diagnostics_output/collision_exposure.csv \
+    --out_json diagnostics_output/collision_exposure.json
+```
+
+- **输入**：D0 的绑定 CSV + npz 矩阵、5 个 task_end checkpoint（只读 key/anchor 张量）、4combo 损伤 CSV
+- **机制链检验**：E_future（未来任务流量对旧类接口的碰撞暴露）→ d_key/d_anchor（p(j|c) 加权接口位移）→ KA_c（oo−oc 损伤），全链 Spearman 相关
+- **A2 设计岔路口**：支撑槽按未来流量 F_j>0 / F_j=0 分层的加权位移对比——劫持介导 vs 衰减介导两种损伤路径的分离；另输出 D_traffic（流量加权位移 Σ p(j|c)·(F_j/ΣF)·||ΔK_j||），区分"被访问"与"被重度访问"
+- **stabK=0.00 sanity**：旧类 modal slot 的未来流量（modal_future_traffic）——旧接口是被复用（劫持）还是被废弃（衰减）
+- **CEI_all**（GPT 形式争抢指数）与 E_future（因果方向的前瞻版）双口径；d_key_next 单窗口位移（事件驱动检查）；public/private 分层
+- **key 位移方向/范数分解**：d_key_dir（l2 归一化后 1−cos，路由相关量）+ d_key_norm_ratio（范数比，wd 存活签名）——D1 v2 FE 判决（2026-10-10）：raw ||ΔK|| 是盲指标（hit/nohit 比值 0.91×，耦合 wd Adam 使未命中槽方向随机游走+范数塌缩、命中槽被梯度钉住，两者产生相当的 raw 位移）；d_key_dir 是逐出相关量（vs modal_preserve FE rho=−0.622），脚本内打印的链相关为 pooled、判决须过 (client,task) FE（见 Roadmap §6.0 判决）
+- 纯张量/CSV 运算，约 1 分钟，无 GPU 前向；描述性审计，因果主张待 A2 干预
+
+### 9.3.3c 落点分析（analyze_landing_spots.py，本地离线，检验集中坍缩/attractor 假说）
+
+```bash
+python diagnostics/analyze_landing_spots.py \
+    --binding_npz diagnostics_output/slot_binding_matrices.npz \
+    --damage_csv diagnostics_output/collision_exposure_local.csv \
+    --out_csv diagnostics_output/landing_spots.csv \
+    --out_json diagnostics_output/landing_spots.json
+```
+
+- **输入**：D0 重跑 npz（含 `_oc` 落点矩阵：同一批固定增强视图的旧特征在最终 key 下的路由）+ D1-lite 损伤 CSV（158 class-units，已验证 158/158 modal 对齐）
+- **预注册判读**：R1 落点暴露 H_landing vs KA_rel（FE）；R2 support_preserve 保护因子；R3 强绑定类 all-or-none 双峰性；R4 跨类落点坍缩
+- **已得判决（2026-10-10）**：R1/R5 证伪（落点去向无预测力，与支撑集暴露同死）、R2 存活（support_preserve FE rho=−0.197, p=0.014，迄今最强类级保护因子）、R3 单边坍缩（90.4% 强绑定类 modal_preserve<0.2，但损伤量级远小于坍缩量级）、R4 强确认（32 旧类 modal 坍缩到 4–8 个吸引子槽，top-10 落点槽承载 86–96% 质量，64.6% 落入未训练噪声区）
+- 秒级本地运行，无 GPU；描述性审计，因果主张待 A2 干预
+
+### 9.3.3 slot 级碰撞诊断 —— 已删除（已测验失败）
+
+- **原版 D1（slot_collision_diagnostic.py）已被 D1 v2（§9.3.3b collision_exposure_diagnostic.py）取代**：其"slot id ≈ class id"单槽归因设计在 D0 判死后即不可用（diag_share=0.000），且核心假说（hits→位移→损伤线性劫持链）被 D1-lite / D1 v2 FE 判决证伪。存档见 FEDSMTA_ROADMAP.md §11；原命令见 git 历史。
+
+### 9.4 Synthetic Oracle-K2 压力测试 —— 已删除（方向已冻结）
+
+- **所属 Phase 2 主线（多模态 K2 anchor）随 Phase 1 判负冻结（2026-10-10）**，不再执行。存档见 FEDSMTA_ROADMAP.md §11；原命令见 git 历史。
 
 ## 10. 官方 FedTA parity 测试（Gate 0A）
 
@@ -313,30 +346,11 @@ git push origin main
 git push origin phase0-fedta-baseline
 ```
 
-## 14. Phase 1-precheck：z_op batch sensitivity 诊断（tag 之后、正式 Phase 1 之前）
+## 14. Phase 1-precheck（z_op batch sensitivity）—— 已删除（已测验失败）
 
-```bash
-python diagnostics/check_feature_batch_sensitivity.py \
-    --run_dir output/regression/cifar100/fedta/reg_full/seed_42 \
-    --checkpoint checkpoints/latest.pth \
-    --device cuda
-```
-
-- 背景（roadmap §5.9）：`batchwise_prompt=True` 下 `z_op(x) = f(x; B)` 依赖 batch 组成；若不稳定，后续 K=2 结论可能是 prompt routing 伪影而非真实语义多模态
-- 协议（三层对照 + 两个 floor）：
-  - **batch-size 扫描**：B = 1/8/16/32/64，同时提取 `z_op` 与 `z_ref`——`zref_B=*_vs_B=1` 是 GPU 数值 floor（origin_model 理论上 batch 无关）
-  - **重复运行 floor**：B=16 同一顺序跑两遍（`zop_repeat_*_run2_vs_run1`）——纯 GPU 非确定性 floor（脚本内已强制 cudnn deterministic）
-  - **组批对照**：B=16 恒定、`--composition_seeds 0 1 2 3 4` 五次 deterministic permutation vs identity，隔离"组批效应"与"batch size 效应"，杜绝单次 permutation 恰好没换 major prompt 的低估
-  - 样本选择：**class-stratified deterministic sampling**（固定种子，非"前 N 个 sorted index"）
-- 输出 `metrics/feature_batch_sensitivity.csv` + `.json`：每 (client, task) 与汇总（ALL）的 delta/cosine 的 mean/median/std/**p05**/p95/**min**/max（delta 看 p95/max 尾部，cosine 看 p05/min 尾部）；**另增 class-level 行**（scope=`class_{label}`，跨 client-task 按类聚合，`is_public` 列标注 public 类——全局稳定 ⇏ 每个目标类稳定，Phase 1 是 class-wise 分析，25 个 public classes 的逐类稳定性是关键）；JSON 含 `public_classes` 清单、`class_level` 汇总与 reading_guide（归因规则：只有 `zop` 漂移 ≫ 两个 floor 才能归因 batchwise prompt；class-level 判读规则同列）
-- 输出 `metrics/feature_batch_sensitivity_samples.csv`：**每样本完整记录**（client / task / label / sample_pos / sample_idx_relative / comparison / delta / cos）。`sample_pos` = 排序后样本列表内的位置（重放分层抽样用）；`sample_idx_relative` = `data_split_indices` 的值（client.train_data[t] 的索引），**与 `features_*.npz` 同坐标系**，(client, task, sample_idx_relative) 可直接 join 定位"某个 public class 的哪些样本不稳定"（约 10 万行量级）
-- **deterministic 设置顺序（v7 修复）**：`cudnn.deterministic / benchmark / use_deterministic_algorithms` 必须在 `bootstrap_server()` **之后**设置——`diag_utils` 会强制 `args.deterministic=False`，`build_server()` → `setup_determinism(False)` 会重开 `cudnn.benchmark=True`，静默覆盖 bootstrap 前设的任何 flags；`CUBLAS_WORKSPACE_CONFIG` 则必须在任何 CUDA context 创建**之前**写入 env。JSON 中的 `cudnn` 字段从 `torch.backends` **实读**（不硬编码），可直接验证运行时真实状态
-- 解读（决策见 roadmap §5.9，看到数字前不擅自改用 z_ref / 不关 batchwise_prompt）：$\bar{\Delta}_B \approx 0$ → `z_op` 可直接用于 Phase 1；显著非零且 ≫ floor → 需重新决定 Semantic Bank 用 `z_ref` / sample-wise prompt feature / 严格定义 prompt context
-- 注意：`--run_dir` 指向**已有完整训练产物**的 run（如 Gate 0B 的 `reg_full`），不是新开训练
-
-- 正式 Phase 1 的特征提取 / 多模态分析命令见第 9 节（`extract_features.py` / `analyze_multimodality.py`），在 precheck 结论通过后执行
+- **服务对象（Phase 1 多模态分析）已判负（2026-10-10），precheck 不再执行**。脚本 `check_feature_batch_sensitivity.py` 保留在仓库，其 deterministic 设置顺序教训（cudnn flags 必须在 `bootstrap_server()` 之后设置）已并入工程约定。存档见 FEDSMTA_ROADMAP.md §11；原命令见 git 历史。
 
 ## 15. Freeze 后的硬约束（长期有效）
 
 - 从 tag 起，`--method fedta` 视为 **read-only scientific baseline**：不得改动 FedTA loss / optimizer / BGPS / SIKF / FedAvg head / Tail Anchor 结构 / prompt 逻辑 / CIFAR 联邦划分
-- 之后的顺序：`diagnostics/check_feature_batch_sensitivity.py`（Phase 1-precheck）→ 正式 Phase 1；z_op batch sensitivity 属于 Phase 1-precheck，不是 Phase 0 Gate
+- 当前活跃路线：**Phase 4 接口稳定性**（FEDSMTA_ROADMAP.md §6）——A2 干预在新方法 flag（`--method fedta_a2`）下实验；已测验失败方案的命令已从本文件移除，总存档见 FEDSMTA_ROADMAP.md §11
