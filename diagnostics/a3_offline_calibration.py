@@ -150,6 +150,16 @@ TRAIN_BATCH = 16           # official train() DataLoader hardcodes batch_size=16
 PULL_COEF = 0.1            # phase-2 loss: CE + 0.2*G*InfoNCE - 0.1*pull
 WEIGHT_DECAY = 1e-3        # Adam(self.model.parameters(), weight_decay=1e-3)
 
+# key row-norm floor for the amplified-gradient-robust lambda variant:
+# l2_normalize routing amplifies gradients of near-collapsed key rows by
+# ~1/||row|| (up to 1e12 for 1e-13-norm rows), which can dominate the
+# pooled ||grad_K KL|| and make lambda_grad artifact-driven. The floored
+# variant computes the KL gradient with the key normalizer clamped at
+# this floor (sim values of healthy rows are EXACTLY unchanged — sim
+# depends only on row direction; collapsed rows have their routing weight
+# shrunk toward 0 and their gradient amplification capped at 1/floor).
+KEY_NORM_FLOOR = 1e-4
+
 
 def parse_args():
     p = argparse.ArgumentParser("A3 offline calibration (tau / KL / mask)")
@@ -194,12 +204,30 @@ def l2_normalize(x, dim=1, epsilon=1e-12):
     return x * x_inv_norm
 
 
-def routing_similarity(feat, key):
+def routing_similarity(feat, key, key_norm_floor=None):
     """Tail_Anchor routing similarity, BEFORE anchor selection:
-    l2_normalize(feat) @ l2_normalize(key rows).t()  ->  (N, pool_size)."""
+    l2_normalize(feat) @ l2_normalize(key rows).t()  ->  (N, pool_size).
+
+    key_norm_floor: when given, the KEY-row normalizer is clamped at this
+    floor (k / clamp(||k||, min=floor)). Forward sims of rows above the
+    floor are EXACTLY unchanged (sim depends only on direction); rows
+    below the floor keep their direction but have their routing weight
+    shrunk by ||k||/floor, and their gradient amplification is capped at
+    1/floor instead of 1/||k||. Used only by the amplified-gradient-robust
+    lambda variant — the default path is the exact official replica."""
     x_norm = l2_normalize(feat, dim=1)
     key = key.reshape(-1, key.shape[-1])
-    key_norm = l2_normalize(key, dim=1)
+    if key_norm_floor is None:
+        key_norm = l2_normalize(key, dim=1)
+    else:
+        square_sum = torch.sum(key ** 2, dim=1, keepdim=True)
+        inv_norm = torch.rsqrt(torch.maximum(
+            square_sum,
+            torch.tensor(1e-12, device=key.device)))
+        inv_norm = torch.minimum(
+            inv_norm,
+            torch.full_like(inv_norm, 1.0 / key_norm_floor))
+        key_norm = key * inv_norm
     return torch.matmul(x_norm, key_norm.t())
 
 
@@ -309,13 +337,17 @@ def task_loss_ce(client, feat_cur, target, nb_classes):
         return float(F.cross_entropy(logits, target))
 
 
-def kl_key_grad(feat, key, log_ro, tau, sample_mask=None):
+def kl_key_grad(feat, key, log_ro, tau, sample_mask=None,
+                key_norm_floor=None):
     """||grad_K KL(R_old || R_new)|| on reference features, analytic
     (autograd w.r.t. the key only; features are constants w.r.t. the key).
     log_ro: detached OLD-interface log-routing (the fixed target).
     sample_mask: optional bool mask over samples — when given, the KL is
     averaged over the masked subset only (matches the sample-masked A3
     loss form on protected samples).
+    key_norm_floor: optional amplified-gradient-robust variant (see
+    routing_similarity) — caps the 1/||k|| gradient amplification of
+    near-collapsed key rows.
 
     Two semantic variants are measured in main():
       deployment gradient  (feat_new, K_new): A3's actual training-time
@@ -326,7 +358,7 @@ def kl_key_grad(feat, key, log_ro, tau, sample_mask=None):
         two decomposes the constraint's difficulty into the prompt-drift
         and key-drift components."""
     key_g = key.detach().clone().requires_grad_(True)
-    sim = routing_similarity(feat, key_g)
+    sim = routing_similarity(feat, key_g, key_norm_floor=key_norm_floor)
     log_rn = F.log_softmax(tau * sim, dim=1)
     per_sample = (log_ro.exp() * (log_ro - log_rn)).sum(dim=1)
     if sample_mask is None:
@@ -770,6 +802,14 @@ def main():
                                                    cur_key.to(client.device),
                                                    log_ro, tau,
                                                    sample_mask=sample_prot)
+                # amplified-gradient-robust variant: caps the 1/||k||
+                # amplification of near-collapsed key rows (see
+                # KEY_NORM_FLOOR) — if this lambda differs from the raw
+                # one, the raw pooled gradient (and its lambda) is
+                # dominated by collapsed-row artifacts
+                kl_grad_prot_floor = kl_key_grad(
+                    feat_new, cur_key.to(client.device), log_ro, tau,
+                    sample_mask=sample_prot, key_norm_floor=KEY_NORM_FLOOR)
                 # per-row gradient concentration at this tau (where does
                 # the huge KL gradient actually live?)
                 row_g = kl_key_rowgrad(feat_new,
@@ -809,6 +849,10 @@ def main():
                 lam_grad = (base_grad_norm / kl_grad_prot
                             if np.isfinite(kl_grad_prot) and kl_grad_prot > 0
                             else float('nan'))
+                lam_grad_floor = (
+                    base_grad_norm / kl_grad_prot_floor
+                    if np.isfinite(kl_grad_prot_floor)
+                    and kl_grad_prot_floor > 0 else float('nan'))
                 lam_loss = (task_loss / prot_sample_kl
                             if np.isfinite(prot_sample_kl)
                             and prot_sample_kl > 0 else float('nan'))
@@ -842,11 +886,17 @@ def main():
                     "kl_grad_norm_prot_featold": (
                         f"{kl_grad_prot_oldfeat:.6e}"
                         if np.isfinite(kl_grad_prot_oldfeat) else "nan"),
+                    "kl_grad_norm_prot_floor": (
+                        f"{kl_grad_prot_floor:.6e}"
+                        if np.isfinite(kl_grad_prot_floor) else "nan"),
                     "kl_grad_norm_all": (f"{kl_grad_all:.6e}"
                                          if np.isfinite(kl_grad_all)
                                          else "nan"),
                     "lambda_grad": (f"{lam_grad:.6e}"
                                     if np.isfinite(lam_grad) else "nan"),
+                    "lambda_grad_floor": (f"{lam_grad_floor:.6e}"
+                                          if np.isfinite(lam_grad_floor)
+                                          else "nan"),
                     "lambda_loss": (f"{lam_loss:.6e}"
                                     if np.isfinite(lam_loss) else "nan"),
                     "kl_rowgrad_top10_share": (
@@ -952,11 +1002,15 @@ def main():
         psk = nmean(tau, "protected_sample_kl")
         kl_g = nmean(tau, "kl_grad_norm_prot")
         kl_g_old = nmean(tau, "kl_grad_norm_prot_featold")
+        kl_g_floor = nmean(tau, "kl_grad_norm_prot_floor")
         lam_grad = (base_grad_mean / kl_g
                     if np.isfinite(kl_g) and kl_g > 0 else float('nan'))
         lam_grad_old = (base_grad_mean / kl_g_old
                         if np.isfinite(kl_g_old) and kl_g_old > 0
                         else float('nan'))
+        lam_grad_floor = (base_grad_mean / kl_g_floor
+                          if np.isfinite(kl_g_floor) and kl_g_floor > 0
+                          else float('nan'))
         tau_sweep[tau] = {
             "top1_prob_mean_old": nmean(tau, "top1_prob_mean_old"),
             "top1_prob_old_prot": nmean(tau, "top1_prob_old_prot"),
@@ -975,9 +1029,11 @@ def main():
             "key_only_kl_prot_mean": nmean(tau, "key_only_kl_prot"),
             "kl_grad_norm_prot_mean": kl_g,
             "kl_grad_norm_prot_featold_mean": kl_g_old,
+            "kl_grad_norm_prot_floor_mean": kl_g_floor,
             "kl_grad_norm_all_mean": nmean(tau, "kl_grad_norm_all"),
             "lambda_grad": lam_grad,
             "lambda_grad_featold": lam_grad_old,
+            "lambda_grad_floor": lam_grad_floor,
             "lambda_loss": nmean(tau, "lambda_loss"),
             "kl_rowgrad_top10_share": nmean(tau, "kl_rowgrad_top10_share"),
             "kl_rowgrad_prot_rows_share": nmean(
@@ -1104,9 +1160,12 @@ def main():
             f"finalizing lambda and the loss form")
 
     # key-norm detail aggregates (used by both the JSON dump and console)
-    kn_min_new = float(np.nanmean(
+    # pooled min across clients (nanmean of per-client mins would dilute a
+    # single client's near-zero rows — the exact rows this stat exists to
+    # expose)
+    kn_min_new = float(np.nanmin(
         [c["key_row_norm_new_min"] for c in per_client.values()]))
-    kn_min_old = float(np.nanmean(
+    kn_min_old = float(np.nanmin(
         [c["key_row_norm_old_min"] for c in per_client.values()]))
     kn_prot_m = float(np.nanmean(
         [c["key_row_norm_new_prot_mean"] for c in per_client.values()]))
@@ -1154,6 +1213,8 @@ def main():
                 "kl_grad_norm_prot_mean": rec["kl_grad_norm_prot_mean"],
                 "kl_grad_norm_prot_featold_mean":
                     rec["kl_grad_norm_prot_featold_mean"],
+                "kl_grad_norm_prot_floor_mean":
+                    rec["kl_grad_norm_prot_floor_mean"],
                 "prompt_only_kl_prot_mean":
                     rec["prompt_only_kl_prot_mean"],
                 "key_only_kl_prot_mean": rec["key_only_kl_prot_mean"],
@@ -1161,6 +1222,8 @@ def main():
                 "lambda_loss": rec["lambda_loss"],
                 "lambda_grad": rec["lambda_grad"],
                 "lambda_grad_featold": rec["lambda_grad_featold"],
+                "lambda_grad_floor": rec["lambda_grad_floor"],
+                "key_norm_floor": KEY_NORM_FLOOR,
                 "kl_rowgrad_top10_share": rec["kl_rowgrad_top10_share"],
                 "kl_rowgrad_prot_rows_share":
                     rec["kl_rowgrad_prot_rows_share"],
@@ -1171,9 +1234,9 @@ def main():
                 "old_top1_prob_prot": rec["top1_prob_old_prot"],
                 "key_row_norm_old_mean": kn_old_mean,
                 "key_row_norm_old_p10": kn_old_p10,
-                "key_row_norm_old_min_mean": kn_min_old,
+                "key_row_norm_old_min": kn_min_old,
                 "key_row_norm_new_mean": kn_new_mean,
-                "key_row_norm_new_min_mean": kn_min_new,
+                "key_row_norm_new_min": kn_min_new,
                 "key_row_norm_new_prot_mean": kn_prot_m,
                 "key_row_norm_new_unprot_mean": kn_unprot_m,
                 "n_key_rows_below_1e-6_total": n_floor,
@@ -1268,6 +1331,31 @@ def main():
           f"{rec['lambda_grad_featold']:.2e}"
           if np.isfinite(rec['lambda_grad_featold'])
           else "KL isolation gradient: undefined")
+    print(f"KL gradient collapsed-row-robust variant (key-norm floor "
+          f"{KEY_NORM_FLOOR:g}, caps 1/||k|| amplification; healthy-row "
+          f"sims exactly unchanged): ||grad_K KL_prot||="
+          f"{rec['kl_grad_norm_prot_floor_mean']:.3e} -> lambda_grad_floor ~ "
+          f"{rec['lambda_grad_floor']:.2e}"
+          if np.isfinite(rec['lambda_grad_floor'])
+          else "KL floored gradient: undefined")
+    if (np.isfinite(rec['lambda_grad'])
+            and np.isfinite(rec['lambda_grad_floor'])
+            and rec['lambda_grad_floor'] > 0):
+        fl_ratio = rec['lambda_grad'] / rec['lambda_grad_floor']
+        if fl_ratio < 0.1:
+            fl_note = ("RAW lambda is >10x BELOW the floored one — the raw "
+                       "pooled gradient (and its lambda) is dominated by "
+                       "collapsed-row (1/||k||) artifacts; use "
+                       "lambda_grad_floor as the sweep center")
+        elif fl_ratio > 10:
+            fl_note = ("floored lambda is >10x below the raw one (unexpected "
+                       "— investigate)")
+        else:
+            fl_note = ("raw and floored lambdas agree within one order — "
+                       "the pooled gradient is NOT dominated by "
+                       "collapsed-row artifacts; either lambda is a valid "
+                       "sweep center")
+        print(f"lambda ratio (raw/floored) {fl_ratio:.2f}x: {fl_note}")
     if (np.isfinite(rec['lambda_grad'])
             and np.isfinite(rec['lambda_grad_featold'])
             and rec['lambda_grad_featold'] > 0):
