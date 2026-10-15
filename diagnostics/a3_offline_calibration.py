@@ -150,16 +150,21 @@ TRAIN_BATCH = 16           # official train() DataLoader hardcodes batch_size=16
 PULL_COEF = 0.1            # phase-2 loss: CE + 0.2*G*InfoNCE - 0.1*pull
 WEIGHT_DECAY = 1e-3        # Adam(self.model.parameters(), weight_decay=1e-3)
 
-# key row-norm floor for the amplified-gradient-robust lambda variant:
-# the OFFICIAL normalizer is k/sqrt(max(||k||^2, 1e-12)) = k/max(||k||, 1e-6)
-# — rows above 1e-6 are amplified by 1/||k||, rows below are capped at 1e6
-# (and are no longer unit vectors). Rows in (1e-6, 1e-3) still get 1e3-1e6x
-# amplification, which can dominate the pooled ||grad_K KL|| and make
-# lambda_grad artifact-driven. The floored variant clamps the key
-# normalizer at this tighter floor (sim values of rows above the floor are
-# EXACTLY unchanged — sim depends only on row direction; rows below keep
-# their direction with routing weight shrunk by ||k||/floor and gradient
-# amplification capped at 1/floor).
+# key row-norm floor for the NORMALIZATION-RULE SENSITIVITY variant of the
+# KL key gradient: the OFFICIAL normalizer is
+# k/sqrt(max(||k||^2, 1e-12)) = k/max(||k||, 1e-6) — rows above 1e-6 are
+# amplified by 1/||k||, rows below are capped at 1e6 (and are no longer
+# unit vectors). Rows in (1e-6, 1e-3) still get 1e3-1e6x amplification,
+# which can dominate the pooled ||grad_K KL||. The floored variant clamps
+# the STUDENT-side key normalizer at this tighter floor while the teacher
+# keeps the official rule, so it evaluates a DIFFERENT objective
+# KL(R_old^{1e-6} || R_new^{1e-4}): rows below the floor have their sims
+# shrunk by ||k||/floor, which shifts the whole softmax denominator — a
+# ZERO-drift configuration (identical features and keys) can yield nonzero
+# loss and nonzero key gradient from the normalization mismatch alone.
+# It is kept strictly as a sensitivity experiment on the normalization
+# rule and must NOT be used as a lambda recommendation for the original
+# KL (training it would require an independent variant design).
 KEY_NORM_FLOOR = 1e-4
 
 
@@ -215,8 +220,11 @@ def routing_similarity(feat, key, key_norm_floor=None):
     floor are EXACTLY unchanged (sim depends only on direction); rows
     below the floor keep their direction but have their routing weight
     shrunk by ||k||/floor, and their gradient amplification is capped at
-    1/floor instead of 1/||k||. Used only by the amplified-gradient-robust
-    lambda variant — the default path is the exact official replica."""
+    1/floor instead of 1/||k||. NOTE: shrinking any row's sim shifts the
+    softmax denominator, so the whole student distribution changes — this
+    evaluates a DIFFERENT objective, not a robust estimate of the official
+    one. Used only by the normalization-rule sensitivity variant — the
+    default path is the exact official replica."""
     x_norm = l2_normalize(feat, dim=1)
     key = key.reshape(-1, key.shape[-1])
     if key_norm_floor is None:
@@ -347,9 +355,12 @@ def kl_key_grad(feat, key, log_ro, tau, sample_mask=None,
     sample_mask: optional bool mask over samples — when given, the KL is
     averaged over the masked subset only (matches the sample-masked A3
     loss form on protected samples).
-    key_norm_floor: optional amplified-gradient-robust variant (see
+    key_norm_floor: optional normalization-rule sensitivity variant (see
     routing_similarity) — caps the 1/||k|| gradient amplification of
-    near-collapsed key rows.
+    near-collapsed key rows on the STUDENT side only; the teacher keeps
+    the official rule, so this measures a DIFFERENT objective
+    (KL(R_old^{1e-6} || R_new^{floor})), not a robust substitute for the
+    official KL gradient.
 
     Two semantic variants are measured in main():
       deployment gradient  (feat_new, K_new): A3's actual training-time
@@ -727,7 +738,8 @@ def main():
             kn_new = cur_key.detach().reshape(
                 -1, cur_key.shape[-1]).norm(dim=1).float().cpu()
             prot_row_mask_c = torch.zeros(kn_new.numel(), dtype=torch.bool)
-            prot_row_mask_c[torch.as_tensor(prot_cols)] = True
+            prot_row_mask_c[torch.as_tensor(
+                prot_cols, dtype=torch.long)] = True
             kn_new_prot_mean = (float(kn_new[prot_row_mask_c].mean())
                                 if bool(prot_row_mask_c.any())
                                 else float('nan'))
@@ -804,11 +816,15 @@ def main():
                                                    cur_key.to(client.device),
                                                    log_ro, tau,
                                                    sample_mask=sample_prot)
-                # amplified-gradient-robust variant: caps the 1/||k||
-                # amplification of near-collapsed key rows (see
-                # KEY_NORM_FLOOR) — if this lambda differs from the raw
-                # one, the raw pooled gradient (and its lambda) is
-                # dominated by collapsed-row artifacts
+                # normalization-rule sensitivity variant: the STUDENT-side
+                # key normalizer is clamped at KEY_NORM_FLOOR while the
+                # teacher keeps the official 1e-6 rule — this evaluates
+                # KL(R_old^{1e-6} || R_new^{1e-4}), a DIFFERENT objective
+                # (rows below the floor shift the softmax denominator; a
+                # zero-drift configuration yields nonzero loss/gradient
+                # from the normalization mismatch alone). Recorded for
+                # sensitivity analysis only; its lambda is NOT a robust
+                # substitute for the raw one
                 kl_grad_prot_floor = kl_key_grad(
                     feat_new, cur_key.to(client.device), log_ro, tau,
                     sample_mask=sample_prot, key_norm_floor=KEY_NORM_FLOOR)
@@ -826,12 +842,13 @@ def main():
                                                 dtype=torch.bool,
                                                 device=row_g.device)
                     prot_row_mask[torch.as_tensor(
-                        prot_cols, device=row_g.device)] = True
+                        prot_cols, dtype=torch.long,
+                        device=row_g.device)] = True
                     prot_rows_share = (float(row_g[prot_row_mask].sum())
                                        / rg_total)
-                    # squared-norm shares — the statistic aligned with
-                    # lambda's L2 denominator (one huge row can dominate
-                    # the L2 norm while its L1 mass share looks modest)
+                    # squared-norm shares — the statistic aligned with the
+                    # per-client lambda's L2 denominator (one huge row can
+                    # dominate the L2 norm while its L1 mass share looks modest)
                     rg_sq_total = float((row_g ** 2).sum())
                     top10_sq_share = float(
                         row_g.topk(min(10, row_g.numel()))
@@ -1151,6 +1168,23 @@ def main():
         "treat lambda_grad as the CENTER of the lambda sweep grid (scan at "
         "least +-1 order of magnitude), never as an exact training-scale "
         "equivalence")
+    notes.append(
+        "the floored KL variant (lambda_grad_floor) evaluates a DIFFERENT "
+        "objective, KL(R_old^{1e-6} || R_new^{1e-4}): the teacher keeps "
+        "the official 1e-6 normalizer while the student-side normalizer "
+        "is floored at 1e-4, and rows below the floor shift the softmax "
+        "denominator — a ZERO-drift configuration (identical features and "
+        "keys) yields nonzero loss and key gradient from the "
+        "normalization mismatch alone. It is a normalization-rule "
+        "sensitivity experiment only, NEVER a lambda recommendation for "
+        "the original KL; training it would require an independent "
+        "variant design")
+    notes.append(
+        "pooled row-grad shares (*_pooled) are L1/squared-norm shares of "
+        "the merged per-client row-grad vector — a different aggregation "
+        "than the pooled lambda (a ratio of client-mean gradient norms), "
+        "and not the contribution rate of the federated-average gradient "
+        "either")
     if a2_run_drift_suppressed:
         notes.append(
             f"this is a key-frozen A2 run (arm={a2_arm}): protected key rows "
@@ -1371,31 +1405,15 @@ def main():
           f"{rec['lambda_grad_featold']:.2e}"
           if np.isfinite(rec['lambda_grad_featold'])
           else "KL isolation gradient: undefined")
-    print(f"KL gradient collapsed-row-robust variant (key-norm floor "
-          f"{KEY_NORM_FLOOR:g}, caps 1/||k|| amplification; healthy-row "
-          f"sims exactly unchanged): ||grad_K KL_prot||="
+    print(f"KL gradient normalization-rule sensitivity variant (STUDENT-side "
+          f"key-norm floor {KEY_NORM_FLOOR:g}, teacher keeps the official "
+          f"1e-6 rule — a DIFFERENT objective KL(R_old^1e-6 || R_new^1e-4); "
+          f"sensitivity analysis only, NOT a lambda recommendation for the "
+          f"original KL): ||grad_K KL_prot||="
           f"{rec['kl_grad_norm_prot_floor_mean']:.3e} -> lambda_grad_floor ~ "
           f"{rec['lambda_grad_floor']:.2e}"
           if np.isfinite(rec['lambda_grad_floor'])
           else "KL floored gradient: undefined")
-    if (np.isfinite(rec['lambda_grad'])
-            and np.isfinite(rec['lambda_grad_floor'])
-            and rec['lambda_grad_floor'] > 0):
-        fl_ratio = rec['lambda_grad'] / rec['lambda_grad_floor']
-        if fl_ratio < 0.1:
-            fl_note = ("RAW lambda is >10x BELOW the floored one — the raw "
-                       "pooled gradient (and its lambda) is dominated by "
-                       "collapsed-row (1/||k||) artifacts; use "
-                       "lambda_grad_floor as the sweep center")
-        elif fl_ratio > 10:
-            fl_note = ("floored lambda is >10x below the raw one (unexpected "
-                       "— investigate)")
-        else:
-            fl_note = ("raw and floored lambdas agree within one order — "
-                       "the pooled gradient is NOT dominated by "
-                       "collapsed-row artifacts; either lambda is a valid "
-                       "sweep center")
-        print(f"lambda ratio (raw/floored) {fl_ratio:.2f}x: {fl_note}")
     if (np.isfinite(rec['lambda_grad'])
             and np.isfinite(rec['lambda_grad_featold'])
             and rec['lambda_grad_featold'] > 0):
@@ -1412,14 +1430,18 @@ def main():
     print(f"gradient concentration (protected-sample KL, this tau): "
           f"top-10 key rows carry {rec['kl_rowgrad_top10_share']:.1%} of "
           f"row-grad mass (L1) / {rec['kl_rowgrad_top10_sq_share']:.1%} of "
-          f"squared norm (L2, aligned with lambda's denominator); "
+          f"squared norm (L2, matches each client's own lambda "
+          f"denominator); "
           f"protected rows carry {rec['kl_rowgrad_prot_rows_share']:.1%} "
           f"(L1) / {rec['kl_rowgrad_prot_rows_sq_share']:.1%} (L2)")
-    print(f"  [per-client-share MEANS above; POOLED across clients: "
+    print(f"  [per-client-share MEANS above; POOLED across clients = shares "
+          f"of the merged per-client row-grad vector: "
           f"top-10 {pooled_top10_l1:.1%} (L1) / {pooled_top10_sq:.1%} "
           f"(L2), protected {pooled_prot_l1:.1%} (L1) / "
-          f"{pooled_prot_sq:.1%} (L2) — under client heterogeneity the "
-          f"pooled shares are the ones aligned with the pooled lambda]")
+          f"{pooled_prot_sq:.1%} (L2) — note: the pooled lambda is a ratio "
+          f"of client-mean gradient NORMS, a different aggregation than "
+          f"these shares, and neither equals the contribution rate of the "
+          f"federated-average gradient]")
     if np.isfinite(lam_grad_minmax[0]) and np.isfinite(lam_grad_minmax[1]):
         print(f"  per-client lambda_grad range: "
               f"[{lam_grad_minmax[0]:.2e}, {lam_grad_minmax[1]:.2e}] "
