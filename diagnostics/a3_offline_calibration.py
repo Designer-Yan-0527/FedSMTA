@@ -2,8 +2,8 @@
 
 Pre-training calibration for method A3 (functional-level routing consistency
 loss  L = L_task + lambda * KL(R_old || R_new),  R = softmax(tau * sim(z, K))).
-Pure inference, zero training. Answers the three unknowns before any A3
-training code is written:
+Pure inference + one-step analytic gradients, zero training. Answers the
+three unknowns before any A3 training code is written:
 
   T-a  temperature tau:
        Forward the SAME reference inputs (public surrogate data, deterministic
@@ -15,25 +15,35 @@ training code is written:
        top-1 probability and entropy (nats) of R = softmax(tau * sim).
        Target: the tau window where top-1 probability is ~[0.6, 0.9].
 
-  T-b  KL magnitude (the decisive number):
-       KL(R_old || R_new) per client on the reference inputs, both masked to
-       the protection-set slots (renormalized within the mask) and unmasked
-       (full pool), PLUS a task-loss magnitude reference: one batch of the
-       current (new_ckpt) task's train data forwarded normally under the new
-       interface with the official class mask, cross-entropy mean. The
-       lambda ~ L_task / KL magnitude then reads off directly.
-       Verdict: if the two-generation routing KL is naturally < 0.01, the
-       damage concentrates in hard top-1 flips rather than distribution
-       drift, a KL constraint would be ineffective and A3 should switch to
-       a margin-hinge form. This conclusion is printed and stored.
+  T-b  constraint magnitude (the decisive numbers):
+       PRIMARY per-sample KL on the FULL slot distribution, restricted to
+       samples whose OLD top-1 destination is a protected slot:
+           KL_prot = mean_{i: argmax R_old_i in P} KL(R_old_i || R_new_i).
+       (The within-mask RENORMALIZED KL is also reported as
+       `within_protected_kl`, but only as an auxiliary: renormalization
+       erases exactly the protected->unprotected probability-mass escape
+       that A3 must prevent, so it must NOT decide the loss form.)
+       lambda calibration, loss-ratio AND gradient-ratio:
+         lambda_loss ~ L_task_CE / KL_prot              (coarse reference)
+         lambda_grad ~ ||grad_K L_base|| / ||grad_K KL||  (PRIMARY)
+       The gradient ratio is primary because in the official phase-2 loss
+       (CE + 0.2*G*InfoNCE - 0.1*pull, Adam wd=1e-3) the key receives NO
+       continuous gradient from CE or InfoNCE (both reach the key only
+       through the discrete topk index); the key's only continuous training
+       signal is -0.1*pull + weight decay. The KL term therefore competes
+       with || -0.1*grad_K pull + wd*K ||, not with the CE scalar.
+       Both gradient norms are measured analytically (autograd w.r.t. the
+       key only; features are constants w.r.t. the key).
 
   T-c  protection-set mask separation:
        top-1 flip rate (old-vs-new argmax disagreement, conditioned on the
-       OLD interface's top-1 destination being a protected slot) and mean
-       per-column JS distance (column j: the distribution over reference
-       samples routed to slot j, old vs new; JS = sqrt(JSD)), computed
-       separately for protected and unprotected slots. Verifies the mask
-       design premise "drift concentrates where the constraint is needed".
+       OLD interface's top-1 destination being a protected slot), stratified
+       by the OLD routing margin (top1-top2 similarity, similarity space):
+       flips at small margins are near-ties (KL can still act on them, and a
+       margin hinge targets them directly); flips at large margins are real
+       topology drift. Plus mean per-column JS distance (column j: the
+       distribution over reference samples routed to slot j, old vs new),
+       computed separately for protected and unprotected slots.
 
 Interface definitions (aligned with compatibility_drift.py's 4-combo):
   old = (old prompt, old key, old anchor)          from --old_ckpt
@@ -42,16 +52,29 @@ Routing similarity depends only on the key and the features (the anchor is
 selected AFTER routing), so anchors never enter the routing math; the new
 anchor/head only matter for the task-loss forward.
 
+Checkpoint pairs:
+  lambda / loss-form decisions should use ADJACENT pairs
+  (task_03_end -> task_04_end, one task of drift): A3 snapshots R_old at
+  every task start, so the single-task drift window is the deployment
+  condition, and at new_ckpt the KL is at its deployment-relevant maximum.
+  Multi-task spans (task_02_end -> task_04_end, task_00_end -> task_04_end)
+  are still useful as ACCUMULATED-DRIFT diagnosis, but their KL is not the
+  number lambda should balance.
+
 Protection set: ALWAYS replicated from the A2 mechanism at the A3 snapshot
 moment (= the start of the task FOLLOWING old_ckpt): top-1 routing of ALL
 completed tasks' (0..old_task INCLUSIVE) train-split features under the OLD
-key, union of hit slots (sequential loader, shuffle=False, num_workers=0,
-eval mode — RNG-neutral, mirrors Client_DF._a2_init_task_protection with
-self.task_id = old_task + 1, whose `completed` is exactly range(old_task+1)
-and whose "current key at task start" is exactly the old_ckpt key).
-The a2_state stored in old_ckpt is deliberately NOT used: it was computed at
-the START of old_ckpt's own task (tasks 0..old_task-1, older key) — one task
-stale relative to the A3 snapshot moment. Its presence is only recorded.
+key, union of hit slots. Mirrors Client_DF._a2_init_task_protection exactly
+at that moment: its `completed` is range(task_id) = range(old_task+1), its
+"current key at task start" is exactly the old_ckpt key, its ViT task_id is
+the FOLLOWING task (old_task + 1), and its loader batch size is the
+hardcoded official 16 (A2_PROTECTION_BATCH below; batchwise prompt voting
+makes features batch-composition dependent, so replication must not vary
+it). RNG-neutral: sequential loader, shuffle=False, num_workers=0, eval
+mode. The a2_state stored in old_ckpt is deliberately NOT used: it was
+computed at the START of old_ckpt's own task (tasks 0..old_task-1, older
+key) — one task stale relative to the A3 snapshot moment. Its presence is
+only recorded.
 
 RNG discipline (same as compatibility_drift.py): the whole diagnostic runs
 under an RNG snapshot that is restored at the end; both interface passes are
@@ -62,18 +85,19 @@ into the shared vit after every old-interface pass.
 
 Outputs:
   CSV  (default <run_dir>/metrics/a3_calibration.csv): one row per
-       (client x tau): top1/entropy stats (per interface + pooled),
-       masked_kl, full_kl, protected/unprotected flip rates and JS.
+       (client x tau): top1/entropy stats, the three KL flavors, gradient
+       norms + both lambda ratios, flip rates (overall + margin-stratified),
+       old protected-sample margins, per-column JS.
   JSON (same directory, .csv suffix -> .json): metadata, tau sweep summary,
-       task-loss reference, and the three verdicts.
+       task-loss reference, gradient calibration, and the three verdicts.
   Console: per-client lines + the three-part verdict summary.
 
-Usage (repo root, on the server):
+Usage (repo root, on the server; ADJACENT pair for lambda decisions):
   python diagnostics/a3_offline_calibration.py \
-      --run_dir output/cifar100/fedta_a2/a2_key/seed_42 \
-      --old_ckpt checkpoints/task_02_end.pth \
+      --run_dir output/ImageNet-R/fedta/inr_base_p40/seed_42 \
+      --old_ckpt checkpoints/task_03_end.pth \
       --new_ckpt checkpoints/task_04_end.pth \
-      --n_ref 64
+      --n_ref 256
 """
 
 import argparse
@@ -94,12 +118,21 @@ from runtime_utils import (load_checkpoint_file, clone_prompt_template,
 # fixed per-(client, task) seeding convention (compatibility_drift.py)
 SEED_BASE = 9700
 
-# KL below this magnitude is judged "naturally negligible" for A3 (T-b)
-KL_EFFECTIVE_FLOOR = 0.01
+# soft reference threshold only: a KL below it does NOT by itself decide
+# "KL ineffective" — the verdict jointly considers flip rate, routing
+# margins, and the analytic KL gradient norm (see make_kl_verdict)
+KL_SOFT_FLOOR = 0.01
 
 # T-a target window for softmax top-1 probability
 TOP1_WINDOW = (0.6, 0.9)
 TOP1_TARGET = 0.75
+
+# exact official constants (do NOT expose as CLI flags: changing them would
+# break the "exact replica" claim of this diagnostic)
+A2_PROTECTION_BATCH = 16   # Client_DF._a2_init_task_protection hardcodes 16
+TRAIN_BATCH = 16           # official train() DataLoader hardcodes batch_size=16
+PULL_COEF = 0.1            # phase-2 loss: CE + 0.2*G*InfoNCE - 0.1*pull
+WEIGHT_DECAY = 1e-3        # Adam(self.model.parameters(), weight_decay=1e-3)
 
 
 def parse_args():
@@ -116,7 +149,10 @@ def parse_args():
                         "in old_ckpt)")
     p.add_argument("--n_ref", type=int, default=256,
                    help="reference inputs per client (public surrogate data)")
-    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--ref_batch_size", type=int, default=16,
+                   help="batch size for the two reference-input interface "
+                        "passes (identical composition in both passes, so "
+                        "batchwise prompt voting cancels)")
     p.add_argument("--temps", default="1,2,5,10,20,50",
                    help="comma-separated tau sweep for R = softmax(tau*sim)")
     p.add_argument("--device", default="cuda")
@@ -151,24 +187,30 @@ def routing_similarity(feat, key):
     return torch.matmul(x_norm, key_norm.t())
 
 
-def interface_features(client, prompt_module, ref_x, task_id, batch_size):
-    """Features of the fixed reference tensor under one interface.
-    The shared vit gets the interface's prompts loaded (caller restores the
-    current ones afterwards). Eval mode is assumed (set once in main).
-    Mirrors evaluate()/_a2_init_task_protection: vit forward with the
-    checkpoint-time convention task_id=<current task>, train=True
-    (use_prompt_mask=False in this codebase, so the flag is inert)."""
-    client.vit.load_prompts(prompt_module)
+def forward_features(client, x, task_id, batch_size):
+    """No-grad features of a fixed input tensor under whatever prompts are
+    currently loaded in the shared vit. Eval mode is assumed (set once in
+    main). Mirrors evaluate()/_a2_init_task_protection: vit forward with
+    task_id=<current task>, train=True (use_prompt_mask=False in this
+    codebase, so the flag is inert)."""
     feats = []
-    for i in range(0, ref_x.shape[0], batch_size):
-        x = ref_x[i:i + batch_size].to(client.device, non_blocking=True)
+    for i in range(0, x.shape[0], batch_size):
+        xb = x[i:i + batch_size].to(client.device, non_blocking=True)
         with torch.no_grad():
-            output = client.original_model(x)
+            output = client.original_model(xb)
             cls_features = output['pre_logits']
-            output = client.vit(x, task_id=task_id,
+            output = client.vit(xb, task_id=task_id,
                                 cls_features=cls_features, train=True)
         feats.append(output['feat'].to(client.device))
     return torch.cat(feats, dim=0)
+
+
+def interface_features(client, prompt_module, ref_x, task_id, batch_size):
+    """Features of the fixed reference tensor under one interface.
+    The shared vit gets the interface's prompts loaded (the new-interface
+    pass that follows reloads the current ones)."""
+    client.vit.load_prompts(prompt_module)
+    return forward_features(client, ref_x, task_id, batch_size)
 
 
 def get_train_split(client, task_k):
@@ -181,29 +223,30 @@ def get_train_split(client, task_k):
     raise KeyError(f"data_split_indices missing task {task_k}")
 
 
-def replicate_protection(client, old_prompt_module, old_key, old_task,
-                         batch_size):
-    """A2 protection-set replication at the old-checkpoint time point:
-    union over completed tasks 0..old_task of the top-1 routing destinations
-    of their train-split features under the OLD key (i.e. exactly what
+def replicate_protection(client, old_prompt_module, old_key, old_task):
+    """A2 protection-set replication at the A3 snapshot moment: union over
+    completed tasks 0..old_task of the top-1 routing destinations of their
+    train-split features under the OLD key — exactly what
     Client_DF._a2_init_task_protection computes when the task FOLLOWING
-    old_ckpt starts, which is the moment A3 would snapshot R_old).
-    RNG-neutral like the A2 mechanism: sequential loader, shuffle=False,
-    num_workers=0, eval mode."""
+    old_ckpt starts (its completed range is range(old_task+1), its ViT
+    task_id is old_task+1, its key is the task-start key = the old_ckpt
+    key, its loader batch size is the hardcoded 16). RNG-neutral: sequential
+    loader, shuffle=False, num_workers=0, eval mode."""
     key = old_key.to(client.device)
+    snapshot_task = old_task + 1          # the task A3 would start training
     client.vit.load_prompts(old_prompt_module)
     hit_slots = []
     for t in range(0, old_task + 1):
         dataset = Subset(client.train_data[t], get_train_split(client, t))
-        loader = DataLoader(dataset, batch_size=batch_size, num_workers=0,
-                            shuffle=False)
+        loader = DataLoader(dataset, batch_size=A2_PROTECTION_BATCH,
+                            num_workers=0, shuffle=False)
         feats = []
         for input, _target in loader:
             input = input.to(client.device, non_blocking=True)
             with torch.no_grad():
                 output = client.original_model(input)
                 cls_features = output['pre_logits']
-                output = client.vit(input, task_id=old_task,
+                output = client.vit(input, task_id=snapshot_task,
                                     cls_features=cls_features, train=True)
             feats.append(output['feat'].to(client.device))
         if not feats:
@@ -217,47 +260,88 @@ def replicate_protection(client, old_prompt_module, old_key, old_task,
     return torch.unique(torch.cat(hit_slots))
 
 
-def task_loss_reference(client, gen, batch_size, nb_classes):
-    """One deterministic batch of the current task's train data, forwarded
-    normally under the NEW interface; official train() cross-entropy
-    (Tail_Anchor anchor-top-1 + current head, classes outside current_class
-    masked to -inf over the first nb_classes logits — exact train() replica;
-    the pull/InfoNCE terms are excluded on purpose: only the CE magnitude
-    reference is wanted)."""
+def deterministic_train_batch(client, gen):
+    """One deterministic batch (TRAIN_BATCH, official train() size) of the
+    current task's train data, as (x, y) tensors on CPU."""
     n = len(client.traindata)
-    take = min(batch_size, n)
+    take = min(TRAIN_BATCH, n)
     idx = torch.randperm(n, generator=gen)[:take].tolist()
     xs, ys = [], []
     for i in idx:
         x, y = client.traindata[i]
         xs.append(x)
         ys.append(int(y))
-    x = torch.stack(xs).to(client.device, non_blocking=True)
-    target = torch.tensor(ys, dtype=torch.long).to(client.device)
+    return torch.stack(xs), torch.tensor(ys, dtype=torch.long)
 
+
+def task_loss_ce(client, feat_cur, target, nb_classes):
+    """Official train() phase-2 cross-entropy on precomputed features:
+    Tail_Anchor anchor-top-1 + current head, classes outside current_class
+    masked to -inf over the first nb_classes logits (exact train() replica;
+    pull/InfoNCE terms are handled separately by the gradient calibration)."""
     with torch.no_grad():
-        output = client.original_model(x)
-        cls_features = output['pre_logits']
-        output = client.vit(x, task_id=client.task_id,
-                            cls_features=cls_features, train=True)
-        feat = output['feat'].to(client.device)
-        # Tail_Anchor.forward replica (without its hardcoded .to('cuda'))
-        similarity = routing_similarity(feat, client.model.key.detach())
+        similarity = routing_similarity(feat_cur, client.model.key.detach())
         _, index = torch.topk(similarity, k=1)
-        anchor = client.model.anchor_pool[index].reshape(-1, feat.shape[1])
-        x1 = torch.stack((feat, anchor), dim=1).reshape(-1, feat.shape[1] * 2)
+        anchor = client.model.anchor_pool[index].reshape(
+            -1, feat_cur.shape[1])
+        x1 = torch.stack((feat_cur, anchor), dim=1).reshape(
+            -1, feat_cur.shape[1] * 2)
         logits = client.model.head(x1)
-        # official class mask (train(): only the first nb_classes logits are
-        # masked; head outputs beyond nb_classes are part of official CE)
         not_mask = np.setdiff1d(np.arange(nb_classes), client.current_class)
         not_mask = torch.tensor(not_mask, dtype=torch.int64).to(client.device)
         logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
         return float(F.cross_entropy(logits, target))
 
 
-def masked_kl(log_rold, log_rnew, cols):
-    """Per-sample KL(R_old || R_new) restricted to the protection-set columns,
-    both distributions renormalized within the mask. Returns scalar mean."""
+def kl_key_grad(feat, key, log_ro, tau, sample_mask=None):
+    """||grad_K KL(R_old || R_new)|| on reference features, analytic
+    (autograd w.r.t. the key only; features are constants w.r.t. the key).
+    log_ro: detached OLD-interface log-routing (the fixed target).
+    sample_mask: optional bool mask over samples — when given, the KL is
+    averaged over the masked subset only (matches the sample-masked A3
+    loss form on protected samples)."""
+    key_g = key.detach().clone().requires_grad_(True)
+    sim = routing_similarity(feat, key_g)
+    log_rn = F.log_softmax(tau * sim, dim=1)
+    per_sample = (log_ro.exp() * (log_ro - log_rn)).sum(dim=1)
+    if sample_mask is None:
+        kl = per_sample.mean()
+    else:
+        if bool(sample_mask.any()):
+            kl = per_sample[sample_mask].mean()
+        else:
+            return float('nan')
+    g, = torch.autograd.grad(kl, key_g)
+    return float(g.norm())
+
+
+def pull_key_grad(feat, key):
+    """grad_K of the official pull term (reduce_sim), exact replica of
+    Tail_Anchor.forward's pull computation on `feat` under `key`:
+    reduce_sim = sum(l2norm(key)[top1] * l2norm(feat)) / key_size.
+    Returns the gradient tensor (caller combines it with weight decay).
+    This is the ONLY continuous channel through which the official phase-2
+    loss trains the key — CE and InfoNCE reach the key only via the
+    discrete topk index, which passes no gradient."""
+    key_g = key.detach().clone().requires_grad_(True)
+    key_norm = l2_normalize(key_g.reshape(-1, key_g.shape[-1]), dim=1)
+    x_norm = l2_normalize(feat, dim=1)
+    sim = torch.matmul(x_norm, key_norm.t())
+    _, index = torch.topk(sim, k=1)
+    batched_key_norm = key_norm[index]           # B, top_k, C
+    x_embed_norm = x_norm.unsqueeze(1)           # B, 1, C
+    reduce_sim = torch.sum(batched_key_norm * x_embed_norm) / key_g.shape[-1]
+    g, = torch.autograd.grad(reduce_sim, key_g)
+    return g
+
+
+def within_masked_kl(log_rold, log_rnew, cols):
+    """AUXILIARY metric (do NOT use for loss-form decisions): per-sample
+    KL(R_old || R_new) restricted to the protection-set columns, both
+    distributions RENORMALIZED within the mask. Renormalization erases the
+    protected->unprotected mass escape, so this number can be ~0 while
+    routing is catastrophically broken; it only measures redistribution
+    AMONG protected slots."""
     lo = log_rold[:, cols] - torch.logsumexp(log_rold[:, cols], dim=1,
                                              keepdim=True)
     ln = log_rnew[:, cols] - torch.logsumexp(log_rnew[:, cols], dim=1,
@@ -289,6 +373,72 @@ def column_js_distance(R_old, R_new, eps=1e-12):
         jsd = 0.5 * kl_terms(pp) + 0.5 * kl_terms(qq)
         out[j] = torch.sqrt(torch.clamp(jsd, min=0.0))
     return out
+
+
+def make_kl_verdict(psk, kl_grad, base_grad, lam_grad,
+                    flip_small, flip_large):
+    """Joint verdict: a small KL alone does NOT decide "KL ineffective" —
+    near-tie flips (small old margin) produce tiny KL while still being
+    fixable by a large lambda (the KL gradient is exactly what grows with
+    tau and lambda), and a winner-preserving margin hinge targets them
+    directly. The verdict therefore reports the structure instead of a
+    binary flag."""
+    if not np.isfinite(psk):
+        return ("INDETERMINATE: no protected samples (empty protection "
+                "set or no protected top-1 destinations)", None)
+    parts = []
+    if psk >= KL_SOFT_FLOOR:
+        parts.append(
+            f"protected-sample full KL = {psk:.4f} >= {KL_SOFT_FLOOR}: "
+            f"measurable distribution drift on the samples A3 must protect "
+            f"-> the KL constraint has signal to act on")
+        effective = True
+    else:
+        if np.isfinite(flip_small) and np.isfinite(flip_large):
+            if flip_small >= flip_large:
+                parts.append(
+                    f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} "
+                    f"AND flips concentrate at SMALL old margins "
+                    f"(small-margin flip {flip_small:.3f} >= large-margin "
+                    f"{flip_large:.3f}): near-tie top-1 flips, not large-"
+                    f"scale topology drift. KL is small but NOT necessarily "
+                    f"ineffective — larger tau/lambda can still restore the "
+                    f"margin; a winner-preserving margin hinge (see below) "
+                    f"targets this regime directly")
+            else:
+                parts.append(
+                    f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} "
+                    f"AND flips occur mainly at LARGE old margins "
+                    f"(large-margin flip {flip_large:.3f} > small-margin "
+                    f"{flip_small:.3f}): sharp, near-one-hot routing "
+                    f"distributions; a soft-KL term has little to grip — "
+                    f"prefer the margin-hinge form")
+        else:
+            parts.append(
+                f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} "
+                f"(margin stratification unavailable: too few protected "
+                f"samples)")
+        effective = None  # small KL: form decision deferred to the numbers
+    if np.isfinite(kl_grad) and kl_grad > 0 and np.isfinite(base_grad):
+        parts.append(
+            f"gradient calibration at the recommended tau: "
+            f"||grad_K L_base|| = {base_grad:.3e} vs "
+            f"||grad_K KL_prot|| = {kl_grad:.3e} -> "
+            f"lambda_grad ~ {lam_grad:.1f}; start the lambda sweep at this "
+            f"order of magnitude (loss-ratio lambda is only a coarse "
+            f"reference: CE passes no continuous gradient to the key)")
+    else:
+        parts.append(
+            "gradient calibration unavailable (KL gradient ~ 0 at the "
+            "recommended tau): the soft-KL term would have no lever on the "
+            "key — use the margin-hinge form")
+    parts.append(
+        "margin-hinge reference form (winner-preserving, NOT similarity "
+        "regression): L_margin = max(0, m - s_new(x, k_old*) + "
+        "max_{j != old*} s_new(x, k_j)) with old* = argmax_j s_old(x, k_j) "
+        "— the slot the OLD interface chose must stay ahead of every "
+        "competitor by at least m under the NEW interface")
+    return ("; ".join(parts), effective)
 
 
 def main():
@@ -370,16 +520,17 @@ def main():
             cur_key = client.model.key.detach().clone()
             pool_size = cur_key.shape[0]
 
-            # ---- protection set: ALWAYS replicate at the A3 snapshot moment.
-            # a2_state in old_ckpt is one task STALE (computed at the start
-            # of old_ckpt's own task); only its presence is recorded.
+            # ---- protection set: ALWAYS replicate at the A3 snapshot moment
+            # (a2_state in old_ckpt is one task STALE — computed at the start
+            # of old_ckpt's own task; only its presence is recorded)
             a2 = old_state.get("a2_state")
             torch.manual_seed(SEED_BASE + 100 * cid + old_task)
             slots = replicate_protection(client, old_prompt, old_key,
-                                          old_task, args.batch_size)
+                                          old_task)
             prot_cols = sorted(int(s) for s in slots.tolist())
             prot_src = (f"replicated A2 mechanism (old key over train "
-                        f"splits of tasks 0..{old_task})")
+                        f"splits of tasks 0..{old_task}, ViT task_id="
+                        f"{old_task + 1}, batch={A2_PROTECTION_BATCH})")
             prot_set = set(prot_cols)
             unprot_cols = [j for j in range(pool_size) if j not in prot_set]
 
@@ -393,27 +544,38 @@ def main():
             # ---- old interface pass ----
             torch.manual_seed(SEED_BASE + 100 * cid + new_task)
             feat_old = interface_features(client, old_prompt, ref_x, new_task,
-                                          args.batch_size)
+                                          args.ref_batch_size)
             sim_old = routing_similarity(feat_old, old_key.to(client.device))
 
             # ---- new interface pass (current prompts restored first) ----
             torch.manual_seed(SEED_BASE + 100 * cid + new_task)
             feat_new = interface_features(client, cur_prompt, ref_x, new_task,
-                                          args.batch_size)
+                                          args.ref_batch_size)
             sim_new = routing_similarity(feat_new, cur_key.to(client.device))
 
-            # ---- task-loss magnitude reference (new interface) ----
+            # ---- current-task batch: CE magnitude + pull gradient (new
+            # interface; features are constants w.r.t. the key) ----
             gen2 = torch.Generator()
             gen2.manual_seed(SEED_BASE + 100 * cid + new_task + 1)
-            task_loss = task_loss_reference(client, gen2, args.batch_size,
-                                            nb_classes)
+            batch_x, batch_y = deterministic_train_batch(client, gen2)
+            batch_y = batch_y.to(client.device)
+            feat_cur = forward_features(client, batch_x, new_task,
+                                        args.ref_batch_size)
+            task_loss = task_loss_ce(client, feat_cur, batch_y, nb_classes)
+            g_pull = pull_key_grad(feat_cur, cur_key.to(client.device))
+            # official instantaneous base gradient on the key:
+            # d/dK [ -0.1 * pull + wd * K ]  (Adam L2 adds wd*K to the grad)
+            g_base = (-PULL_COEF * g_pull
+                      + WEIGHT_DECAY * cur_key.reshape(-1, cur_key.shape[-1]))
+            base_grad_norm = float(g_base.norm())
+            pull_grad_norm = float(g_pull.norm())
 
-            # ---- T-c flip rates (tau-independent: argmax is tau-invariant) -
+            # ---- T-c flip rates + old routing margins (tau-independent) --
             argm_old = sim_old.argmax(dim=1)
             argm_new = sim_new.argmax(dim=1)
             flip = argm_old != argm_new
             prot_col_mask = torch.zeros(pool_size, dtype=torch.bool,
-                                       device=sim_old.device)
+                                        device=sim_old.device)
             if prot_cols:
                 prot_col_mask[torch.tensor(prot_cols, dtype=torch.long,
                                            device=sim_old.device)] = True
@@ -422,6 +584,24 @@ def main():
                          if bool(sample_prot.any()) else float('nan'))
             unprot_flip = (float(flip[~sample_prot].float().mean())
                            if bool((~sample_prot).any()) else float('nan'))
+
+            # old routing margin (top1 - top2 similarity, similarity space)
+            top2 = torch.topk(sim_old, k=2).values
+            margin_old = top2[:, 0] - top2[:, 1]
+            prot_margins = margin_old[sample_prot]
+            if int(sample_prot.sum()) >= 2:
+                m_mean = float(prot_margins.mean())
+                m_med = float(prot_margins.median())
+                m_p10 = float(torch.quantile(prot_margins, 0.1))
+                small = prot_margins < m_med
+                flips_p = flip[sample_prot]
+                flip_small = (float(flips_p[small].float().mean())
+                              if bool(small.any()) else float('nan'))
+                flip_large = (float(flips_p[~small].float().mean())
+                              if bool((~small).any()) else float('nan'))
+            else:
+                m_mean = m_med = m_p10 = float('nan')
+                flip_small = flip_large = float('nan')
 
             # ---- T-a / T-b per tau ----
             for tau in temps:
@@ -432,15 +612,38 @@ def main():
                 top1_n = float(rn.max(dim=1).values.mean())
                 h_o = float((-(ro * log_ro).sum(dim=1)).mean())
                 h_n = float((-(rn * log_rn).sum(dim=1)).mean())
-                full_kl = float(((ro * (log_ro - log_rn)).sum(dim=1)).mean())
+                # PRIMARY KL: full distribution, protected SAMPLES only
+                per_kl = (ro * (log_ro - log_rn)).sum(dim=1)
+                prot_sample_kl = (float(per_kl[sample_prot].mean())
+                                  if bool(sample_prot.any())
+                                  else float('nan'))
+                unprot_sample_kl = (float(per_kl[~sample_prot].mean())
+                                    if bool((~sample_prot).any())
+                                    else float('nan'))
+                full_kl = float(per_kl.mean())
+                # AUXILIARY: within-mask renormalized KL
                 if prot_cols:
-                    m_kl = masked_kl(log_ro, log_rn, prot_cols)
+                    w_kl = within_masked_kl(log_ro, log_rn, prot_cols)
                     js_cols = column_js_distance(ro, rn)
                     p_js = float(js_cols[prot_cols].mean())
                 else:
-                    m_kl, p_js = float('nan'), float('nan')
+                    w_kl, p_js = float('nan'), float('nan')
                 u_js = (float(column_js_distance(ro, rn)[unprot_cols].mean())
                         if unprot_cols else float('nan'))
+                # analytic key gradients at this tau
+                kl_grad_prot = kl_key_grad(feat_new,
+                                           cur_key.to(client.device),
+                                           log_ro, tau,
+                                           sample_mask=sample_prot)
+                kl_grad_all = kl_key_grad(feat_new,
+                                          cur_key.to(client.device),
+                                          log_ro, tau)
+                lam_grad = (base_grad_norm / kl_grad_prot
+                            if np.isfinite(kl_grad_prot) and kl_grad_prot > 0
+                            else float('nan'))
+                lam_loss = (task_loss / prot_sample_kl
+                            if np.isfinite(prot_sample_kl)
+                            and prot_sample_kl > 0 else float('nan'))
                 rows.append({
                     "client_id": cid,
                     "old_task": old_task,
@@ -452,10 +655,29 @@ def main():
                     "entropy_mean_old": f"{h_o:.6f}",
                     "entropy_mean_new": f"{h_n:.6f}",
                     "entropy_mean": f"{(h_o + h_n) / 2:.6f}",
-                    "masked_kl": f"{m_kl:.6f}",
+                    "protected_sample_kl": f"{prot_sample_kl:.6f}",
+                    "unprotected_sample_kl": f"{unprot_sample_kl:.6f}",
+                    "within_protected_kl": f"{w_kl:.6f}",
                     "full_kl": f"{full_kl:.6f}",
+                    "base_grad_norm": f"{base_grad_norm:.6e}",
+                    "pull_grad_norm": f"{pull_grad_norm:.6e}",
+                    "kl_grad_norm_prot": (f"{kl_grad_prot:.6e}"
+                                          if np.isfinite(kl_grad_prot)
+                                          else "nan"),
+                    "kl_grad_norm_all": (f"{kl_grad_all:.6e}"
+                                         if np.isfinite(kl_grad_all)
+                                         else "nan"),
+                    "lambda_grad": (f"{lam_grad:.4f}"
+                                    if np.isfinite(lam_grad) else "nan"),
+                    "lambda_loss": (f"{lam_loss:.4f}"
+                                    if np.isfinite(lam_loss) else "nan"),
                     "protected_flip_rate": f"{prot_flip:.4f}",
                     "unprotected_flip_rate": f"{unprot_flip:.4f}",
+                    "flip_rate_small_margin": f"{flip_small:.4f}",
+                    "flip_rate_large_margin": f"{flip_large:.4f}",
+                    "old_margin_mean_prot": f"{m_mean:.6f}",
+                    "old_margin_median_prot": f"{m_med:.6f}",
+                    "old_margin_p10_prot": f"{m_p10:.6f}",
                     "protected_js": f"{p_js:.6f}",
                     "unprotected_js": f"{u_js:.6f}",
                     "n_ref": n_actual,
@@ -472,13 +694,22 @@ def main():
                 "n_protected_slots": len(prot_cols),
                 "n_unprotected_slots": len(unprot_cols),
                 "task_loss": task_loss,
+                "base_grad_norm": base_grad_norm,
+                "pull_grad_norm": pull_grad_norm,
                 "protected_flip_rate": prot_flip,
                 "unprotected_flip_rate": unprot_flip,
+                "flip_rate_small_margin": flip_small,
+                "flip_rate_large_margin": flip_large,
+                "old_margin_mean_prot": m_mean,
+                "old_margin_median_prot": m_med,
+                "old_margin_p10_prot": m_p10,
             }
             print(f"client {cid}: old_task={old_task} new_task={new_task} "
-                  f"protected={len(prot_cols)}/{pool_size} [{prot_src}] "
+                  f"protected={len(prot_cols)}/{pool_size} "
                   f"task_loss={task_loss:.4f} "
-                  f"flip prot={prot_flip:.3f} unprot={unprot_flip:.3f}",
+                  f"flip prot={prot_flip:.3f} unprot={unprot_flip:.3f} "
+                  f"(small-m {flip_small:.3f} / large-m {flip_large:.3f}) "
+                  f"base||gK||={base_grad_norm:.2e}",
                   flush=True)
     finally:
         server.model.train(vit_was_training)
@@ -508,11 +739,14 @@ def main():
 
     task_losses = [c["task_loss"] for c in per_client.values()]
     task_loss_mean = float(np.mean(task_losses))
+    base_grad_mean = float(np.mean(
+        [c["base_grad_norm"] for c in per_client.values()]))
     tau_sweep = {}
     for tau in temps:
-        m_kl = nmean(tau, "masked_kl")
-        lam = (task_loss_mean / m_kl
-               if np.isfinite(m_kl) and m_kl > 0 else float('nan'))
+        psk = nmean(tau, "protected_sample_kl")
+        kl_g = nmean(tau, "kl_grad_norm_prot")
+        lam_grad = (base_grad_mean / kl_g
+                    if np.isfinite(kl_g) and kl_g > 0 else float('nan'))
         tau_sweep[tau] = {
             "top1_prob_mean_old": nmean(tau, "top1_prob_mean_old"),
             "top1_prob_mean_new": nmean(tau, "top1_prob_mean_new"),
@@ -520,9 +754,14 @@ def main():
             "entropy_mean_old": nmean(tau, "entropy_mean_old"),
             "entropy_mean_new": nmean(tau, "entropy_mean_new"),
             "entropy_mean": nmean(tau, "entropy_mean"),
-            "masked_kl_mean": m_kl,
+            "protected_sample_kl_mean": psk,
+            "unprotected_sample_kl_mean": nmean(tau, "unprotected_sample_kl"),
+            "within_protected_kl_mean": nmean(tau, "within_protected_kl"),
             "full_kl_mean": nmean(tau, "full_kl"),
-            "lambda_magnitude": lam,
+            "kl_grad_norm_prot_mean": kl_g,
+            "kl_grad_norm_all_mean": nmean(tau, "kl_grad_norm_all"),
+            "lambda_grad": lam_grad,
+            "lambda_loss": nmean(tau, "lambda_loss"),
         }
 
     # ---------------- verdicts ----------------
@@ -533,30 +772,15 @@ def main():
     rec_tau = min(pool_taus, key=lambda t: abs(
         tau_sweep[t]["top1_prob_mean"] - TOP1_TARGET))
     rec = tau_sweep[rec_tau]
-    lam_rec = rec["lambda_magnitude"]
-
-    if np.isfinite(rec["masked_kl_mean"]) and \
-            rec["masked_kl_mean"] < KL_EFFECTIVE_FLOOR:
-        kl_verdict = (
-            f"masked KL = {rec['masked_kl_mean']:.4f} < {KL_EFFECTIVE_FLOOR}: "
-            f"two-generation routing distributions are naturally near-"
-            f"identical on protected slots; damage concentrates in hard "
-            f"top-1 flips, NOT distribution drift -> the KL constraint "
-            f"would be INEFFECTIVE; A3 should use a margin-hinge form "
-            f"(penalize |tau*(sim_old - sim_new)| on protected slots) "
-            f"instead of softmax-KL")
-        kl_effective = False
-    else:
-        kl_verdict = (
-            f"masked KL = {rec['masked_kl_mean']:.4f} >= "
-            f"{KL_EFFECTIVE_FLOOR}: measurable distribution drift on "
-            f"protected slots -> the KL constraint has signal to act on")
-        kl_effective = True
 
     p_flip = float(np.nanmean(
         [c["protected_flip_rate"] for c in per_client.values()]))
     u_flip = float(np.nanmean(
         [c["unprotected_flip_rate"] for c in per_client.values()]))
+    flip_small = float(np.nanmean(
+        [c["flip_rate_small_margin"] for c in per_client.values()]))
+    flip_large = float(np.nanmean(
+        [c["flip_rate_large_margin"] for c in per_client.values()]))
     p_js = nmean(rec_tau, "protected_js")
     u_js = nmean(rec_tau, "unprotected_js")
     flip_ratio = (p_flip / u_flip
@@ -575,13 +799,20 @@ def main():
     else:
         sep_verdict = "INDETERMINATE: empty protected or unprotected group"
 
+    kl_verdict, kl_effective = make_kl_verdict(
+        psk=rec["protected_sample_kl_mean"],
+        kl_grad=rec["kl_grad_norm_prot_mean"],
+        base_grad=base_grad_mean,
+        lam_grad=rec["lambda_grad"],
+        flip_small=flip_small, flip_large=flip_large)
+
     method = getattr(run_args, "method", None)
     a2_arm = getattr(run_args, "a2_arm", None)
     notes = [
-        f"key pool has {rows[0]['n_protected_slots'] + rows[0]['n_unprotected_slots']} "
-        f"slots (Tail_Anchor(10,768,200)) vs nb_classes={nb_classes}; slots "
-        f">= {nb_classes} are never-trained noise slots, kept in the pool "
-        f"because Tail_Anchor.forward routes over all of them",
+        "Tail_Anchor's key/anchor pool (200 rows) is a ROUTING pool, not a "
+        "class-indexed prototype list: the official forward routes over "
+        "ALL 200 slots regardless of nb_classes, any slot can receive mass "
+        "and be optimized, so the diagnostic keeps the full pool",
         "routing similarity is taken BEFORE anchor selection; the anchor "
         "component of the interface never enters the routing math",
         "flip rates are conditioned on the OLD interface's top-1 slot "
@@ -594,17 +825,28 @@ def main():
         "composition in both interface passes (batchwise prompt voting "
         "cancels)",
         "protection set is ALWAYS replicated at the A3 snapshot moment "
-        "(tasks 0..old_task top-1 under the old key); the a2_state stored "
-        "in old_ckpt is one task stale (computed at the START of old_ckpt's "
-        "own task) and is recorded but never used",
+        "(tasks 0..old_task top-1 under the old key, ViT task_id=old_task+1, "
+        "batch=16 hardcoded as in the official A2); the a2_state stored in "
+        "old_ckpt is one task stale and is recorded but never used",
+        "MECHANISTIC NOTE: in the official phase-2 loss the key's ONLY "
+        "continuous gradient channel is -0.1*pull + Adam weight decay — CE "
+        "and InfoNCE reach the key only through the discrete topk index. "
+        "lambda_grad (base/key-gradient norm vs KL/key-gradient norm) is "
+        "therefore the primary lambda estimate; lambda_loss (CE/KL) is a "
+        "coarse reference only",
+        "lambda decisions should use ADJACENT checkpoint pairs (one task of "
+        "drift, e.g. task_03_end -> task_04_end): A3 snapshots R_old at "
+        "every task start. Multi-task spans remain useful as "
+        "accumulated-drift diagnosis",
     ]
     if method == 'fedta_a2' and a2_arm in ('key', 'both'):
         notes.append(
             f"this is a key-frozen A2 run (arm={a2_arm}): protected key rows "
             f"are restored after every optimizer step, so routing drift on "
-            f"protected slots (masked KL, protected flip rate) is SUPPRESSED "
-            f"relative to a pure fedta baseline — KL is UNDERESTIMATED here; "
-            f"re-run on a pure fedta run before finalizing lambda")
+            f"protected slots (protected-sample KL, protected flip rate) is "
+            f"SUPPRESSED relative to a pure fedta baseline — all drift "
+            f"numbers are UNDERESTIMATED here; re-run on a pure fedta run "
+            f"before finalizing lambda and the loss form")
 
     # ---------------- persist JSON ----------------
     out_json = out_csv.with_suffix(".json")
@@ -615,11 +857,13 @@ def main():
         "old_ckpt": old_path, "new_ckpt": new_path,
         "old_task": sorted({c["old_task"] for c in per_client.values()}),
         "new_task": sorted({c["new_task"] for c in per_client.values()}),
-        "seed": seed, "n_ref": n_ref, "batch_size": args.batch_size,
-        "temps": temps, "device": args.device,
+        "seed": seed, "n_ref": n_ref,
+        "ref_batch_size": args.ref_batch_size, "temps": temps,
+        "device": args.device,
         "surrogate_pool_size": n_pool,
         "clients": {str(k): v for k, v in per_client.items()},
         "task_loss_mean": task_loss_mean,
+        "base_grad_norm_mean": base_grad_mean,
         "tau_sweep": {str(t): tau_sweep[t] for t in temps},
         "tau_window_top1_0.6_0.9": tau_window,
         "recommended_tau": rec_tau,
@@ -632,10 +876,16 @@ def main():
                              "recommended = closest to 0.75",
             },
             "kl_lambda": {
-                "masked_kl_mean": rec["masked_kl_mean"],
+                "protected_sample_kl_mean": rec["protected_sample_kl_mean"],
+                "within_protected_kl_mean": rec["within_protected_kl_mean"],
                 "full_kl_mean": rec["full_kl_mean"],
                 "task_loss_mean": task_loss_mean,
-                "lambda_magnitude": lam_rec,
+                "base_grad_norm_mean": base_grad_mean,
+                "pull_grad_norm_mean": float(np.mean(
+                    [c["pull_grad_norm"] for c in per_client.values()])),
+                "kl_grad_norm_prot_mean": rec["kl_grad_norm_prot_mean"],
+                "lambda_loss": rec["lambda_loss"],
+                "lambda_grad": rec["lambda_grad"],
                 "effective": kl_effective,
                 "verdict": kl_verdict,
             },
@@ -643,6 +893,14 @@ def main():
                 "protected_flip_rate_mean": p_flip,
                 "unprotected_flip_rate_mean": u_flip,
                 "flip_ratio": flip_ratio,
+                "flip_rate_small_margin_mean": flip_small,
+                "flip_rate_large_margin_mean": flip_large,
+                "old_margin_mean_prot": float(np.nanmean(
+                    [c["old_margin_mean_prot"]
+                     for c in per_client.values()])),
+                "old_margin_p10_prot": float(np.nanmean(
+                    [c["old_margin_p10_prot"]
+                     for c in per_client.values()])),
                 "protected_js_mean": p_js,
                 "unprotected_js_mean": u_js,
                 "holds": separation_holds,
@@ -665,31 +923,42 @@ def main():
               f"(old {s['top1_prob_mean_old']:.4f} / "
               f"new {s['top1_prob_mean_new']:.4f})  "
               f"entropy={s['entropy_mean']:.3f}  "
-              f"masked_kl={s['masked_kl_mean']:.4f}")
+              f"prot_sample_kl={s['protected_sample_kl_mean']:.4f}  "
+              f"kl||gradK||={s['kl_grad_norm_prot_mean']:.2e}")
     print(f"tau window with top1 in [{TOP1_WINDOW[0]}, {TOP1_WINDOW[1]}]: "
           f"{tau_window}  -> recommended tau={rec_tau:g} "
           f"(top1={rec['top1_prob_mean']:.4f})")
 
-    print(f"\n===== T-b: KL magnitude & lambda (at tau={rec_tau:g}) =====")
-    per_client_kl = col(rec_tau, "masked_kl")
-    print(f"masked KL(R_old||R_new) mean={rec['masked_kl_mean']:.4f}  "
-          f"per client: {['%.4f' % v for v in per_client_kl]}")
-    print(f"full   KL mean={rec['full_kl_mean']:.4f}")
-    print(f"task-loss CE mean={task_loss_mean:.4f} "
-          f"(per client: {['%.4f' % c['task_loss'] for c in per_client.values()]})")
-    print(f"lambda ~ L_task/KL = {lam_rec:.2f} "
-          f"(order 10^{int(np.log10(lam_rec))})" if np.isfinite(lam_rec) and lam_rec > 0
-          else "lambda ~ L_task/KL: undefined (masked KL ~ 0)")
+    print(f"\n===== T-b: KL flavors, gradients & lambda (at tau={rec_tau:g}) "
+          f"=====")
+    print(f"protected-sample full KL (PRIMARY) mean="
+          f"{rec['protected_sample_kl_mean']:.4f}  per client: "
+          f"{['%.4f' % v for v in col(rec_tau, 'protected_sample_kl')]}")
+    print(f"within-mask renormalized KL (auxiliary) mean="
+          f"{rec['within_protected_kl_mean']:.4f}")
+    print(f"full-pool KL mean={rec['full_kl_mean']:.4f}")
+    print(f"task CE mean={task_loss_mean:.4f} -> lambda_loss "
+          f"(coarse) ~ {rec['lambda_loss']:.2f}")
+    print(f"base key-gradient ||-0.1*grad pull + wd*K|| mean="
+          f"{base_grad_mean:.3e}  vs  ||grad_K KL_prot|| mean="
+          f"{rec['kl_grad_norm_prot_mean']:.3e}")
+    print(f"lambda_grad (PRIMARY) ~ {rec['lambda_grad']:.2f}"
+          if np.isfinite(rec['lambda_grad'])
+          else "lambda_grad: undefined (KL key-gradient ~ 0)")
     print(f"verdict: {kl_verdict}")
 
     print(f"\n===== T-c: protection-mask separation (at tau={rec_tau:g}) =====")
     print(f"top-1 flip rate: protected={p_flip:.3f}  "
           f"unprotected={u_flip:.3f}  ratio={flip_ratio:.2f}x")
+    print(f"flip stratification by old margin (protected samples): "
+          f"small-margin={flip_small:.3f}  large-margin={flip_large:.3f}  "
+          f"(margin mean={float(np.nanmean([c['old_margin_mean_prot'] for c in per_client.values()])):.4f}, "
+          f"p10={float(np.nanmean([c['old_margin_p10_prot'] for c in per_client.values()])):.4f})")
     print(f"per-column JS distance: protected={p_js:.4f}  "
           f"unprotected={u_js:.4f}")
     print(f"verdict: {sep_verdict}")
     for note in notes:
-        if note.startswith(("this is a key-frozen",)):
+        if note.startswith(("this is a key-frozen", "MECHANISTIC")):
             print(f"note: {note}")
 
 
