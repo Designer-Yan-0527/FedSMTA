@@ -131,9 +131,10 @@
 
 <h2>九、接口遗忘分解（Interface Forgetting，新指标）</h2>
 <div class="card">
-<p style="font-size:14px">把每个旧任务的标准遗忘 F<sub>i</sub> = A<sub>i,i</sub> − A<sub>i</sub><sup>cur</sup> 分解为两部分：<b>接口可恢复遗忘</b> F<sup>int</sup> = A<sup>hist</sup> − A<sup>cur</sup>（换回历史兼容接口即可恢复），<b>残余遗忘</b> F<sup>res</sup> = A<sub>i,i</sub> − A<sup>hist</sup>（知识本体真实损失）。A<sup>hist</sup> 取自 A1 快照评估（seed 42）。</p>
+<p style="font-size:14px">统一定义（p<sub>i</sub> = A<sub>i,i</sub> 刚学完精度，b<sub>i</sub> = 基线终态精度，r<sub>i</sub> = A1 换回历史接口后的精度）：F<sub>i</sub> = (r<sub>i</sub> − b<sub>i</sub>) + (p<sub>i</sub> − r<sub>i</sub>)。前项为 <b>A1 干预下可恢复的遗忘份额</b>（interface-recoverable under A1），后项为<b>残余遗忘</b>（知识本体真实损失）。r<sub>i</sub> 取自 A1 快照评估（seed 42）。</p>
+<p class="note" style="margin-top:2px">归因边界：A1 换回的是 key+anchor <b>整体接口世代</b>，故该份额只证明"接口级可恢复"，不单独指认 key——"key 为主通道"的因果结论由 A2 四臂干预（§三）独立确立，两项证据互补而非互相推出。</p>
 <table>
-<tr><th>任务</th><th>A_i,i 刚学完</th><th>A_cur 当前接口</th><th>A_hist 历史接口</th><th>F_total</th><th>F_interface（占比）</th><th>F_residual</th></tr>
+<tr><th>任务</th><th>A_i,i 刚学完</th><th>A_cur 当前接口</th><th>A_hist 历史接口</th><th>F_total</th><th>F^A1 可恢复（占比）</th><th>F_residual</th></tr>
 <tr><td>task 0</td><td>94.25</td><td>85.66</td><td>93.05</td><td>8.59</td><td>7.39（86%）</td><td>1.20</td></tr>
 <tr><td>task 1</td><td>96.27</td><td>71.10</td><td>93.85</td><td>25.17</td><td>22.75（90%）</td><td>2.42</td></tr>
 <tr><td>task 2</td><td>91.67</td><td>71.45</td><td>84.83</td><td>20.22</td><td>13.38（66%）</td><td class="bad">6.84</td></tr>

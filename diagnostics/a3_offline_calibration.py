@@ -37,18 +37,29 @@ three unknowns before any A3 training code is written:
        the KL gradient are reported: DEPLOYMENT (feat_new: current drifted
        prompts — the lambda-relevant one, what A3's training actually sees)
        and ISOLATION (feat_old: prompts held at the old generation —
-       comparing them decomposes the constraint difficulty into the
-       prompt-drift vs key-drift components).
+       comparing the two LAMBDAS only says whether the deployment lever is
+       weaker, it does NOT attribute drift). Factor attribution is carried
+       by a single-factor drift decomposition instead: key-only KL
+       (features at the old generation, drifted key) vs prompt-only KL
+       (drifted features, key at the old generation) — non-additive, but
+       each term isolates one factor of the interface. lambda_grad is the
+       CENTER of a sweep grid (scan at least +-1 order of magnitude), not
+       an exact training-scale equivalence: Adam rescales per-parameter
+       update magnitudes, so gradient-norm balance is a first-order
+       estimate only.
 
   T-c  protection-set mask separation:
        top-1 flip rate (old-vs-new argmax disagreement, conditioned on the
        OLD interface's top-1 destination being a protected slot), stratified
-       by the OLD routing margin (top1-top2 similarity, similarity space):
-       flips at small margins are near-ties (KL can still act on them, and a
-       margin hinge targets them directly); flips at large margins are real
-       topology drift. Plus mean per-column JS distance (column j: the
-       distribution over reference samples routed to slot j, old vs new),
-       computed separately for protected and unprotected slots.
+       by the OLD routing margin (top1-top2 similarity, similarity space)
+       — reported as STRUCTURE only. Note the two spaces are different: a
+       large sim-space margin can coexist with a soft softmax distribution
+       at small tau, so the margin is never used to infer softmax
+       sharpness; sharpness evidence is the measured top-1 probability of
+       the old routing distribution (T-a). Plus mean per-column JS distance
+       (column j: the distribution over reference samples routed to slot j,
+       old vs new), computed separately for protected and unprotected
+       slots.
 
 Interface definitions (aligned with compatibility_drift.py's 4-combo):
   old = (old prompt, old key, old anchor)          from --old_ckpt
@@ -404,62 +415,61 @@ def column_js_distance(R_old, R_new, eps=1e-12):
     return out
 
 
-def make_kl_verdict(psk, kl_grad, base_grad, lam_grad,
-                    flip_small, flip_large):
-    """Joint verdict: a small KL alone does NOT decide "KL ineffective" —
-    near-tie flips (small old margin) produce tiny KL while still being
-    fixable by a large lambda (the KL gradient is exactly what grows with
-    tau and lambda), and a winner-preserving margin hinge targets them
-    directly. The verdict therefore reports the structure instead of a
-    binary flag."""
+def make_kl_verdict(psk, old_top1, kl_grad, base_grad, lam_grad, prot_flip):
+    """DESCRIPTIVE joint verdict — no auto-selection of the loss form.
+
+    A small protected-sample KL alone decides nothing:
+      (a) top-1 flips can be CHEAP in probability space when the old
+          routing distribution is soft — the sharpness evidence is the
+          MEASURED old top-1 probability, never the sim-space top1-top2
+          margin (a large sim margin can coexist with a soft softmax at
+          small tau; they live in different spaces);
+      (b) a weak constraint lever shows up as a small analytic KL key
+          gradient, which a larger lambda/tau can compensate.
+    The verdict therefore reports the measured structure and names the
+    viable constraint forms instead of auto-selecting one."""
     if not np.isfinite(psk):
         return ("INDETERMINATE: no protected samples (empty protection "
                 "set or no protected top-1 destinations)", None)
     parts = []
+    soft = old_top1 < 0.8   # measured softmax sharpness at rec tau
     if psk >= KL_SOFT_FLOOR:
         parts.append(
             f"protected-sample full KL = {psk:.4f} >= {KL_SOFT_FLOOR}: "
             f"measurable distribution drift on the samples A3 must protect "
-            f"-> the KL constraint has signal to act on")
+            f"-> the soft-KL constraint has signal to act on")
         effective = True
+    elif soft:
+        parts.append(
+            f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} with a "
+            f"SOFT old routing distribution (measured old top-1 prob = "
+            f"{old_top1:.3f}, protected flip rate {prot_flip:.3f}): top-1 "
+            f"flips are cheap in probability space, so a small KL does NOT "
+            f"mean no damage — it means a soft-KL term must be driven "
+            f"harder (larger tau/lambda; check lambda_grad below), while a "
+            f"winner-preserving margin hinge would enforce the top-1 "
+            f"directly in similarity space, immune to softmax softness")
+        effective = None
     else:
-        if np.isfinite(flip_small) and np.isfinite(flip_large):
-            if flip_small >= flip_large:
-                parts.append(
-                    f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} "
-                    f"AND flips concentrate at SMALL old margins "
-                    f"(small-margin flip {flip_small:.3f} >= large-margin "
-                    f"{flip_large:.3f}): near-tie top-1 flips, not large-"
-                    f"scale topology drift. KL is small but NOT necessarily "
-                    f"ineffective — larger tau/lambda can still restore the "
-                    f"margin; a winner-preserving margin hinge (see below) "
-                    f"targets this regime directly")
-            else:
-                parts.append(
-                    f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} "
-                    f"AND flips occur mainly at LARGE old margins "
-                    f"(large-margin flip {flip_large:.3f} > small-margin "
-                    f"{flip_small:.3f}): sharp, near-one-hot routing "
-                    f"distributions; a soft-KL term has little to grip — "
-                    f"prefer the margin-hinge form")
-        else:
-            parts.append(
-                f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} "
-                f"(margin stratification unavailable: too few protected "
-                f"samples)")
-        effective = None  # small KL: form decision deferred to the numbers
+        parts.append(
+            f"protected-sample full KL = {psk:.4f} < {KL_SOFT_FLOOR} with a "
+            f"SHARP old routing distribution (measured old top-1 prob = "
+            f"{old_top1:.3f}, protected flip rate {prot_flip:.3f}): little "
+            f"distributional difference for a soft KL to grip — the "
+            f"margin-hinge form targets this regime directly")
+        effective = None
     if np.isfinite(kl_grad) and kl_grad > 0 and np.isfinite(base_grad):
         parts.append(
-            f"gradient calibration at the recommended tau: "
-            f"||grad_K L_base|| = {base_grad:.3e} vs "
-            f"||grad_K KL_prot|| = {kl_grad:.3e} -> "
-            f"lambda_grad ~ {lam_grad:.1f}; start the lambda sweep at this "
-            f"order of magnitude (loss-ratio lambda is only a coarse "
-            f"reference: CE passes no continuous gradient to the key)")
+            f"gradient calibration: ||grad_K L_base|| = {base_grad:.3e} vs "
+            f"||grad_K KL_prot|| = {kl_grad:.3e} -> lambda_grad ~ "
+            f"{lam_grad:.1f} as the SWEEP CENTER, not an exact equivalence "
+            f"(Adam rescales per-parameter updates; scan at least +-1 order "
+            f"of magnitude around it; the CE scalar passes no continuous "
+            f"gradient to the key)")
     else:
         parts.append(
-            "gradient calibration unavailable (KL gradient ~ 0 at the "
-            "recommended tau): the soft-KL term would have no lever on the "
+            "gradient calibration unavailable (KL key-gradient ~ 0 at the "
+            "recommended tau): a soft-KL term would have no lever on the "
             "key — use the margin-hinge form")
     parts.append(
         "margin-hinge reference form (winner-preserving, NOT similarity "
@@ -484,6 +494,19 @@ def main():
         args.run_dir, checkpoint=new_path,
         data_path=args.data_path, device=args.device)
     nb_classes = run_args.nb_classes
+    method = getattr(run_args, "method", None)
+    a2_arm = getattr(run_args, "a2_arm", None)
+    a2_run_drift_suppressed = (method == 'fedta_a2'
+                               and a2_arm in ('key', 'both'))
+    if a2_run_drift_suppressed:
+        print("!" * 78)
+        print(f"[A2-RUN WARNING] this run is method fedta_a2 (arm={a2_arm}):")
+        print("protected key rows are FROZEN during training, so ALL drift")
+        print("numbers (protected-sample KL, flip rates) are SUPPRESSED and")
+        print("the recommended lambda is NOT deployment-valid — rerun this")
+        print("calibration on a pure fedta baseline run before deciding")
+        print("the A3 loss form or lambda")
+        print("!" * 78)
 
     old_ckpt = load_checkpoint_file(old_path)
 
@@ -650,6 +673,26 @@ def main():
                                     if bool((~sample_prot).any())
                                     else float('nan'))
                 full_kl = float(per_kl.mean())
+                # single-factor drift decomposition (non-additive, but each
+                # term isolates one drifted factor of the interface):
+                # prompt-only = features at new generation, key held old;
+                # key-only    = features at old generation, drifted key
+                sim_po = routing_similarity(feat_new,
+                                            old_key.to(client.device))
+                per_po = (ro * (log_ro - F.log_softmax(
+                    tau * sim_po, dim=1))).sum(dim=1)
+                sim_ko = routing_similarity(feat_old,
+                                            cur_key.to(client.device))
+                per_ko = (ro * (log_ro - F.log_softmax(
+                    tau * sim_ko, dim=1))).sum(dim=1)
+                prompt_only_kl = float(per_po.mean())
+                key_only_kl = float(per_ko.mean())
+                prompt_only_kl_prot = (float(per_po[sample_prot].mean())
+                                       if bool(sample_prot.any())
+                                       else float('nan'))
+                key_only_kl_prot = (float(per_ko[sample_prot].mean())
+                                    if bool(sample_prot.any())
+                                    else float('nan'))
                 # AUXILIARY: within-mask renormalized KL
                 if prot_cols:
                     w_kl = within_masked_kl(log_ro, log_rn, prot_cols)
@@ -694,6 +737,10 @@ def main():
                     "unprotected_sample_kl": f"{unprot_sample_kl:.6f}",
                     "within_protected_kl": f"{w_kl:.6f}",
                     "full_kl": f"{full_kl:.6f}",
+                    "prompt_only_kl": f"{prompt_only_kl:.6f}",
+                    "prompt_only_kl_prot": f"{prompt_only_kl_prot:.6f}",
+                    "key_only_kl": f"{key_only_kl:.6f}",
+                    "key_only_kl_prot": f"{key_only_kl_prot:.6f}",
                     "base_grad_norm": f"{base_grad_norm:.6e}",
                     "pull_grad_norm": f"{pull_grad_norm:.6e}",
                     "kl_grad_norm_prot": (f"{kl_grad_prot:.6e}"
@@ -800,6 +847,10 @@ def main():
             "unprotected_sample_kl_mean": nmean(tau, "unprotected_sample_kl"),
             "within_protected_kl_mean": nmean(tau, "within_protected_kl"),
             "full_kl_mean": nmean(tau, "full_kl"),
+            "prompt_only_kl_mean": nmean(tau, "prompt_only_kl"),
+            "prompt_only_kl_prot_mean": nmean(tau, "prompt_only_kl_prot"),
+            "key_only_kl_mean": nmean(tau, "key_only_kl"),
+            "key_only_kl_prot_mean": nmean(tau, "key_only_kl_prot"),
             "kl_grad_norm_prot_mean": kl_g,
             "kl_grad_norm_prot_featold_mean": kl_g_old,
             "kl_grad_norm_all_mean": nmean(tau, "kl_grad_norm_all"),
@@ -845,13 +896,12 @@ def main():
 
     kl_verdict, kl_effective = make_kl_verdict(
         psk=rec["protected_sample_kl_mean"],
+        old_top1=rec["top1_prob_mean_old"],
         kl_grad=rec["kl_grad_norm_prot_mean"],
         base_grad=base_grad_mean,
         lam_grad=rec["lambda_grad"],
-        flip_small=flip_small, flip_large=flip_large)
+        prot_flip=p_flip)
 
-    method = getattr(run_args, "method", None)
-    a2_arm = getattr(run_args, "a2_arm", None)
     notes = [
         "Tail_Anchor's key/anchor pool (200 rows) is a ROUTING pool, not a "
         "class-indexed prototype list: the official forward routes over "
@@ -883,14 +933,21 @@ def main():
         "every task start. Multi-task spans remain useful as "
         "accumulated-drift diagnosis",
     ]
-    if method == 'fedta_a2' and a2_arm in ('key', 'both'):
+    notes.append(
+        "lambda_grad balances gradient norms at one point (the new_ckpt "
+        "interface); Adam normalizes per-parameter update magnitudes, so "
+        "treat lambda_grad as the CENTER of the lambda sweep grid (scan at "
+        "least +-1 order of magnitude), never as an exact training-scale "
+        "equivalence")
+    if a2_run_drift_suppressed:
         notes.append(
             f"this is a key-frozen A2 run (arm={a2_arm}): protected key rows "
             f"are restored after every optimizer step, so routing drift on "
             f"protected slots (protected-sample KL, protected flip rate) is "
             f"SUPPRESSED relative to a pure fedta baseline — all drift "
-            f"numbers are UNDERESTIMATED here; re-run on a pure fedta run "
-            f"before finalizing lambda and the loss form")
+            f"numbers are UNDERESTIMATED here and the recommended lambda "
+            f"is NOT deployment-valid; re-run on a pure fedta run before "
+            f"finalizing lambda and the loss form")
 
     # ---------------- persist JSON ----------------
     out_json = out_csv.with_suffix(".json")
@@ -898,6 +955,7 @@ def main():
         "script": "diagnostics/a3_offline_calibration.py",
         "run_dir": str(Path(args.run_dir)),
         "method": method, "a2_arm": a2_arm,
+        "a2_run_drift_suppressed": a2_run_drift_suppressed,
         "old_ckpt": old_path, "new_ckpt": new_path,
         "old_task": sorted({c["old_task"] for c in per_client.values()}),
         "new_task": sorted({c["new_task"] for c in per_client.values()}),
@@ -930,9 +988,14 @@ def main():
                 "kl_grad_norm_prot_mean": rec["kl_grad_norm_prot_mean"],
                 "kl_grad_norm_prot_featold_mean":
                     rec["kl_grad_norm_prot_featold_mean"],
+                "prompt_only_kl_prot_mean":
+                    rec["prompt_only_kl_prot_mean"],
+                "key_only_kl_prot_mean": rec["key_only_kl_prot_mean"],
+                "old_top1_prob_mean": rec["top1_prob_mean_old"],
                 "lambda_loss": rec["lambda_loss"],
                 "lambda_grad": rec["lambda_grad"],
                 "lambda_grad_featold": rec["lambda_grad_featold"],
+                "deployment_valid": not a2_run_drift_suppressed,
                 "effective": kl_effective,
                 "verdict": kl_verdict,
             },
@@ -978,19 +1041,26 @@ def main():
 
     print(f"\n===== T-b: KL flavors, gradients & lambda (at tau={rec_tau:g}) "
           f"=====")
+    if a2_run_drift_suppressed:
+        print("[A2-RUN: key frozen — drift numbers suppressed, recommended "
+              "lambda NOT deployment-valid; rerun on a pure fedta baseline]")
     print(f"protected-sample full KL (PRIMARY) mean="
           f"{rec['protected_sample_kl_mean']:.4f}  per client: "
           f"{['%.4f' % v for v in col(rec_tau, 'protected_sample_kl')]}")
     print(f"within-mask renormalized KL (auxiliary) mean="
           f"{rec['within_protected_kl_mean']:.4f}")
     print(f"full-pool KL mean={rec['full_kl_mean']:.4f}")
+    print(f"drift decomposition, protected samples (single-factor terms, "
+          f"non-additive): key-only KL={rec['key_only_kl_prot_mean']:.4f}  "
+          f"prompt-only KL={rec['prompt_only_kl_prot_mean']:.4f}  "
+          f"total={rec['protected_sample_kl_mean']:.4f}")
     print(f"task CE mean={task_loss_mean:.4f} -> lambda_loss "
           f"(coarse) ~ {rec['lambda_loss']:.2f}")
     print(f"base key-gradient ||-0.1*grad pull + wd*K|| mean="
           f"{base_grad_mean:.3e}  vs  ||grad_K KL_prot|| mean="
           f"{rec['kl_grad_norm_prot_mean']:.3e}")
     print(f"lambda_grad (PRIMARY, deployment feat_new) ~ "
-          f"{rec['lambda_grad']:.2f}"
+          f"{rec['lambda_grad']:.2f}  [sweep center, scan +-1 order]"
           if np.isfinite(rec['lambda_grad'])
           else "lambda_grad: undefined (KL key-gradient ~ 0)")
     print(f"KL gradient isolation variant (feat_old, prompts undrifted): "
@@ -1002,15 +1072,13 @@ def main():
     if (np.isfinite(rec['lambda_grad'])
             and np.isfinite(rec['lambda_grad_featold'])
             and rec['lambda_grad_featold'] > 0):
-        ratio = rec['lambda_grad'] / rec['lambda_grad_featold']
-        if ratio > 1.5:
-            label = "prompt drift dominates the constraint difficulty"
-        elif ratio < 0.67:
-            label = "key drift dominates (key repair is the main lever)"
-        else:
-            label = "mixed prompt+key drift"
-        print(f"deployment/isolation gradient ratio {ratio:.2f}x "
-              f"({label})")
+        lam_ratio = rec['lambda_grad'] / rec['lambda_grad_featold']
+        print(f"lambda ratio (deployment/isolation) {lam_ratio:.2f}x: the "
+              f"deployment constraint's lever on the key is "
+              f"{'weaker' if lam_ratio > 1 else 'no weaker'} than under "
+              f"undrifted prompts — use the LARGER lambda as the sweep "
+              f"center. Factor attribution is carried by the drift "
+              f"decomposition above, not by this ratio")
     print(f"verdict: {kl_verdict}")
 
     print(f"\n===== T-c: protection-mask separation (at tau={rec_tau:g}) =====")
