@@ -33,7 +33,12 @@ three unknowns before any A3 training code is written:
        signal is -0.1*pull + weight decay. The KL term therefore competes
        with || -0.1*grad_K pull + wd*K ||, not with the CE scalar.
        Both gradient norms are measured analytically (autograd w.r.t. the
-       key only; features are constants w.r.t. the key).
+       key only; features are constants w.r.t. the key). Two variants of
+       the KL gradient are reported: DEPLOYMENT (feat_new: current drifted
+       prompts — the lambda-relevant one, what A3's training actually sees)
+       and ISOLATION (feat_old: prompts held at the old generation —
+       comparing them decomposes the constraint difficulty into the
+       prompt-drift vs key-drift components).
 
   T-c  protection-set mask separation:
        top-1 flip rate (old-vs-new argmax disagreement, conditioned on the
@@ -299,7 +304,16 @@ def kl_key_grad(feat, key, log_ro, tau, sample_mask=None):
     log_ro: detached OLD-interface log-routing (the fixed target).
     sample_mask: optional bool mask over samples — when given, the KL is
     averaged over the masked subset only (matches the sample-masked A3
-    loss form on protected samples)."""
+    loss form on protected samples).
+
+    Two semantic variants are measured in main():
+      deployment gradient  (feat_new, K_new): A3's actual training-time
+        lever — with the CURRENT (drifted) prompts fixed, how much key
+        gradient the constraint produces (this is the lambda-relevant one);
+      isolation gradient   (feat_old, K_new): if prompts had NOT drifted,
+        how much key gradient pure key-repair would need — comparing the
+        two decomposes the constraint's difficulty into the prompt-drift
+        and key-drift components."""
     key_g = key.detach().clone().requires_grad_(True)
     sim = routing_similarity(feat, key_g)
     log_rn = F.log_softmax(tau * sim, dim=1)
@@ -307,18 +321,32 @@ def kl_key_grad(feat, key, log_ro, tau, sample_mask=None):
     if sample_mask is None:
         kl = per_sample.mean()
     else:
-        if bool(sample_mask.any()):
-            kl = per_sample[sample_mask].mean()
-        else:
+        if not bool(sample_mask.any()):
+            del key_g, sim, log_rn, per_sample
             return float('nan')
+        kl = per_sample[sample_mask].mean()
     g, = torch.autograd.grad(kl, key_g)
-    return float(g.norm())
+    out = float(g.norm())
+    del key_g, sim, log_rn, per_sample, kl, g
+    return out
 
 
 def pull_key_grad(feat, key):
     """grad_K of the official pull term (reduce_sim), exact replica of
     Tail_Anchor.forward's pull computation on `feat` under `key`:
     reduce_sim = sum(l2norm(key)[top1] * l2norm(feat)) / key_size.
+
+    Scale VERIFIED against Models/Tail_Anchor.py (L61-64): the official
+    reduce_sim = torch.sum(sim) / self.key_size is a SUM over
+    B * top_k * C elements divided by the feature dim (768) — NOT a batch
+    mean — so this gradient scales linearly with the batch size, exactly
+    as in official training (train() hardcodes batch_size=16 = TRAIN_BATCH,
+    which is what this replica is called with; the gradient-norm ratio is
+    therefore at deployment scale, no B-fold bias). The integer-index
+    gather key_norm[index] is differentiable w.r.t. the selected rows
+    (PyTorch gather semantics; `index` itself needs no grad) and is the
+    same operation the official forward performs.
+
     Returns the gradient tensor (caller combines it with weight decay).
     This is the ONLY continuous channel through which the official phase-2
     loss trains the key — CE and InfoNCE reach the key only via the
@@ -332,6 +360,7 @@ def pull_key_grad(feat, key):
     x_embed_norm = x_norm.unsqueeze(1)           # B, 1, C
     reduce_sim = torch.sum(batched_key_norm * x_embed_norm) / key_g.shape[-1]
     g, = torch.autograd.grad(reduce_sim, key_g)
+    del key_g, key_norm, sim, index, batched_key_norm, x_embed_norm, reduce_sim
     return g
 
 
@@ -638,6 +667,12 @@ def main():
                 kl_grad_all = kl_key_grad(feat_new,
                                           cur_key.to(client.device),
                                           log_ro, tau)
+                # isolation variant: features held at the OLD generation
+                # (prompts undrifted) — pure key-repair gradient
+                kl_grad_prot_oldfeat = kl_key_grad(feat_old,
+                                                   cur_key.to(client.device),
+                                                   log_ro, tau,
+                                                   sample_mask=sample_prot)
                 lam_grad = (base_grad_norm / kl_grad_prot
                             if np.isfinite(kl_grad_prot) and kl_grad_prot > 0
                             else float('nan'))
@@ -664,6 +699,9 @@ def main():
                     "kl_grad_norm_prot": (f"{kl_grad_prot:.6e}"
                                           if np.isfinite(kl_grad_prot)
                                           else "nan"),
+                    "kl_grad_norm_prot_featold": (
+                        f"{kl_grad_prot_oldfeat:.6e}"
+                        if np.isfinite(kl_grad_prot_oldfeat) else "nan"),
                     "kl_grad_norm_all": (f"{kl_grad_all:.6e}"
                                          if np.isfinite(kl_grad_all)
                                          else "nan"),
@@ -745,8 +783,12 @@ def main():
     for tau in temps:
         psk = nmean(tau, "protected_sample_kl")
         kl_g = nmean(tau, "kl_grad_norm_prot")
+        kl_g_old = nmean(tau, "kl_grad_norm_prot_featold")
         lam_grad = (base_grad_mean / kl_g
                     if np.isfinite(kl_g) and kl_g > 0 else float('nan'))
+        lam_grad_old = (base_grad_mean / kl_g_old
+                        if np.isfinite(kl_g_old) and kl_g_old > 0
+                        else float('nan'))
         tau_sweep[tau] = {
             "top1_prob_mean_old": nmean(tau, "top1_prob_mean_old"),
             "top1_prob_mean_new": nmean(tau, "top1_prob_mean_new"),
@@ -759,8 +801,10 @@ def main():
             "within_protected_kl_mean": nmean(tau, "within_protected_kl"),
             "full_kl_mean": nmean(tau, "full_kl"),
             "kl_grad_norm_prot_mean": kl_g,
+            "kl_grad_norm_prot_featold_mean": kl_g_old,
             "kl_grad_norm_all_mean": nmean(tau, "kl_grad_norm_all"),
             "lambda_grad": lam_grad,
+            "lambda_grad_featold": lam_grad_old,
             "lambda_loss": nmean(tau, "lambda_loss"),
         }
 
@@ -884,8 +928,11 @@ def main():
                 "pull_grad_norm_mean": float(np.mean(
                     [c["pull_grad_norm"] for c in per_client.values()])),
                 "kl_grad_norm_prot_mean": rec["kl_grad_norm_prot_mean"],
+                "kl_grad_norm_prot_featold_mean":
+                    rec["kl_grad_norm_prot_featold_mean"],
                 "lambda_loss": rec["lambda_loss"],
                 "lambda_grad": rec["lambda_grad"],
+                "lambda_grad_featold": rec["lambda_grad_featold"],
                 "effective": kl_effective,
                 "verdict": kl_verdict,
             },
@@ -942,9 +989,28 @@ def main():
     print(f"base key-gradient ||-0.1*grad pull + wd*K|| mean="
           f"{base_grad_mean:.3e}  vs  ||grad_K KL_prot|| mean="
           f"{rec['kl_grad_norm_prot_mean']:.3e}")
-    print(f"lambda_grad (PRIMARY) ~ {rec['lambda_grad']:.2f}"
+    print(f"lambda_grad (PRIMARY, deployment feat_new) ~ "
+          f"{rec['lambda_grad']:.2f}"
           if np.isfinite(rec['lambda_grad'])
           else "lambda_grad: undefined (KL key-gradient ~ 0)")
+    print(f"KL gradient isolation variant (feat_old, prompts undrifted): "
+          f"||grad_K KL_prot||={rec['kl_grad_norm_prot_featold_mean']:.3e} "
+          f"-> lambda_grad_featold ~ "
+          f"{rec['lambda_grad_featold']:.2f}"
+          if np.isfinite(rec['lambda_grad_featold'])
+          else "KL isolation gradient: undefined")
+    if (np.isfinite(rec['lambda_grad'])
+            and np.isfinite(rec['lambda_grad_featold'])
+            and rec['lambda_grad_featold'] > 0):
+        ratio = rec['lambda_grad'] / rec['lambda_grad_featold']
+        if ratio > 1.5:
+            label = "prompt drift dominates the constraint difficulty"
+        elif ratio < 0.67:
+            label = "key drift dominates (key repair is the main lever)"
+        else:
+            label = "mixed prompt+key drift"
+        print(f"deployment/isolation gradient ratio {ratio:.2f}x "
+              f"({label})")
     print(f"verdict: {kl_verdict}")
 
     print(f"\n===== T-c: protection-mask separation (at tau={rec_tau:g}) =====")
