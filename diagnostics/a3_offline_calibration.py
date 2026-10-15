@@ -151,13 +151,15 @@ PULL_COEF = 0.1            # phase-2 loss: CE + 0.2*G*InfoNCE - 0.1*pull
 WEIGHT_DECAY = 1e-3        # Adam(self.model.parameters(), weight_decay=1e-3)
 
 # key row-norm floor for the amplified-gradient-robust lambda variant:
-# l2_normalize routing amplifies gradients of near-collapsed key rows by
-# ~1/||row|| (up to 1e12 for 1e-13-norm rows), which can dominate the
-# pooled ||grad_K KL|| and make lambda_grad artifact-driven. The floored
-# variant computes the KL gradient with the key normalizer clamped at
-# this floor (sim values of healthy rows are EXACTLY unchanged — sim
-# depends only on row direction; collapsed rows have their routing weight
-# shrunk toward 0 and their gradient amplification capped at 1/floor).
+# the OFFICIAL normalizer is k/sqrt(max(||k||^2, 1e-12)) = k/max(||k||, 1e-6)
+# — rows above 1e-6 are amplified by 1/||k||, rows below are capped at 1e6
+# (and are no longer unit vectors). Rows in (1e-6, 1e-3) still get 1e3-1e6x
+# amplification, which can dominate the pooled ||grad_K KL|| and make
+# lambda_grad artifact-driven. The floored variant clamps the key
+# normalizer at this tighter floor (sim values of rows above the floor are
+# EXACTLY unchanged — sim depends only on row direction; rows below keep
+# their direction with routing weight shrunk by ||k||/floor and gradient
+# amplification capped at 1/floor).
 KEY_NORM_FLOOR = 1e-4
 
 
@@ -1174,6 +1176,34 @@ def main():
     n_floor = int(sum(c["n_key_rows_below_1e-6"]
                       for c in per_client.values()))
 
+    # pooled row-grad concentration across clients: the tau_sweep shares are
+    # MEANS of per-client shares, which under severe client heterogeneity
+    # (one client dominating the pooled norm) can differ drastically from
+    # the contribution to the actually-pooled gradient
+    pooled_top10_sq = pooled_prot_sq = float('nan')
+    pooled_top10_l1 = pooled_prot_l1 = float('nan')
+    lam_grad_minmax = (float('nan'), float('nan'))
+    _det_cids = sorted({c for (c, t) in rowgrad_detail if t == rec_tau})
+    if _det_cids:
+        _rg = torch.cat([rowgrad_detail[(c, rec_tau)]["row_g"]
+                         for c in _det_cids])
+        _pm = torch.cat([rowgrad_detail[(c, rec_tau)]["prot_mask"]
+                         for c in _det_cids])
+        _sq_tot = float((_rg ** 2).sum())
+        _l1_tot = float(_rg.sum())
+        if _sq_tot > 0 and _l1_tot > 0:
+            pooled_top10_sq = (float(_rg.topk(min(10, _rg.numel()))
+                                     .values.pow(2).sum()) / _sq_tot)
+            pooled_prot_sq = float((_rg[_pm] ** 2).sum()) / _sq_tot
+            pooled_top10_l1 = (float(_rg.topk(min(10, _rg.numel()))
+                                     .values.sum()) / _l1_tot)
+            pooled_prot_l1 = float(_rg[_pm].sum()) / _l1_tot
+    _lam_vals = [float(r["lambda_grad"]) for r in rows
+                 if float(r["temp"]) == rec_tau
+                 and r["lambda_grad"] != "nan"]
+    if _lam_vals:
+        lam_grad_minmax = (min(_lam_vals), max(_lam_vals))
+
     # ---------------- persist JSON ----------------
     out_json = out_csv.with_suffix(".json")
     meta = {
@@ -1224,6 +1254,12 @@ def main():
                 "lambda_grad_featold": rec["lambda_grad_featold"],
                 "lambda_grad_floor": rec["lambda_grad_floor"],
                 "key_norm_floor": KEY_NORM_FLOOR,
+                "lambda_grad_per_client_min": lam_grad_minmax[0],
+                "lambda_grad_per_client_max": lam_grad_minmax[1],
+                "kl_rowgrad_top10_sq_share_pooled": pooled_top10_sq,
+                "kl_rowgrad_prot_rows_sq_share_pooled": pooled_prot_sq,
+                "kl_rowgrad_top10_share_pooled": pooled_top10_l1,
+                "kl_rowgrad_prot_rows_share_pooled": pooled_prot_l1,
                 "kl_rowgrad_top10_share": rec["kl_rowgrad_top10_share"],
                 "kl_rowgrad_prot_rows_share":
                     rec["kl_rowgrad_prot_rows_share"],
@@ -1248,7 +1284,11 @@ def main():
                          "key_norm_new": float(
                              rowgrad_detail[(cid, rec_tau)]["kn_new"][s]),
                          "row_grad_l2": float(
-                             rowgrad_detail[(cid, rec_tau)]["row_g"][s])}
+                             rowgrad_detail[(cid, rec_tau)]["row_g"][s]),
+                         "scale_adj_row_grad": float(
+                             max(rowgrad_detail[(cid, rec_tau)]["kn_new"][s],
+                                 1e-6)
+                             * rowgrad_detail[(cid, rec_tau)]["row_g"][s])}
                         for s in rowgrad_detail[(cid, rec_tau)]["row_g"]
                         .topk(min(10, rowgrad_detail[(cid, rec_tau)]
                                   ["row_g"].numel())).indices.tolist()]
@@ -1375,23 +1415,42 @@ def main():
           f"squared norm (L2, aligned with lambda's denominator); "
           f"protected rows carry {rec['kl_rowgrad_prot_rows_share']:.1%} "
           f"(L1) / {rec['kl_rowgrad_prot_rows_sq_share']:.1%} (L2)")
+    print(f"  [per-client-share MEANS above; POOLED across clients: "
+          f"top-10 {pooled_top10_l1:.1%} (L1) / {pooled_top10_sq:.1%} "
+          f"(L2), protected {pooled_prot_l1:.1%} (L1) / "
+          f"{pooled_prot_sq:.1%} (L2) — under client heterogeneity the "
+          f"pooled shares are the ones aligned with the pooled lambda]")
+    if np.isfinite(lam_grad_minmax[0]) and np.isfinite(lam_grad_minmax[1]):
+        print(f"  per-client lambda_grad range: "
+              f"[{lam_grad_minmax[0]:.2e}, {lam_grad_minmax[1]:.2e}] "
+              f"(the pooled mean "
+              f"{rec['lambda_grad']:.2e} cannot represent a typical client "
+              f"when this range spans orders of magnitude)")
     print(f"key row norms (parameter scale): old mean={kn_old_mean:.4f} "
           f"min={kn_min_old:.2e}  new mean={kn_new_mean:.4f} "
           f"min={kn_min_new:.2e}  new protected-row mean={kn_prot_m:.4f} "
           f"vs unprotected-row mean={kn_unprot_m:.4f}  "
           f"rows below 1e-6 (old+new, all clients): {n_floor}")
-    print("top gradient rows (per client, top-5 by row-grad L2):")
+    print("top gradient rows (per client, top-5 by row-grad L2; "
+          "sg = max(kn, 1e-6)*g, the scale-adjusted gradient — the "
+          "official normalizer k/max(||k||,1e-6) caps amplification at "
+          "1e6, so sg removes that amplification for comparison):")
     for cid in sorted({c for (c, t) in rowgrad_detail if t == rec_tau}):
         d = rowgrad_detail[(cid, rec_tau)]
         top_idx = d["row_g"].topk(min(5, d["row_g"].numel())).indices
         cells = [f"slot{s}({'P' if d['prot_mask'][s] else 'u'}) "
-                 f"kn={d['kn_new'][s]:.2e} g={d['row_g'][s]:.2e}"
+                 f"kn={d['kn_new'][s]:.2e} g={d['row_g'][s]:.2e} "
+                 f"sg={max(float(d['kn_new'][s]), 1e-6) * float(d['row_g'][s]):.2e}"
                  for s in top_idx.tolist()]
         print(f"  client {cid}: " + " | ".join(cells))
-    print("note: gradient concentration alone does NOT prove a "
-          "parameter-scale artifact — real routing change also "
-          "concentrates; check the top rows' key norms (tiny kn with "
-          "huge g = artifact; healthy kn with huge g = real drift)")
+    print("note: norm scale and real constraint need can CO-OCCUR on the "
+          "same row — a tiny-kn row with huge g is amplified, but that does "
+          "NOT mean it has no real routing drift to repair, and a healthy-kn "
+          "row with huge g may still be partly amplified. Compare g with sg: "
+          "rows whose g rank collapses under sg are scale-dominated; rows "
+          "that stay large under sg carry real constraint signal. A hinge "
+          "loss passes through the same normalizer and does NOT escape this "
+          "scale issue")
     print(f"verdict: {kl_verdict}")
 
     print(f"\n===== T-c: protection-mask separation (at tau={rec_tau:g}) =====")
