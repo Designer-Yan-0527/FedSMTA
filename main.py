@@ -151,11 +151,38 @@ def build_server(args, run_manager=None):
     return myServer
 
 
+def validate_method_args(args):
+    """Phase 5 A3: fail-fast config validation (method isolation).
+
+    A3 (fedta_a3) is mutually exclusive with A2 (fedta_a2) by construction:
+    a single --method choice. A3 never freezes key/anchor rows — the only
+    freeze mechanism in this codebase is A2's post-step restore, gated on
+    method == 'fedta_a2'. The frozen fedta baseline accepts no A3 arguments.
+    """
+    if args.method != 'fedta_a3':
+        return
+    problems = []
+    if not (float(args.a3_lambda) > 0):
+        problems.append("--a3_lambda must be > 0")
+    if not (float(args.a3_tau) > 0):
+        problems.append("--a3_tau must be > 0")
+    if int(args.a3_n_ref) <= 0:
+        problems.append("--a3_n_ref must be > 0")
+    if int(args.a3_ref_batch_size) <= 0:
+        problems.append("--a3_ref_batch_size must be > 0")
+    if int(args.a3_compat_every) < 1:
+        problems.append("--a3_compat_every must be >= 1")
+    if problems:
+        raise ValueError(
+            f"invalid fedta_a3 configuration: " + "; ".join(problems))
+
+
 def main(args):
     # Phase 0: run directory / tee logging / resume target resolution.
     # Must happen before any training output so everything is logged.
     # (RunManager is RNG-neutral, so its position does not affect the
     # partition RNG stream.)
+    validate_method_args(args)
     run_manager = RunManager(args)
 
     myServer = build_server(args, run_manager=run_manager)
