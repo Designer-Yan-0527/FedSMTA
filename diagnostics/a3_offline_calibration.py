@@ -454,6 +454,12 @@ def make_kl_verdict(psk, old_top1, kl_grad, base_grad, lam_grad, prot_flip):
     if not np.isfinite(psk):
         return ("INDETERMINATE: no protected samples (empty protection "
                 "set or no protected top-1 destinations)", None)
+    if psk < KL_SOFT_FLOOR and prot_flip < 0.01:
+        return (f"NO DRIFT on protected samples at this snapshot "
+                f"(KL={psk:.4f} < {KL_SOFT_FLOOR}, flip rate "
+                f"{prot_flip:.3f} < 0.01): the constraint is inactive — "
+                f"there is nothing to preserve here; do NOT add a hinge "
+                f"either (zero drift means zero constraint need)", False)
     parts = []
     soft = old_top1 < 0.8   # measured softmax sharpness at rec tau
     if psk >= KL_SOFT_FLOOR:
@@ -558,6 +564,7 @@ def main():
 
     rows = []
     per_client = {}
+    rowgrad_detail = {}
     n_skipped = 0
     try:
         server.model.eval()
@@ -685,6 +692,18 @@ def main():
                 -1, old_key.shape[-1]).norm(dim=1).float().cpu()
             kn_new = cur_key.detach().reshape(
                 -1, cur_key.shape[-1]).norm(dim=1).float().cpu()
+            prot_row_mask_c = torch.zeros(kn_new.numel(), dtype=torch.bool)
+            prot_row_mask_c[torch.as_tensor(prot_cols)] = True
+            kn_new_prot_mean = (float(kn_new[prot_row_mask_c].mean())
+                                if bool(prot_row_mask_c.any())
+                                else float('nan'))
+            kn_new_unprot_mean = (float(kn_new[~prot_row_mask_c].mean())
+                                  if bool((~prot_row_mask_c).any())
+                                  else float('nan'))
+            kn_new_min = float(kn_new.min())
+            kn_old_min = float(kn_old.min())
+            n_below_floor = int((kn_new < 1e-6).sum()
+                                + (kn_old < 1e-6).sum())
 
             # ---- T-a / T-b per tau ----
             for tau in temps:
@@ -693,6 +712,10 @@ def main():
                 ro, rn = log_ro.exp(), log_rn.exp()
                 top1_o = float(ro.max(dim=1).values.mean())
                 top1_n = float(rn.max(dim=1).values.mean())
+                top1_o_prot = (float(ro[sample_prot]
+                                     .max(dim=1).values.mean())
+                               if bool(sample_prot.any())
+                               else float('nan'))
                 h_o = float((-(ro * log_ro).sum(dim=1)).mean())
                 h_n = float((-(rn * log_rn).sum(dim=1)).mean())
                 # PRIMARY KL: full distribution, protected SAMPLES only
@@ -764,8 +787,25 @@ def main():
                         prot_cols, device=row_g.device)] = True
                     prot_rows_share = (float(row_g[prot_row_mask].sum())
                                        / rg_total)
+                    # squared-norm shares — the statistic aligned with
+                    # lambda's L2 denominator (one huge row can dominate
+                    # the L2 norm while its L1 mass share looks modest)
+                    rg_sq_total = float((row_g ** 2).sum())
+                    top10_sq_share = float(
+                        row_g.topk(min(10, row_g.numel()))
+                        .values.pow(2).sum()) / rg_sq_total
+                    prot_rows_sq_share = (float(
+                        (row_g[prot_row_mask] ** 2).sum()) / rg_sq_total)
                 else:
-                    top10_share, prot_rows_share = float('nan'), float('nan')
+                    top10_share = prot_rows_share = float('nan')
+                    top10_sq_share = prot_rows_sq_share = float('nan')
+                # keep per-client row-grad detail for the recommended tau
+                if row_g is not None:
+                    rowgrad_detail[(cid, tau)] = {
+                        "row_g": row_g.float().cpu(),
+                        "prot_mask": prot_row_mask_c.clone(),
+                        "kn_new": kn_new.clone(),
+                    }
                 lam_grad = (base_grad_norm / kl_grad_prot
                             if np.isfinite(kl_grad_prot) and kl_grad_prot > 0
                             else float('nan'))
@@ -778,6 +818,9 @@ def main():
                     "new_task": new_task,
                     "temp": tau,
                     "top1_prob_mean_old": f"{top1_o:.6f}",
+                    "top1_prob_old_prot": (f"{top1_o_prot:.6f}"
+                                           if np.isfinite(top1_o_prot)
+                                           else "nan"),
                     "top1_prob_mean_new": f"{top1_n:.6f}",
                     "top1_prob_mean": f"{(top1_o + top1_n) / 2:.6f}",
                     "entropy_mean_old": f"{h_o:.6f}",
@@ -812,6 +855,12 @@ def main():
                     "kl_rowgrad_prot_rows_share": (
                         f"{prot_rows_share:.6f}"
                         if np.isfinite(prot_rows_share) else "nan"),
+                    "kl_rowgrad_top10_sq_share": (
+                        f"{top10_sq_share:.6f}"
+                        if np.isfinite(top10_sq_share) else "nan"),
+                    "kl_rowgrad_prot_rows_sq_share": (
+                        f"{prot_rows_sq_share:.6f}"
+                        if np.isfinite(prot_rows_sq_share) else "nan"),
                     "protected_flip_rate": f"{prot_flip:.4f}",
                     "unprotected_flip_rate": f"{unprot_flip:.4f}",
                     "flip_rate_small_margin": f"{flip_small:.4f}",
@@ -839,9 +888,14 @@ def main():
                 "key_row_norm_old_mean": float(kn_old.mean()),
                 "key_row_norm_old_p10": float(
                     torch.quantile(kn_old, 0.10)),
+                "key_row_norm_old_min": kn_old_min,
                 "key_row_norm_new_mean": float(kn_new.mean()),
                 "key_row_norm_new_p10": float(
                     torch.quantile(kn_new, 0.10)),
+                "key_row_norm_new_min": kn_new_min,
+                "key_row_norm_new_prot_mean": kn_new_prot_mean,
+                "key_row_norm_new_unprot_mean": kn_new_unprot_mean,
+                "n_key_rows_below_1e-6": n_below_floor,
                 "task_loss": task_loss,
                 "base_grad_norm": base_grad_norm,
                 "pull_grad_norm": pull_grad_norm,
@@ -905,6 +959,7 @@ def main():
                         else float('nan'))
         tau_sweep[tau] = {
             "top1_prob_mean_old": nmean(tau, "top1_prob_mean_old"),
+            "top1_prob_old_prot": nmean(tau, "top1_prob_old_prot"),
             "top1_prob_mean_new": nmean(tau, "top1_prob_mean_new"),
             "top1_prob_mean": nmean(tau, "top1_prob_mean"),
             "entropy_mean_old": nmean(tau, "entropy_mean_old"),
@@ -927,6 +982,10 @@ def main():
             "kl_rowgrad_top10_share": nmean(tau, "kl_rowgrad_top10_share"),
             "kl_rowgrad_prot_rows_share": nmean(
                 tau, "kl_rowgrad_prot_rows_share"),
+            "kl_rowgrad_top10_sq_share": nmean(
+                tau, "kl_rowgrad_top10_sq_share"),
+            "kl_rowgrad_prot_rows_sq_share": nmean(
+                tau, "kl_rowgrad_prot_rows_sq_share"),
         }
 
     # ---------------- verdicts ----------------
@@ -982,9 +1041,16 @@ def main():
     else:
         sep_verdict = "INDETERMINATE: empty protected or unprotected group"
 
+    # sharpness evidence: PROTECTED-sample old top-1 prob when available
+    # (the verdict is about the samples A3 constrains), all-sample mean
+    # as fallback
+    old_top1_for_verdict = (rec["top1_prob_old_prot"]
+                            if np.isfinite(rec.get("top1_prob_old_prot",
+                                                   float('nan')))
+                            else rec["top1_prob_mean_old"])
     kl_verdict, kl_effective = make_kl_verdict(
         psk=rec["protected_sample_kl_mean"],
-        old_top1=rec["top1_prob_mean_old"],
+        old_top1=old_top1_for_verdict,
         kl_grad=rec["kl_grad_norm_prot_mean"],
         base_grad=base_grad_mean,
         lam_grad=rec["lambda_grad"],
@@ -1037,6 +1103,18 @@ def main():
             f"is NOT deployment-valid; re-run on a pure fedta run before "
             f"finalizing lambda and the loss form")
 
+    # key-norm detail aggregates (used by both the JSON dump and console)
+    kn_min_new = float(np.nanmean(
+        [c["key_row_norm_new_min"] for c in per_client.values()]))
+    kn_min_old = float(np.nanmean(
+        [c["key_row_norm_old_min"] for c in per_client.values()]))
+    kn_prot_m = float(np.nanmean(
+        [c["key_row_norm_new_prot_mean"] for c in per_client.values()]))
+    kn_unprot_m = float(np.nanmean(
+        [c["key_row_norm_new_unprot_mean"] for c in per_client.values()]))
+    n_floor = int(sum(c["n_key_rows_below_1e-6"]
+                      for c in per_client.values()))
+
     # ---------------- persist JSON ----------------
     out_json = out_csv.with_suffix(".json")
     meta = {
@@ -1086,9 +1164,33 @@ def main():
                 "kl_rowgrad_top10_share": rec["kl_rowgrad_top10_share"],
                 "kl_rowgrad_prot_rows_share":
                     rec["kl_rowgrad_prot_rows_share"],
+                "kl_rowgrad_top10_sq_share":
+                    rec["kl_rowgrad_top10_sq_share"],
+                "kl_rowgrad_prot_rows_sq_share":
+                    rec["kl_rowgrad_prot_rows_sq_share"],
+                "old_top1_prob_prot": rec["top1_prob_old_prot"],
                 "key_row_norm_old_mean": kn_old_mean,
                 "key_row_norm_old_p10": kn_old_p10,
+                "key_row_norm_old_min_mean": kn_min_old,
                 "key_row_norm_new_mean": kn_new_mean,
+                "key_row_norm_new_min_mean": kn_min_new,
+                "key_row_norm_new_prot_mean": kn_prot_m,
+                "key_row_norm_new_unprot_mean": kn_unprot_m,
+                "n_key_rows_below_1e-6_total": n_floor,
+                "top_grad_rows_per_client": {
+                    str(cid): [
+                        {"slot": int(s),
+                         "protected": bool(
+                             rowgrad_detail[(cid, rec_tau)]["prot_mask"][s]),
+                         "key_norm_new": float(
+                             rowgrad_detail[(cid, rec_tau)]["kn_new"][s]),
+                         "row_grad_l2": float(
+                             rowgrad_detail[(cid, rec_tau)]["row_g"][s])}
+                        for s in rowgrad_detail[(cid, rec_tau)]["row_g"]
+                        .topk(min(10, rowgrad_detail[(cid, rec_tau)]
+                                  ["row_g"].numel())).indices.tolist()]
+                    for cid in sorted({c for (c, t) in rowgrad_detail
+                                       if t == rec_tau})},
                 "deployment_valid": not a2_run_drift_suppressed,
                 "effective": kl_effective,
                 "verdict": kl_verdict,
@@ -1181,13 +1283,27 @@ def main():
               f"ratio")
     print(f"gradient concentration (protected-sample KL, this tau): "
           f"top-10 key rows carry {rec['kl_rowgrad_top10_share']:.1%} of "
-          f"total row-grad mass, protected rows carry "
-          f"{rec['kl_rowgrad_prot_rows_share']:.1%}")
+          f"row-grad mass (L1) / {rec['kl_rowgrad_top10_sq_share']:.1%} of "
+          f"squared norm (L2, aligned with lambda's denominator); "
+          f"protected rows carry {rec['kl_rowgrad_prot_rows_share']:.1%} "
+          f"(L1) / {rec['kl_rowgrad_prot_rows_sq_share']:.1%} (L2)")
     print(f"key row norms (parameter scale): old mean={kn_old_mean:.4f} "
-          f"(p10={kn_old_p10:.4f})  new mean={kn_new_mean:.4f} — "
-          f"l2_normalize in routing amplifies gradients on low-norm rows "
-          f"by ~1/||row||; if top-10 share is extreme, lambda_grad is "
-          f"partly a parameter-scale artifact")
+          f"min={kn_min_old:.2e}  new mean={kn_new_mean:.4f} "
+          f"min={kn_min_new:.2e}  new protected-row mean={kn_prot_m:.4f} "
+          f"vs unprotected-row mean={kn_unprot_m:.4f}  "
+          f"rows below 1e-6 (old+new, all clients): {n_floor}")
+    print("top gradient rows (per client, top-5 by row-grad L2):")
+    for cid in sorted({c for (c, t) in rowgrad_detail if t == rec_tau}):
+        d = rowgrad_detail[(cid, rec_tau)]
+        top_idx = d["row_g"].topk(min(5, d["row_g"].numel())).indices
+        cells = [f"slot{s}({'P' if d['prot_mask'][s] else 'u'}) "
+                 f"kn={d['kn_new'][s]:.2e} g={d['row_g'][s]:.2e}"
+                 for s in top_idx.tolist()]
+        print(f"  client {cid}: " + " | ".join(cells))
+    print("note: gradient concentration alone does NOT prove a "
+          "parameter-scale artifact — real routing change also "
+          "concentrates; check the top rows' key norms (tiny kn with "
+          "huge g = artifact; healthy kn with huge g = real drift)")
     print(f"verdict: {kl_verdict}")
 
     print(f"\n===== T-c: protection-mask separation (at tau={rec_tau:g}) =====")
