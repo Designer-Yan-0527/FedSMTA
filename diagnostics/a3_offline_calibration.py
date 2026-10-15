@@ -342,6 +342,29 @@ def kl_key_grad(feat, key, log_ro, tau, sample_mask=None):
     return out
 
 
+def kl_key_rowgrad(feat, key, log_ro, tau, sample_mask=None):
+    """Per-ROW gradient norms of the (sample-masked) KL w.r.t. the key,
+    shape (n_slots,). Diagnoses WHERE the large KL gradient concentrates:
+    if a few key rows carry most of the total gradient norm, lambda_grad
+    is dominated by parameter-scale structure rather than by drift
+    structure. Returns None when the sample mask is empty."""
+    key_g = key.detach().clone().requires_grad_(True)
+    sim = routing_similarity(feat, key_g)
+    log_rn = F.log_softmax(tau * sim, dim=1)
+    per_sample = (log_ro.exp() * (log_ro - log_rn)).sum(dim=1)
+    if sample_mask is None:
+        kl = per_sample.mean()
+    else:
+        if not bool(sample_mask.any()):
+            del key_g, sim, log_rn, per_sample
+            return None
+        kl = per_sample[sample_mask].mean()
+    g, = torch.autograd.grad(kl, key_g)
+    out = g.reshape(-1, g.shape[-1]).norm(dim=1).detach().clone()
+    del key_g, sim, log_rn, per_sample, kl, g
+    return out
+
+
 def pull_key_grad(feat, key):
     """grad_K of the official pull term (reduce_sim), exact replica of
     Tail_Anchor.forward's pull computation on `feat` under `key`:
@@ -462,7 +485,7 @@ def make_kl_verdict(psk, old_top1, kl_grad, base_grad, lam_grad, prot_flip):
         parts.append(
             f"gradient calibration: ||grad_K L_base|| = {base_grad:.3e} vs "
             f"||grad_K KL_prot|| = {kl_grad:.3e} -> lambda_grad ~ "
-            f"{lam_grad:.1f} as the SWEEP CENTER, not an exact equivalence "
+            f"{lam_grad:.2e} as the SWEEP CENTER, not an exact equivalence "
             f"(Adam rescales per-parameter updates; scan at least +-1 order "
             f"of magnitude around it; the CE scalar passes no continuous "
             f"gradient to the key)")
@@ -655,6 +678,14 @@ def main():
                 m_mean = m_med = m_p10 = float('nan')
                 flip_small = flip_large = float('nan')
 
+            # key row norms (parameter-scale context for the gradient
+            # norms: l2_normalize in routing_similarity means gradients
+            # w.r.t. low-norm rows are amplified by ~1/||row||)
+            kn_old = old_key.detach().reshape(
+                -1, old_key.shape[-1]).norm(dim=1).float().cpu()
+            kn_new = cur_key.detach().reshape(
+                -1, cur_key.shape[-1]).norm(dim=1).float().cpu()
+
             # ---- T-a / T-b per tau ----
             for tau in temps:
                 log_ro = F.log_softmax(tau * sim_old, dim=1)
@@ -716,6 +747,25 @@ def main():
                                                    cur_key.to(client.device),
                                                    log_ro, tau,
                                                    sample_mask=sample_prot)
+                # per-row gradient concentration at this tau (where does
+                # the huge KL gradient actually live?)
+                row_g = kl_key_rowgrad(feat_new,
+                                       cur_key.to(client.device),
+                                       log_ro, tau, sample_mask=sample_prot)
+                if row_g is not None and float(row_g.sum()) > 0:
+                    rg_total = float(row_g.sum())
+                    top10_share = float(
+                        row_g.topk(min(10, row_g.numel()))
+                        .values.sum()) / rg_total
+                    prot_row_mask = torch.zeros(row_g.numel(),
+                                                dtype=torch.bool,
+                                                device=row_g.device)
+                    prot_row_mask[torch.as_tensor(
+                        prot_cols, device=row_g.device)] = True
+                    prot_rows_share = (float(row_g[prot_row_mask].sum())
+                                       / rg_total)
+                else:
+                    top10_share, prot_rows_share = float('nan'), float('nan')
                 lam_grad = (base_grad_norm / kl_grad_prot
                             if np.isfinite(kl_grad_prot) and kl_grad_prot > 0
                             else float('nan'))
@@ -752,10 +802,16 @@ def main():
                     "kl_grad_norm_all": (f"{kl_grad_all:.6e}"
                                          if np.isfinite(kl_grad_all)
                                          else "nan"),
-                    "lambda_grad": (f"{lam_grad:.4f}"
+                    "lambda_grad": (f"{lam_grad:.6e}"
                                     if np.isfinite(lam_grad) else "nan"),
-                    "lambda_loss": (f"{lam_loss:.4f}"
+                    "lambda_loss": (f"{lam_loss:.6e}"
                                     if np.isfinite(lam_loss) else "nan"),
+                    "kl_rowgrad_top10_share": (
+                        f"{top10_share:.6f}"
+                        if np.isfinite(top10_share) else "nan"),
+                    "kl_rowgrad_prot_rows_share": (
+                        f"{prot_rows_share:.6f}"
+                        if np.isfinite(prot_rows_share) else "nan"),
                     "protected_flip_rate": f"{prot_flip:.4f}",
                     "unprotected_flip_rate": f"{unprot_flip:.4f}",
                     "flip_rate_small_margin": f"{flip_small:.4f}",
@@ -778,6 +834,14 @@ def main():
                     a2 and a2.get("protected_slots")),
                 "n_protected_slots": len(prot_cols),
                 "n_unprotected_slots": len(unprot_cols),
+                "n_prot_samples": int(sample_prot.sum()),
+                "n_unprot_samples": int((~sample_prot).sum()),
+                "key_row_norm_old_mean": float(kn_old.mean()),
+                "key_row_norm_old_p10": float(
+                    torch.quantile(kn_old, 0.10)),
+                "key_row_norm_new_mean": float(kn_new.mean()),
+                "key_row_norm_new_p10": float(
+                    torch.quantile(kn_new, 0.10)),
                 "task_loss": task_loss,
                 "base_grad_norm": base_grad_norm,
                 "pull_grad_norm": pull_grad_norm,
@@ -792,9 +856,12 @@ def main():
             print(f"client {cid}: old_task={old_task} new_task={new_task} "
                   f"protected={len(prot_cols)}/{pool_size} "
                   f"task_loss={task_loss:.4f} "
-                  f"flip prot={prot_flip:.3f} unprot={unprot_flip:.3f} "
+                  f"flip prot={prot_flip:.3f} (n={int(sample_prot.sum())}) "
+                  f"unprot={unprot_flip:.3f} (n={int((~sample_prot).sum())}) "
                   f"(small-m {flip_small:.3f} / large-m {flip_large:.3f}) "
-                  f"base||gK||={base_grad_norm:.2e}",
+                  f"base||gK||={base_grad_norm:.2e} "
+                  f"keyRowNorm old={float(kn_old.mean()):.3f}/"
+                  f"new={float(kn_new.mean()):.3f}",
                   flush=True)
     finally:
         server.model.train(vit_was_training)
@@ -857,6 +924,9 @@ def main():
             "lambda_grad": lam_grad,
             "lambda_grad_featold": lam_grad_old,
             "lambda_loss": nmean(tau, "lambda_loss"),
+            "kl_rowgrad_top10_share": nmean(tau, "kl_rowgrad_top10_share"),
+            "kl_rowgrad_prot_rows_share": nmean(
+                tau, "kl_rowgrad_prot_rows_share"),
         }
 
     # ---------------- verdicts ----------------
@@ -872,6 +942,14 @@ def main():
         [c["protected_flip_rate"] for c in per_client.values()]))
     u_flip = float(np.nanmean(
         [c["unprotected_flip_rate"] for c in per_client.values()]))
+    n_prot_samp = [c["n_prot_samples"] for c in per_client.values()]
+    n_unprot_samp = [c["n_unprot_samples"] for c in per_client.values()]
+    kn_old_mean = float(np.mean(
+        [c["key_row_norm_old_mean"] for c in per_client.values()]))
+    kn_old_p10 = float(np.mean(
+        [c["key_row_norm_old_p10"] for c in per_client.values()]))
+    kn_new_mean = float(np.mean(
+        [c["key_row_norm_new_mean"] for c in per_client.values()]))
     flip_small = float(np.nanmean(
         [c["flip_rate_small_margin"] for c in per_client.values()]))
     flip_large = float(np.nanmean(
@@ -884,13 +962,23 @@ def main():
     separation_holds = bool(np.isfinite(p_flip) and np.isfinite(u_flip)
                             and p_flip > u_flip)
     if separation_holds:
-        sep_verdict = (f"HOLDS: protected flip {p_flip:.3f} > unprotected "
-                       f"{u_flip:.3f} (ratio {flip_ratio:.2f}x) — drift "
-                       f"concentrates on the slots the mask constrains")
-    elif np.isfinite(p_flip) and np.isfinite(u_flip):
-        sep_verdict = (f"DOES NOT HOLD: protected flip {p_flip:.3f} <= "
+        sep_verdict = (f"SEPARATION PRESENT: protected flip {p_flip:.3f} > "
                        f"unprotected {u_flip:.3f} (ratio "
                        f"{flip_ratio:.2f}x)")
+    elif np.isfinite(p_flip) and np.isfinite(u_flip):
+        sep_verdict = (f"NO SEPARATION (informational, not a negation of "
+                       f"the mask): protected flip {p_flip:.3f} <= "
+                       f"unprotected {u_flip:.3f} (ratio "
+                       f"{flip_ratio:.2f}x). The protection set means "
+                       f"'history tasks NEED these slots' — it does NOT "
+                       f"require protected slots to flip more than "
+                       f"unprotected ones; unprotected flips are expected "
+                       f"(new-task learning rewrites free slots). Validate "
+                       f"the mask IN TRAINING by whether the constraint "
+                       f"improves OLD-task accuracy. Coverage: protected "
+                       f"samples per client {n_prot_samp}, unprotected "
+                       f"{n_unprot_samp} — small unprotected groups make "
+                       f"the unprotected rate noisy")
     else:
         sep_verdict = "INDETERMINATE: empty protected or unprotected group"
 
@@ -995,6 +1083,12 @@ def main():
                 "lambda_loss": rec["lambda_loss"],
                 "lambda_grad": rec["lambda_grad"],
                 "lambda_grad_featold": rec["lambda_grad_featold"],
+                "kl_rowgrad_top10_share": rec["kl_rowgrad_top10_share"],
+                "kl_rowgrad_prot_rows_share":
+                    rec["kl_rowgrad_prot_rows_share"],
+                "key_row_norm_old_mean": kn_old_mean,
+                "key_row_norm_old_p10": kn_old_p10,
+                "key_row_norm_new_mean": kn_new_mean,
                 "deployment_valid": not a2_run_drift_suppressed,
                 "effective": kl_effective,
                 "verdict": kl_verdict,
@@ -1003,6 +1097,8 @@ def main():
                 "protected_flip_rate_mean": p_flip,
                 "unprotected_flip_rate_mean": u_flip,
                 "flip_ratio": flip_ratio,
+                "n_prot_samples_per_client": n_prot_samp,
+                "n_unprot_samples_per_client": n_unprot_samp,
                 "flip_rate_small_margin_mean": flip_small,
                 "flip_rate_large_margin_mean": flip_large,
                 "old_margin_mean_prot": float(np.nanmean(
@@ -1051,22 +1147,23 @@ def main():
           f"{rec['within_protected_kl_mean']:.4f}")
     print(f"full-pool KL mean={rec['full_kl_mean']:.4f}")
     print(f"drift decomposition, protected samples (single-factor terms, "
-          f"non-additive): key-only KL={rec['key_only_kl_prot_mean']:.4f}  "
+          f"non-additive — do not sum them or convert to attribution "
+          f"shares): key-only KL={rec['key_only_kl_prot_mean']:.4f}  "
           f"prompt-only KL={rec['prompt_only_kl_prot_mean']:.4f}  "
           f"total={rec['protected_sample_kl_mean']:.4f}")
     print(f"task CE mean={task_loss_mean:.4f} -> lambda_loss "
-          f"(coarse) ~ {rec['lambda_loss']:.2f}")
+          f"(coarse, NOT a training lambda) ~ {rec['lambda_loss']:.2e}")
     print(f"base key-gradient ||-0.1*grad pull + wd*K|| mean="
           f"{base_grad_mean:.3e}  vs  ||grad_K KL_prot|| mean="
           f"{rec['kl_grad_norm_prot_mean']:.3e}")
     print(f"lambda_grad (PRIMARY, deployment feat_new) ~ "
-          f"{rec['lambda_grad']:.2f}  [sweep center, scan +-1 order]"
+          f"{rec['lambda_grad']:.2e}  [sweep center, scan +-1 order]"
           if np.isfinite(rec['lambda_grad'])
           else "lambda_grad: undefined (KL key-gradient ~ 0)")
     print(f"KL gradient isolation variant (feat_old, prompts undrifted): "
           f"||grad_K KL_prot||={rec['kl_grad_norm_prot_featold_mean']:.3e} "
           f"-> lambda_grad_featold ~ "
-          f"{rec['lambda_grad_featold']:.2f}"
+          f"{rec['lambda_grad_featold']:.2e}"
           if np.isfinite(rec['lambda_grad_featold'])
           else "KL isolation gradient: undefined")
     if (np.isfinite(rec['lambda_grad'])
@@ -1078,14 +1175,25 @@ def main():
         print(f"lambda ratio (deployment/isolation) {lam_ratio:.2f}x: the "
               f"deployment constraint's lever on the key is "
               f"{lever} than under "
-              f"undrifted prompts — use the LARGER lambda as the sweep "
-              f"center. Factor attribution is carried by the drift "
-              f"decomposition above, not by this ratio")
+              f"undrifted prompts — the DEPLOYMENT value is the diagnostic "
+              f"reference for the sweep center. Factor attribution is "
+              f"carried by the drift decomposition above, not by this "
+              f"ratio")
+    print(f"gradient concentration (protected-sample KL, this tau): "
+          f"top-10 key rows carry {rec['kl_rowgrad_top10_share']:.1%} of "
+          f"total row-grad mass, protected rows carry "
+          f"{rec['kl_rowgrad_prot_rows_share']:.1%}")
+    print(f"key row norms (parameter scale): old mean={kn_old_mean:.4f} "
+          f"(p10={kn_old_p10:.4f})  new mean={kn_new_mean:.4f} — "
+          f"l2_normalize in routing amplifies gradients on low-norm rows "
+          f"by ~1/||row||; if top-10 share is extreme, lambda_grad is "
+          f"partly a parameter-scale artifact")
     print(f"verdict: {kl_verdict}")
 
     print(f"\n===== T-c: protection-mask separation (at tau={rec_tau:g}) =====")
-    print(f"top-1 flip rate: protected={p_flip:.3f}  "
-          f"unprotected={u_flip:.3f}  ratio={flip_ratio:.2f}x")
+    print(f"top-1 flip rate: protected={p_flip:.3f} (n/client {n_prot_samp})  "
+          f"unprotected={u_flip:.3f} (n/client {n_unprot_samp})  "
+          f"ratio={flip_ratio:.2f}x")
     print(f"flip stratification by old margin (protected samples): "
           f"small-margin={flip_small:.3f}  large-margin={flip_large:.3f}  "
           f"(margin mean={float(np.nanmean([c['old_margin_mean_prot'] for c in per_client.values()])):.4f}, "
