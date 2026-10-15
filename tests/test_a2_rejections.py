@@ -1,12 +1,15 @@
 """A2 fail-closed rejection tests (GPU, short runs).
 
-Verifies the two rejection paths required by the A2 resume discipline:
+Verifies the three rejection paths required by the A2 resume discipline:
 
   R1. arm mismatch: resuming an `anchor`-arm checkpoint with `--a2_arm key`
       must FAIL (RuntimeError) instead of silently changing arm semantics.
-  R2. missing a2_state: resuming a fedta_a2 run from a checkpoint WITHOUT
-      a2_state (e.g. a plain fedta checkpoint) must FAIL (RuntimeError)
+  R2. missing a2_state: resuming a fedta_a2 run from a fedta_a2 checkpoint
+      whose a2_state entries were stripped must FAIL (RuntimeError)
       instead of silently continuing as unprotected A2.
+  R3. cross-method resume: resuming a plain fedta checkpoint as fedta_a2
+      must FAIL (generic validate_checkpoint_args guard fires before the
+      a2_state check, so the expected message is the method mismatch).
 
 Also sanity-checks that the short fedta_a2 run actually PRODUCED a
 non-empty a2_state once it entered task 1 (protection set computed).
@@ -131,13 +134,30 @@ def main():
              expect_fail=True, expect_msg="arm mismatch",
              label="R1 arm-mismatch resume")
 
-    # R2: fedta_a2 resume from a fedta checkpoint (no a2_state) -> must fail
+    # R2: resume from a fedta_a2 checkpoint with a2_state stripped -> must
+    # fail. (A plain fedta checkpoint cannot test this path: the generic
+    # validate_checkpoint_args guard rejects the method mismatch first, so
+    # the a2_state check is never reached.)
+    import torch
+    ckpt_noa2_path = run_a2 / "checkpoints" / "latest_no_a2_state.pth"
+    ckpt_noa2 = torch_load_compat(run_a2 / "checkpoints" / "latest.pth")
+    for c in ckpt_noa2["clients"]:
+        c.pop("a2_state", None)
+    torch.save(ckpt_noa2, ckpt_noa2_path)
+    run_main(base + ["--method", "fedta_a2", "--a2_arm", "anchor",
+                     "--run_name", "rej_a2",
+                     "--resume", str(ckpt_noa2_path),
+                     "--max_rounds", str(args.rounds)],
+             expect_fail=True, expect_msg="a2_state",
+             label="R2 missing-a2_state resume")
+
+    # R3: fedta checkpoint resumed as fedta_a2 -> generic guard must reject
     run_main(base + ["--method", "fedta_a2", "--a2_arm", "anchor",
                      "--run_name", "rej_fedta",
                      "--resume", str(run_ft / "checkpoints" / "latest.pth"),
                      "--max_rounds", str(args.rounds)],
-             expect_fail=True, expect_msg="a2_state",
-             label="R2 missing-a2_state resume")
+             expect_fail=True, expect_msg="Checkpoint mismatch",
+             label="R3 cross-method resume")
 
     print("\nRESULT: PASS (all rejection paths enforced)")
 

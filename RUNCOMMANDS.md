@@ -40,13 +40,15 @@ python main.py datasets_delay \
     --surrogate_num 5 \
     --client_num 5 \
     --task_num 5 \
-    --private_class_num 15 \
+    --private_class_num 40 \
     --global_epoch 5 \
     --local_epoch 30 \
     --batch-size 16 \
     --lr 0.001 \
     --seed 42
 ```
+
+> **协议要点（勿改）**：官方论文 §5.1 规定 ImageNet-R 为**每客户端 40 个私有类、0 公共类、每任务 8 类**（`public_class_num = 200 − 5×40 = 0`，`class_every_task = 40/5 = 8`）。`--private_class_num 40` 是唯一正确取值；误用 CIFAR-100 的 15 会得到 125 个公共类、每任务 28 类的错误协议（2026-10-14 曾误跑，task 0 仅 56.95 vs 官方 81.5，已判废）。
 
 数据集准备（**本地导入，不联网下载**）：
 
