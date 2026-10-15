@@ -47,6 +47,17 @@ three unknowns before any A3 training code is written:
        an exact training-scale equivalence: Adam rescales per-parameter
        update magnitudes, so gradient-norm balance is a first-order
        estimate only.
+       Two scale/conflict diagnostics complete T-b (v2.7, final round):
+         unit-row-norm counterfactual: ||grad_K KL|| recomputed with the
+       STUDENT key rows rescaled to unit norm (teacher unchanged). For
+       rows >= 1e-6 the forward routing is exactly unchanged, so the
+       gradient drop (kl_grad_unitnorm_ratio) isolates the 1/||k|| Jacobian
+       amplification of l2_normalize from real constraint signal; rows
+       below the floor are flagged separately (not forward-equivalent).
+         gradient cosine: cos(g_base, g_KL_prot) between the instantaneous
+       base key gradient (-0.1*pull + wd*K on one train batch, the key's
+       only continuous channel) and the KL gradient — conflict (<0) /
+       orthogonal (~0) / synergy (>0).
 
   T-c  protection-set mask separation:
        top-1 flip rate (old-vs-new argmax disagreement, conditioned on the
@@ -59,7 +70,11 @@ three unknowns before any A3 training code is written:
        the old routing distribution (T-a). Plus mean per-column JS distance
        (column j: the distribution over reference samples routed to slot j,
        old vs new), computed separately for protected and unprotected
-       slots.
+       slots. Also reports protected_sample_coverage = n_prot_samples /
+       n_ref: above 0.95 the protected-sample mask degenerates to a
+       near-global constraint on surrogate data and the protected-vs-
+       unprotected flip comparison is reported as UNINFORMATIVE (never as
+       mask evidence).
 
 Interface definitions (aligned with compatibility_drift.py's 4-combo):
   old = (old prompt, old key, old anchor)          from --old_ckpt
@@ -186,8 +201,9 @@ def parse_args():
                    help="batch size for the two reference-input interface "
                         "passes (identical composition in both passes, so "
                         "batchwise prompt voting cancels)")
-    p.add_argument("--temps", default="1,2,5,10,20,50",
-                   help="comma-separated tau sweep for R = softmax(tau*sim)")
+    p.add_argument("--temps", default="25,30,35,40,45,50,60,70",
+                   help="comma-separated tau sweep for R = softmax(tau*sim) "
+                        "(finer grid around the [0.6, 0.9] top-1 window)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out_csv", default=None,
                    help="default <run_dir>/metrics/a3_calibration.csv")
@@ -239,6 +255,30 @@ def routing_similarity(feat, key, key_norm_floor=None):
             torch.full_like(inv_norm, 1.0 / key_norm_floor))
         key_norm = key * inv_norm
     return torch.matmul(x_norm, key_norm.t())
+
+
+def unit_row_norm_key(key):
+    """Unit-row-norm COUNTERFACTUAL of the STUDENT key: every nonzero row is
+    rescaled to unit norm (direction preserved), exactly-zero rows stay
+    zero. For rows with ||k|| >= 1e-6 (the official l2_normalize floor,
+    k/max(||k||, 1e-6)) the forward routing is EXACTLY unchanged — cosine
+    routing depends only on direction — so recomputing ||grad_K KL|| under
+    this parameterization isolates the 1/||k|| Jacobian amplification of
+    l2_normalize (parameterization artifact) from real constraint signal.
+    Rows BELOW the 1e-6 floor are NOT forward-equivalent: the official
+    normalizer shrinks their sims by ||k||/1e-6, the counterfactual
+    restores full unit length and shifts the softmax denominator; their
+    count is reported separately (n_key_rows_below_1e-6_student) and no
+    strict forward-equivalence claim is made for them. A diagnostic of
+    scale degeneracy only — NOT a training reparameterization proposal
+    (under unit rows the pull term and weight decay would also act
+    differently)."""
+    k = key.detach().reshape(-1, key.shape[-1]).clone()
+    kn = k.norm(dim=1, keepdim=True)
+    nz = kn.squeeze(1) > 0
+    if bool(nz.any()):
+        k[nz] = k[nz] / kn[nz]
+    return k
 
 
 def forward_features(client, x, task_id, batch_size):
@@ -347,6 +387,26 @@ def task_loss_ce(client, feat_cur, target, nb_classes):
         return float(F.cross_entropy(logits, target))
 
 
+def kl_key_grad_full(feat, key, log_ro, tau, sample_mask=None,
+                     key_norm_floor=None):
+    """Full-tensor variant of kl_key_grad: returns the COMPLETE gradient
+    tensor (or None when the sample mask is empty) so callers can combine
+    it with other key gradients (e.g. the cosine against the base training
+    gradient). Semantics identical to kl_key_grad — see that docstring."""
+    key_g = key.detach().clone().requires_grad_(True)
+    sim = routing_similarity(feat, key_g, key_norm_floor=key_norm_floor)
+    log_rn = F.log_softmax(tau * sim, dim=1)
+    per_sample = (log_ro.exp() * (log_ro - log_rn)).sum(dim=1)
+    if sample_mask is None:
+        kl = per_sample.mean()
+    else:
+        if not bool(sample_mask.any()):
+            return None
+        kl = per_sample[sample_mask].mean()
+    g, = torch.autograd.grad(kl, key_g)
+    return g
+
+
 def kl_key_grad(feat, key, log_ro, tau, sample_mask=None,
                 key_norm_floor=None):
     """||grad_K KL(R_old || R_new)|| on reference features, analytic
@@ -369,21 +429,16 @@ def kl_key_grad(feat, key, log_ro, tau, sample_mask=None,
       isolation gradient   (feat_old, K_new): if prompts had NOT drifted,
         how much key gradient pure key-repair would need — comparing the
         two decomposes the constraint's difficulty into the prompt-drift
-        and key-drift components."""
-    key_g = key.detach().clone().requires_grad_(True)
-    sim = routing_similarity(feat, key_g, key_norm_floor=key_norm_floor)
-    log_rn = F.log_softmax(tau * sim, dim=1)
-    per_sample = (log_ro.exp() * (log_ro - log_rn)).sum(dim=1)
-    if sample_mask is None:
-        kl = per_sample.mean()
-    else:
-        if not bool(sample_mask.any()):
-            del key_g, sim, log_rn, per_sample
-            return float('nan')
-        kl = per_sample[sample_mask].mean()
-    g, = torch.autograd.grad(kl, key_g)
+        and key-drift components.
+
+    Returns the norm only; use kl_key_grad_full when the full gradient
+    tensor is needed (gradient cosine)."""
+    g = kl_key_grad_full(feat, key, log_ro, tau, sample_mask=sample_mask,
+                         key_norm_floor=key_norm_floor)
+    if g is None:
+        return float('nan')
     out = float(g.norm())
-    del key_g, sim, log_rn, per_sample, kl, g
+    del g
     return out
 
 
@@ -751,6 +806,19 @@ def main():
             n_below_floor = int((kn_new < 1e-6).sum()
                                 + (kn_old < 1e-6).sum())
 
+            # unit-row-norm counterfactual of the STUDENT key (teacher side
+            # keeps the official rule); student rows below the 1e-6 floor
+            # are counted separately — for them the counterfactual is NOT
+            # forward-equivalent (see unit_row_norm_key)
+            unit_key = unit_row_norm_key(cur_key.to(client.device))
+            n_student_rows_below_floor = int((kn_new < 1e-6).sum())
+            # protected-sample coverage of the reference set: near 1.0 ->
+            # the sample mask degenerates to a near-global constraint on
+            # surrogate data and protected-vs-unprotected comparisons carry
+            # no separation evidence
+            prot_coverage = (int(sample_prot.sum()) / n_actual
+                             if n_actual > 0 else float('nan'))
+
             # ---- T-a / T-b per tau ----
             for tau in temps:
                 log_ro = F.log_softmax(tau * sim_old, dim=1)
@@ -802,11 +870,40 @@ def main():
                     w_kl, p_js = float('nan'), float('nan')
                 u_js = (float(column_js_distance(ro, rn)[unprot_cols].mean())
                         if unprot_cols else float('nan'))
-                # analytic key gradients at this tau
-                kl_grad_prot = kl_key_grad(feat_new,
-                                           cur_key.to(client.device),
-                                           log_ro, tau,
-                                           sample_mask=sample_prot)
+                # analytic key gradients at this tau; the protected-sample
+                # KL gradient is first obtained as a FULL tensor so the
+                # cosine against the base training gradient reuses the same
+                # autograd call
+                g_kl_prot = kl_key_grad_full(
+                    feat_new, cur_key.to(client.device), log_ro, tau,
+                    sample_mask=sample_prot)
+                kl_grad_prot = (float(g_kl_prot.norm())
+                                if g_kl_prot is not None else float('nan'))
+                # gradient cosine cos(g_base, g_KL_prot): conflict (<0) /
+                # orthogonal (~0) / synergy (>0) between the compatibility
+                # constraint and the key's only continuous training channel
+                # (the instantaneous -0.1*pull + wd*K on one train batch)
+                if (g_kl_prot is not None and base_grad_norm > 0
+                        and kl_grad_prot > 0):
+                    grad_cos_base_kl = float(
+                        torch.dot(g_base.reshape(-1),
+                                  g_kl_prot.reshape(-1).to(g_base.device))
+                        / (base_grad_norm * kl_grad_prot))
+                else:
+                    grad_cos_base_kl = float('nan')
+                del g_kl_prot
+                # unit-row-norm counterfactual: STUDENT key rows rescaled
+                # to unit norm, teacher log_ro unchanged — isolates the
+                # 1/||k|| Jacobian amplification of l2_normalize from real
+                # constraint signal (NOT forward-equivalent for the
+                # n_student_rows_below_floor rows below the 1e-6 floor)
+                kl_grad_prot_unitnorm = kl_key_grad(
+                    feat_new, unit_key, log_ro, tau, sample_mask=sample_prot)
+                kl_grad_unitnorm_ratio = (
+                    kl_grad_prot / kl_grad_prot_unitnorm
+                    if (np.isfinite(kl_grad_prot)
+                        and np.isfinite(kl_grad_prot_unitnorm)
+                        and kl_grad_prot_unitnorm > 0) else float('nan'))
                 kl_grad_all = kl_key_grad(feat_new,
                                           cur_key.to(client.device),
                                           log_ro, tau)
@@ -902,6 +999,15 @@ def main():
                     "kl_grad_norm_prot": (f"{kl_grad_prot:.6e}"
                                           if np.isfinite(kl_grad_prot)
                                           else "nan"),
+                    "kl_grad_norm_prot_unitnorm": (
+                        f"{kl_grad_prot_unitnorm:.6e}"
+                        if np.isfinite(kl_grad_prot_unitnorm) else "nan"),
+                    "kl_grad_unitnorm_ratio": (
+                        f"{kl_grad_unitnorm_ratio:.6f}"
+                        if np.isfinite(kl_grad_unitnorm_ratio) else "nan"),
+                    "grad_cos_base_kl_prot": (
+                        f"{grad_cos_base_kl:.6f}"
+                        if np.isfinite(grad_cos_base_kl) else "nan"),
                     "kl_grad_norm_prot_featold": (
                         f"{kl_grad_prot_oldfeat:.6e}"
                         if np.isfinite(kl_grad_prot_oldfeat) else "nan"),
@@ -942,6 +1048,8 @@ def main():
                     "n_ref": n_actual,
                     "n_protected_slots": len(prot_cols),
                     "n_unprotected_slots": len(unprot_cols),
+                    "protected_sample_coverage": f"{prot_coverage:.6f}",
+                    "n_key_rows_below_1e-6_student": n_student_rows_below_floor,
                     "task_loss": f"{task_loss:.6f}",
                 })
 
@@ -965,6 +1073,8 @@ def main():
                 "key_row_norm_new_prot_mean": kn_new_prot_mean,
                 "key_row_norm_new_unprot_mean": kn_new_unprot_mean,
                 "n_key_rows_below_1e-6": n_below_floor,
+                "n_key_rows_below_1e-6_student": n_student_rows_below_floor,
+                "protected_sample_coverage": prot_coverage,
                 "task_loss": task_loss,
                 "base_grad_norm": base_grad_norm,
                 "pull_grad_norm": pull_grad_norm,
@@ -1047,6 +1157,11 @@ def main():
             "key_only_kl_mean": nmean(tau, "key_only_kl"),
             "key_only_kl_prot_mean": nmean(tau, "key_only_kl_prot"),
             "kl_grad_norm_prot_mean": kl_g,
+            "kl_grad_norm_prot_unitnorm_mean": nmean(
+                tau, "kl_grad_norm_prot_unitnorm"),
+            "kl_grad_unitnorm_ratio_mean": nmean(
+                tau, "kl_grad_unitnorm_ratio"),
+            "grad_cos_base_kl_prot_mean": nmean(tau, "grad_cos_base_kl_prot"),
             "kl_grad_norm_prot_featold_mean": kl_g_old,
             "kl_grad_norm_prot_floor_mean": kl_g_floor,
             "kl_grad_norm_all_mean": nmean(tau, "kl_grad_norm_all"),
@@ -1093,9 +1208,31 @@ def main():
     flip_ratio = (p_flip / u_flip
                   if np.isfinite(p_flip) and np.isfinite(u_flip) and u_flip > 0
                   else float('nan'))
-    separation_holds = bool(np.isfinite(p_flip) and np.isfinite(u_flip)
-                            and p_flip > u_flip)
-    if separation_holds:
+    # protected-sample coverage: near-total coverage degenerates the sample
+    # mask to a near-global constraint on surrogate data — the
+    # protected-vs-unprotected flip comparison then carries NO separation
+    # evidence (the unprotected group is a handful of samples) and must not
+    # be used to judge the mask
+    cov_per_client = [c["protected_sample_coverage"]
+                      for c in per_client.values()]
+    cov_mean = (float(np.nanmean(cov_per_client))
+                if cov_per_client else float('nan'))
+    mask_informative = bool(np.isfinite(cov_mean) and cov_mean <= 0.95)
+    separation_holds = (bool(np.isfinite(p_flip) and np.isfinite(u_flip)
+                             and p_flip > u_flip)
+                        if mask_informative else None)
+    if not mask_informative and np.isfinite(cov_mean):
+        sep_verdict = (
+            f"UNINFORMATIVE due to near-total protected coverage: "
+            f"{cov_mean:.1%} of reference samples route (old top-1) into "
+            f"protected slots, so the protected-sample constraint is "
+            f"effectively a GLOBAL routing constraint on surrogate data; "
+            f"the protected-vs-unprotected flip comparison (protected "
+            f"{p_flip:.3f} vs unprotected {u_flip:.3f}, unprotected "
+            f"n/client {n_unprot_samp}) carries no separation evidence — "
+            f"do NOT use it to judge the mask. Validate the mask IN "
+            f"TRAINING by whether the constraint improves OLD-task accuracy")
+    elif separation_holds:
         sep_verdict = (f"SEPARATION PRESENT: protected flip {p_flip:.3f} > "
                        f"unprotected {u_flip:.3f} (ratio "
                        f"{flip_ratio:.2f}x)")
@@ -1185,6 +1322,35 @@ def main():
         "than the pooled lambda (a ratio of client-mean gradient norms), "
         "and not the contribution rate of the federated-average gradient "
         "either")
+    notes.append(
+        "unit-row-norm counterfactual (kl_grad_norm_prot_unitnorm / "
+        "kl_grad_unitnorm_ratio): the STUDENT key rows are rescaled to unit "
+        "norm while the teacher keeps the official rule. For rows >= 1e-6 "
+        "the forward routing is EXACTLY unchanged (cosine routing depends "
+        "only on direction), so the gradient drop isolates the 1/||k|| "
+        "Jacobian amplification of l2_normalize — a parameterization "
+        "artifact, not constraint strength. Rows below the 1e-6 floor "
+        "(n_key_rows_below_1e-6_student) are NOT forward-equivalent under "
+        "the counterfactual (their official sims are shrunk by ||k||/1e-6; "
+        "the counterfactual restores full unit length and shifts the "
+        "softmax denominator), so no strict forward-equivalence claim is "
+        "made for them. A diagnostic of scale degeneracy only — NOT a "
+        "training reparameterization proposal")
+    notes.append(
+        "grad_cos_base_kl_prot: cosine between the instantaneous base key "
+        "gradient (-0.1*grad pull + wd*K on ONE train batch — the key's "
+        "ONLY continuous training channel; CE/InfoNCE pass no continuous "
+        "key gradient) and the protected-sample KL gradient. <0 conflict / "
+        "~0 orthogonal / >0 synergy. A one-batch snapshot, not a "
+        "training-averaged direction")
+    notes.append(
+        "protected_sample_coverage = n_prot_samples / n_ref: when the "
+        "client-mean coverage exceeds 0.95 the sample mask degenerates to "
+        "a near-global constraint on surrogate data and the "
+        "protected-vs-unprotected flip comparison is UNINFORMATIVE — the "
+        "small number of historical protected slots absorbing nearly all "
+        "surrogate routing mass is itself a strong routing-concentration "
+        "observation, but it is NOT mask separation evidence")
     if a2_run_drift_suppressed:
         notes.append(
             f"this is a key-frozen A2 run (arm={a2_arm}): protected key rows "
@@ -1290,6 +1456,15 @@ def main():
                 "key_norm_floor": KEY_NORM_FLOOR,
                 "lambda_grad_per_client_min": lam_grad_minmax[0],
                 "lambda_grad_per_client_max": lam_grad_minmax[1],
+                "kl_grad_norm_prot_unitnorm_mean":
+                    rec["kl_grad_norm_prot_unitnorm_mean"],
+                "kl_grad_unitnorm_ratio_mean":
+                    rec["kl_grad_unitnorm_ratio_mean"],
+                "grad_cos_base_kl_prot_mean":
+                    rec["grad_cos_base_kl_prot_mean"],
+                "n_key_rows_below_1e-6_student_total": int(sum(
+                    c["n_key_rows_below_1e-6_student"]
+                    for c in per_client.values())),
                 "kl_rowgrad_top10_sq_share_pooled": pooled_top10_sq,
                 "kl_rowgrad_prot_rows_sq_share_pooled": pooled_prot_sq,
                 "kl_rowgrad_top10_share_pooled": pooled_top10_l1,
@@ -1331,11 +1506,22 @@ def main():
                 "deployment_valid": not a2_run_drift_suppressed,
                 "effective": kl_effective,
                 "verdict": kl_verdict,
+                "a3_kl_first_version_recommendation": (
+                    "detach the student-side features in the compatibility "
+                    "term — R_new = softmax(tau * sim(sg(z_new), K_new)) — "
+                    "so the KL updates ONLY the key; this matches the "
+                    "key-only lambda_grad calibration above (no prompt-side "
+                    "gradient was measured, so no prompt-update lambda can "
+                    "be inferred from these numbers)"),
             },
             "mask_separation": {
                 "protected_flip_rate_mean": p_flip,
                 "unprotected_flip_rate_mean": u_flip,
                 "flip_ratio": flip_ratio,
+                "protected_sample_coverage_mean": cov_mean,
+                "protected_sample_coverage_per_client": cov_per_client,
+                "coverage_uninformative_threshold": 0.95,
+                "informative": mask_informative,
                 "n_prot_samples_per_client": n_prot_samp,
                 "n_unprot_samples_per_client": n_unprot_samp,
                 "flip_rate_small_margin_mean": flip_small,
@@ -1414,6 +1600,25 @@ def main():
           f"{rec['lambda_grad_floor']:.2e}"
           if np.isfinite(rec['lambda_grad_floor'])
           else "KL floored gradient: undefined")
+    print(f"unit-row-norm counterfactual (student key rows rescaled to unit "
+          f"norm, teacher unchanged; forward-equivalent only for rows >= "
+          f"1e-6 — student rows below floor: "
+          f"{int(sum(c['n_key_rows_below_1e-6_student'] for c in per_client.values()))}): "
+          f"||grad_K KL_prot||="
+          f"{rec['kl_grad_norm_prot_unitnorm_mean']:.3e} vs official "
+          f"parameterization {rec['kl_grad_norm_prot_mean']:.3e} -> "
+          f"amplification ratio {rec['kl_grad_unitnorm_ratio_mean']:.1f}x "
+          f"(how much of the official KL gradient is 1/||k|| normalization "
+          f"amplification rather than constraint signal)"
+          if np.isfinite(rec['kl_grad_unitnorm_ratio_mean'])
+          else "unit-row-norm counterfactual: undefined (empty mask)")
+    print(f"gradient cosine cos(g_base, g_KL_prot) mean="
+          f"{rec['grad_cos_base_kl_prot_mean']:.3f}  "
+          f"(<0 conflict / ~0 orthogonal / >0 synergy; g_base = "
+          f"instantaneous -0.1*pull + wd*K on one train batch, the key's "
+          f"only continuous training signal)"
+          if np.isfinite(rec['grad_cos_base_kl_prot_mean'])
+          else "gradient cosine: undefined")
     if (np.isfinite(rec['lambda_grad'])
             and np.isfinite(rec['lambda_grad_featold'])
             and rec['lambda_grad_featold'] > 0):
@@ -1474,8 +1679,17 @@ def main():
           "loss passes through the same normalizer and does NOT escape this "
           "scale issue")
     print(f"verdict: {kl_verdict}")
+    print("A3-KL first-version recommendation: detach the student-side "
+          "features (R_new = softmax(tau*sim(sg(z_new), K_new))) so the "
+          "compatibility loss updates ONLY the key — consistent with the "
+          "key-only lambda_grad calibration above; no prompt-update lambda "
+          "can be inferred from these numbers")
 
     print(f"\n===== T-c: protection-mask separation (at tau={rec_tau:g}) =====")
+    print(f"protected sample coverage: mean={cov_mean:.1%} per client "
+          f"{['%.3f' % c for c in cov_per_client]}  "
+          f"(coverage > {0.95:.2f} -> the protected-vs-unprotected flip "
+          f"comparison below is UNINFORMATIVE)")
     print(f"top-1 flip rate: protected={p_flip:.3f} (n/client {n_prot_samp})  "
           f"unprotected={u_flip:.3f} (n/client {n_unprot_samp})  "
           f"ratio={flip_ratio:.2f}x")
