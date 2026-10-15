@@ -1073,9 +1073,11 @@ def main():
             and np.isfinite(rec['lambda_grad_featold'])
             and rec['lambda_grad_featold'] > 0):
         lam_ratio = rec['lambda_grad'] / rec['lambda_grad_featold']
+        lever = ('weaker' if lam_ratio > 1.1
+                 else 'stronger' if lam_ratio < 0.9 else 'about equal')
         print(f"lambda ratio (deployment/isolation) {lam_ratio:.2f}x: the "
               f"deployment constraint's lever on the key is "
-              f"{'weaker' if lam_ratio > 1 else 'no weaker'} than under "
+              f"{lever} than under "
               f"undrifted prompts — use the LARGER lambda as the sweep "
               f"center. Factor attribution is carried by the drift "
               f"decomposition above, not by this ratio")
