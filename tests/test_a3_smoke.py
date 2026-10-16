@@ -1,10 +1,11 @@
 """A3-KL v1 smoke test (GPU, short runs).
 
-Verifies the six properties required before any long A3 run:
+Verifies the eight properties required before any long A3 run:
 
-  S1. A3 OFF == frozen fedta baseline: a plain fedta run still succeeds and
-      its checkpoints carry NO a3_state key (schema invariance; every A3
-      code path is gated on method == 'fedta_a3').
+  S1. A3 OFF schema invariance: a plain fedta run still succeeds and its
+      checkpoints carry NO a3_state key (every A3 code path is gated on
+      method == 'fedta_a3'). NOT a trajectory-equivalence test — that is
+      the T0/Gate-0 regression suite's job.
   S2. task 0: A3 inactive — task_00_end.pth a3_state has an empty bank and
       the log prints the task-0 inactive line (compat loss never added).
   S3. task 1+: the reference bank exists (256 indices, teacher probs
@@ -18,6 +19,14 @@ Verifies the six properties required before any long A3 run:
       torch.Generator seeded 9700 + 100*client_id + task_id).
   S6. resume: resuming mid-task from latest.pth restores the SAME reference
       bank (indices equal, teacher probs bit-identical); no re-sampling.
+  S7. KL direction: with the key perturbed off the teacher fixed point, the
+      compat loss equals the explicit forward KL sum(r_old*(log r_old -
+      log r_new))/B and is NOT the reverse KL — S3's "> 0" alone cannot
+      distinguish the two directions.
+  S8. fetch immutability: _a3_fetch_ref_images reads surro.data[raw_idx]
+      (byte-equal to a direct read) and is unchanged after getTrainData()
+      re-orders the mutable TrainData buffer (as kd_fusion_prompt does
+      every round).
 
 Usage (from repo root, on the server):
   python tests/test_a3_smoke.py
@@ -232,6 +241,92 @@ def main():
     print("[PASS] S4: compat-only backward -> key.grad != 0; "
           "anchor / head / vit-prompt / stored-prompt grads all None")
 
+    # S7: KL direction — numerical assertion KL(R_old || R_new). At the
+    # teacher fixed point (unperturbed key, identical prompts) both KL
+    # directions are ~0, and for WEAK perturbations they stay nearly equal
+    # (KL is symmetric to second order), so the key is perturbed with
+    # progressively stronger directional noise until the two directions
+    # separate by >= 5%; only then is loss-vs-forward-KL meaningful.
+    # (Row scaling alone is invisible to l2_normalize; row PERMUTATION is
+    # also useless — it permutes r_new columns and leaves fwd ~= rev.)
+    key_backup = c0.model.key.detach().clone()
+    bs = c0.a3_ref_batch_size
+    pert_gen = torch.Generator().manual_seed(20261015)
+    noise = torch.randn(c0.model.key.shape, generator=pert_gen,
+                        dtype=key_backup.dtype).to(key_backup.device)
+    unit = float(key_backup.abs().mean())
+
+    def _fwd_rev_kl():
+        loss_val = float(c0._a3_compat_loss(0))
+        with torch.no_grad():
+            raw = c0._a3_ref_raw[:bs]
+            x = c0._a3_fetch_ref_images(raw).to(c0.device)
+            out = c0.original_model(x)
+            cls_features = out['pre_logits']
+            out = c0.vit(x, task_id=c0.task_id, cls_features=cls_features,
+                         train=True)
+            feat = out['feat'].to(c0.device)
+            x_embed_norm = c0.model.l2_normalize(feat, dim=1)
+            key_rows = c0.model.key.reshape(-1, c0.model.key_size)
+            key_norm = c0.model.l2_normalize(key_rows, dim=1)
+            sim = torch.matmul(
+                x_embed_norm, key_norm.t().to(x_embed_norm.device))
+            log_r_new = torch.log_softmax(c0.a3_tau * sim, dim=1)
+            r_new = log_r_new.exp()
+            r_old = c0._a3_teacher_probs[:bs].to(c0.device)
+            log_r_old = r_old.clamp_min(1e-30).log()
+            # KL(P||Q) = sum P * (log P - log Q), mean over the batch
+            kl_fwd = (r_old * (log_r_old - log_r_new)).sum(dim=1).mean()
+            kl_rev = (r_new * (r_new.clamp_min(1e-30).log() - log_r_old)
+                      ).sum(dim=1).mean()
+        return loss_val, float(kl_fwd), float(kl_rev)
+
+    chosen = None
+    for scale in (3.0, 10.0, 1.0):
+        c0.model.key.data.copy_(key_backup)
+        c0.model.key.data.add_(noise * (scale * unit))
+        loss_val, fwd, rev = _fwd_rev_kl()
+        if fwd > 1e-2 and abs(fwd - rev) > 0.05 * max(fwd, rev):
+            chosen = (loss_val, fwd, rev)
+            break
+    c0.model.key.data.copy_(key_backup)
+    assert chosen is not None, (
+        f"no perturbation scale separated the KL directions "
+        f"(last: loss={loss_val:.6f}, fwd={fwd:.6f}, rev={rev:.6f})")
+    loss_val, fwd, rev = chosen
+    tol = 1e-4 + 1e-3 * abs(fwd)
+    assert abs(loss_val - fwd) < tol, (
+        f"compat loss {loss_val:.6f} != forward KL {fwd:.6f} "
+        f"(KL(R_old||R_new) direction is wrong?)")
+    assert abs(loss_val - rev) > abs(loss_val - fwd) + 0.5 * abs(fwd - rev), (
+        f"compat loss {loss_val:.6f} is closer to the REVERSE KL "
+        f"{rev:.6f} than to the forward KL {fwd:.6f}")
+    print(f"[PASS] S7: compat loss == KL(R_old||R_new) numerically "
+          f"(loss={loss_val:.6f}, fwd={fwd:.6f}, rev={rev:.6f}; "
+          f"the two directions are clearly distinguishable)")
+
+    # S8: fetch immutability — images come from surro.data[raw_idx], never
+    # from the mutable TrainData buffer that getTrainData() re-orders.
+    from PIL import Image
+    probe = c0._a3_ref_raw[:4]
+    imgs_before = c0._a3_fetch_ref_images(probe)
+    direct = torch.stack(
+        [surro.trans(Image.fromarray(surro.data[i]).convert('RGB'))
+         for i in probe])
+    assert torch.equal(imgs_before, direct), (
+        "_a3_fetch_ref_images does not read surro.data[raw_idx] "
+        "(byte-inequal to a direct immutable-array read)")
+    # force the TrainData reorder kd_fusion_prompt performs every round
+    surro.getTrainData(list(reversed(classes)))
+    assert int(surro.TrainLabels[0]) == int(classes[-1]), (
+        "getTrainData did not reorder TrainData — S8 would be vacuous")
+    imgs_after = c0._a3_fetch_ref_images(probe)
+    assert torch.equal(imgs_before, imgs_after), (
+        "_a3_fetch_ref_images output changed after a TrainData reorder "
+        "(the bank silently follows the mutable buffer)")
+    print("[PASS] S8: fetch reads immutable surro.data[raw_idx]; unchanged "
+          "after a getTrainData reorder of the mutable TrainData buffer")
+
     # ---- S6: mid-task resume must restore the identical bank ----
     ckpt_r2 = torch_load_compat(run_a3 / "checkpoints" /
                                 f"round_{n_rounds_a - 1:04d}.pth")
@@ -258,7 +353,7 @@ def main():
     print("[PASS] S6: mid-task resume restored bit-identical teacher targets "
           "and the same reference indices (no re-sampling)")
 
-    print("\nRESULT: PASS (S1-S6)")
+    print("\nRESULT: PASS (S1-S8)")
 
 
 if __name__ == "__main__":
