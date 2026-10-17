@@ -519,6 +519,103 @@ class Client_DF(object):
         return F.kl_div(log_r_new, teacher, reduction='batchmean')
 
 
+    def _phase2_train_step(self, input, target, round, args, criterion,
+                           optimizer, a3_active=False, a3_step=0,
+                           a3_n_batches=0):
+        """OFFICIAL phase-2 per-batch update, extracted verbatim from
+        train(): forward (no_grad original_model + vit) -> base loss ->
+        method regularizer (A3 KL / A4 direction) -> zero_grad/backward/
+        step -> A2 post-step restore.
+
+        Extracted (not copied) so that diagnostics/a4_gate_tests.py S6/S8
+        exercise THE ACTUAL production step — including any post-step
+        logic that may live here in the future — instead of a gate-side
+        re-implementation that could drift from train().
+
+        Returns (base_loss, extra_loss, extra_kind) as detached floats;
+        base_loss is the OFFICIAL loss BEFORE the method regularizer;
+        extra_kind is None / 'kl' / 'dir'. The A3/A4 per-epoch logging
+        accumulators stay in train(); the a3_step cursor is owned by the
+        caller (it advances every batch whether or not the KL was
+        applied this step)."""
+        with torch.no_grad():
+            if self.original_model is not None:
+                output = self.original_model(input)
+                cls_features = output['pre_logits']
+                output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True)
+        pre, output_mixed, pull_off2 = self.model(output['feat'].to(self.device), target.to(self.device))
+        logits = pre
+        # NCE loss
+        if self.global_protos is None:
+            loss_InfoNCE = 0
+        else:
+            count = 0
+            loss_InfoNCE = None
+            for i, label in enumerate(target):
+                if label.item() in self.global_protos.keys():
+                    count += 1
+                    feature = output_mixed[i].unsqueeze(0)
+                    loss_instance = self.calculate_infonce(feature,label.item(),(round+1)%self.task_per_global_epoch==0)
+                    if loss_InfoNCE is None:
+                        loss_InfoNCE = loss_instance
+                    else:
+                        loss_InfoNCE += loss_instance
+            if count != 0:
+                loss_InfoNCE = loss_InfoNCE / count
+            else:
+                loss_InfoNCE = 0
+        loss_InfoNCE = loss_InfoNCE
+
+        mask = self.current_class
+        not_mask = np.setdiff1d(np.arange(args.nb_classes), mask)
+        not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
+        logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
+
+        loss = criterion(logits, target) + 0.2*self.task_per_global_epoch *loss_InfoNCE - 0.1*pull_off2
+
+        if round==16 and self.id==0:
+            print(loss_InfoNCE)
+            print(criterion(logits, target))
+
+        base_f = float(loss.detach())
+        extra, extra_kind = None, None
+        # Phase 5 A3 (fedta_a3): add the routing-consistency KL
+        # KL(R_old || R_new) on one fixed public reference batch to
+        # the OFFICIAL phase-2 loss. The official loss / optimizer /
+        # weight decay are untouched; only the key receives
+        # compatibility gradient (features detached inside).
+        if a3_active and a3_step % self.a3_compat_every == 0:
+            batch_idx = a3_step % a3_n_batches
+            loss_kl = self._a3_compat_loss(batch_idx)
+            loss = loss + self.a3_lambda * loss_kl
+            extra, extra_kind = float(loss_kl.detach()), 'kl'
+
+        # Phase 6 A4 (fedta_a4): add the normalized-direction
+        # preservation term on the protected key rows to the OFFICIAL
+        # phase-2 loss. The official loss / optimizer / weight decay are
+        # untouched; the anchor rows never appear in the regularizer
+        # (fully FedTA-trained), and the radial (norm) direction of the
+        # protected key rows is left free (routing uses normalized keys
+        # only). Same predicate as train()'s a4_active.
+        a4_active = (self.method == 'fedta_a4'
+                     and self._a2_protected_slots is not None
+                     and self._a2_key_snapshot is not None
+                     and self._a2_task_id == self.task_id)
+        if a4_active:
+            loss_dir = self._a4_dir_loss()
+            loss = loss + self.a4_lambda * loss_dir
+            extra, extra_kind = float(loss_dir.detach()), 'dir'
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        # Phase 4 A2: restore protected key/anchor rows after the
+        # Tail_Anchor step. No-op for the frozen fedta baseline.
+        if self.method == 'fedta_a2':
+            self._a2_post_step_restore()
+        return base_f, extra, extra_kind
+
+
     def train(self, round, args):
         self.original_model.eval()
 
@@ -606,84 +703,24 @@ class Client_DF(object):
                 input, target = Variable(input, requires_grad=False).to(self.device, non_blocking=True), target.long().to(
                     self.device, non_blocking=True)
 
-                with torch.no_grad():
-                    if self.original_model is not None:
-                        output = self.original_model(input)
-                        cls_features = output['pre_logits']
-                        output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True)
-                pre, output_mixed, pull_off2 = self.model(output['feat'].to(self.device), target.to(self.device))
-                logits = pre
-                # NCE loss
-                if self.global_protos is None:
-                    loss_InfoNCE = 0
-                else:
-                    count = 0
-                    loss_InfoNCE = None
-                    for i, label in enumerate(target):
-                        if label.item() in self.global_protos.keys():
-                            count += 1
-                            feature = output_mixed[i].unsqueeze(0)
-                            loss_instance = self.calculate_infonce(feature,label.item(),(round+1)%self.task_per_global_epoch==0)
-                            if loss_InfoNCE is None:
-                                loss_InfoNCE = loss_instance
-                            else:
-                                loss_InfoNCE += loss_instance
-                    if count != 0:
-                        loss_InfoNCE = loss_InfoNCE / count
-                    else:
-                        loss_InfoNCE = 0
-                loss_InfoNCE = loss_InfoNCE
-
-                mask = self.current_class
-                not_mask = np.setdiff1d(np.arange(args.nb_classes), mask)
-                not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
-                logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
-
-                loss = criterion(logits, target) + 0.2*self.task_per_global_epoch *loss_InfoNCE - 0.1*pull_off2
-
-                if round==16 and self.id==0:
-                    print(loss_InfoNCE)
-                    print(criterion(logits, target))
-
-                # Phase 5 A3 (fedta_a3): add the routing-consistency KL
-                # KL(R_old || R_new) on one fixed public reference batch to
-                # the OFFICIAL phase-2 loss. The official loss / optimizer /
-                # weight decay are untouched; only the key receives
-                # compatibility gradient (features detached inside).
-                if a3_active and a3_step % self.a3_compat_every == 0:
-                    batch_idx = a3_step % a3_n_batches
-                    loss_kl = self._a3_compat_loss(batch_idx)
-                    if a3_epoch_acc is not None:
-                        a3_epoch_acc["base"].append(float(loss.detach()))
-                        a3_epoch_acc["kl"].append(float(loss_kl.detach()))
-                        a3_epoch_acc["lam_kl"].append(
-                            float(self.a3_lambda) * float(loss_kl.detach()))
-                    loss = loss + self.a3_lambda * loss_kl
+                # OFFICIAL phase-2 single-batch update (forward -> base
+                # loss -> A3/A4 regularizer -> optimizer step -> A2
+                # post-step restore), shared verbatim with the A4 gate
+                base_f, extra_f, extra_kind = self._phase2_train_step(
+                    input, target, round, args, criterion, optimizer,
+                    a3_active=a3_active, a3_step=a3_step,
+                    a3_n_batches=a3_n_batches)
                 a3_step += 1
-
-                # Phase 6 A4 (fedta_a4): add the normalized-direction
-                # preservation term on the protected key rows to the
-                # OFFICIAL phase-2 loss. The official loss / optimizer /
-                # weight decay are untouched; the anchor rows never appear
-                # in the regularizer (fully FedTA-trained), and the radial
-                # (norm) direction of the protected key rows is left free
-                # (routing uses normalized keys only).
-                if a4_active:
-                    loss_dir = self._a4_dir_loss()
-                    if a4_epoch_acc is not None:
-                        a4_epoch_acc["base"].append(float(loss.detach()))
-                        a4_epoch_acc["dir"].append(float(loss_dir.detach()))
-                        a4_epoch_acc["lam_dir"].append(
-                            float(self.a4_lambda) * float(loss_dir.detach()))
-                    loss = loss + self.a4_lambda * loss_dir
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                # Phase 4 A2: restore protected key/anchor rows after the
-                # Tail_Anchor step. No-op for the frozen fedta baseline.
-                if self.method == 'fedta_a2':
-                    self._a2_post_step_restore()
+                if a3_epoch_acc is not None and extra_kind == 'kl':
+                    a3_epoch_acc["base"].append(base_f)
+                    a3_epoch_acc["kl"].append(extra_f)
+                    a3_epoch_acc["lam_kl"].append(
+                        float(self.a3_lambda) * extra_f)
+                if a4_epoch_acc is not None and extra_kind == 'dir':
+                    a4_epoch_acc["base"].append(base_f)
+                    a4_epoch_acc["dir"].append(extra_f)
+                    a4_epoch_acc["lam_dir"].append(
+                        float(self.a4_lambda) * extra_f)
 
             # Phase 5 A3: per-local-epoch logging (means over this epoch's
             # constrained steps; teacher top1 confidence is a fixed property

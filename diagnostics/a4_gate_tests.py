@@ -70,7 +70,7 @@ import torch
 import torch.nn.functional as F
 
 from diag_utils import load_args_from_run_dir, resolve_checkpoint
-from a4_lambda_probe import phase2_forward_loss, prepare_probe_task
+from a4_lambda_probe import prepare_probe_task
 from runtime_utils import atomic_save_checkpoint
 
 # FP32 tolerances (GPT round-3 spec): the snapshot-point zeros are exact
@@ -150,14 +150,17 @@ def fetch_fixed_batches(client, run_args, n):
 
 
 def a4_step(client, run_args, round_id, batch, optimizer):
-    """One REAL A4 phase-2 step: official base loss + lambda * L_dir."""
+    """One PRODUCTION A4 phase-2 step: Client_DF._phase2_train_step is
+    the actual per-batch update train() itself runs (official forward,
+    base loss, A4 direction term, optimizer step, post-step logic) —
+    the gate deliberately does NOT re-implement the step, so a future
+    regression (e.g. a hidden hard-restore sneaking back into train())
+    would be caught by S6 instead of silently passing a gate-side
+    copy."""
     input, target = batch
-    loss = phase2_forward_loss(client, run_args, round_id, input, target)
-    loss = loss + client.a4_lambda * client._a4_dir_loss()
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    return float(loss.detach())
+    criterion = torch.nn.CrossEntropyLoss().to(client.device)
+    return client._phase2_train_step(
+        input, target, round_id, run_args, criterion, optimizer)
 
 
 def main():
@@ -337,8 +340,9 @@ def main():
               "clients_checked": 0, "all_equal": True}
     for cid in range(server.client_num):
         ca, cb = server.clients[cid], server_b.clients[cid]
-        if ca._a2_protected_slots is None and cb._a2_protected_slots is None:
-            continue
+        # EVERY client is compared, even those without a protection set:
+        # S7's claim is about the RNG ordering of the train/test split
+        # itself, which must hold for all clients regardless
         detail["clients_checked"] += 1
         train_eq = (ca.data_split_indices[args.gate_task]["train"]
                     == cb.data_split_indices[args.gate_task]["train"])
@@ -406,6 +410,11 @@ def main():
                          "round must stay inside gate_task)")
     next_round = gate_round + 1
     c8.update_data(round=next_round, args=run_args)
+    if c8.task_id != args.gate_task:
+        raise SystemExit(
+            f"S8: update_data({next_round}) moved Path A to task "
+            f"{c8.task_id}, expected {args.gate_task} — task scheduler "
+            f"changed; the resumed round would cross a task boundary")
     optA = torch.optim.Adam(c8.model.parameters(), lr=c8.lr,
                             weight_decay=1e-03)
     a4_step(c8, run_args, next_round, batches8[2], optA)
@@ -425,6 +434,11 @@ def main():
     c8d.model.to(c8d.device)
     c8d.vit.to(c8d.device)
     c8d.update_data(round=next_round, args=run_args)
+    if c8d.task_id != args.gate_task:
+        raise SystemExit(
+            f"S8: update_data({next_round}) moved Path B to task "
+            f"{c8d.task_id}, expected {args.gate_task} — task scheduler "
+            f"changed; the resumed round would cross a task boundary")
     optB = torch.optim.Adam(c8d.model.parameters(), lr=c8d.lr,
                             weight_decay=1e-03)
     a4_step(c8d, run_args, next_round, batches8[2], optB)
