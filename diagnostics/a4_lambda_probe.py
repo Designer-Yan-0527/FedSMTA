@@ -326,6 +326,33 @@ def summarize(reports):
     return rec
 
 
+def prepare_probe_task(server, run_args, probe_round, probe_task):
+    """Stage 1: EVERY client completes the task transition first.
+
+    Mirrors Server_DF.train_clients(): all update_data() calls (which
+    consume the shared global RNG via random_split) happen BEFORE any
+    local training. Interleaving probe training with later clients'
+    update_data would shift their RNG stream and silently change their
+    train split -> protected set -> gradients.
+
+    Exported as a function (NOT inlined in main) so that
+    diagnostics/a4_gate_tests.py S7 can call THE ACTUAL probe stage-1
+    code path and verify it equals the official server transition —
+    rather than re-implementing it and testing a copy.
+    """
+    for cid in range(server.client_num):
+        client = server.clients[cid]
+        client.update_data(round=probe_round, args=run_args)
+        if client.task_id != probe_task:
+            raise SystemExit(
+                f"client {cid}: expected task_id {probe_task} after "
+                f"update_data, got {client.task_id} (bad checkpoint task?)")
+        # A4 protection set + task-start key snapshot (RNG-neutral,
+        # idempotent; a2_arm forced to 'key' regardless of the source run)
+        client.a2_arm = 'key'
+        client._a2_init_task_protection(run_args)
+
+
 def main():
     args = parse_args()
     probe_steps = sorted({int(s) for s in args.probe_steps.split(",")})
@@ -342,23 +369,8 @@ def main():
     client_ids = (list(range(server.client_num)) if args.clients == "all"
                   else [int(c) for c in args.clients.split(",")])
 
-    # ---- stage 1: EVERY client completes the task transition first ----
-    # Mirrors Server_DF.train_clients(): all update_data() calls (which
-    # consume the shared global RNG via random_split) happen BEFORE any
-    # local training. Interleaving probe training with later clients'
-    # update_data would shift their RNG stream and silently change their
-    # train split -> protected set -> gradients.
-    for cid in range(server.client_num):
-        client = server.clients[cid]
-        client.update_data(round=probe_round, args=run_args)
-        if client.task_id != args.probe_task:
-            raise SystemExit(
-                f"client {cid}: expected task_id {args.probe_task} after "
-                f"update_data, got {client.task_id} (bad checkpoint task?)")
-        # A4 protection set + task-start key snapshot (RNG-neutral,
-        # idempotent; a2_arm forced to 'key' regardless of the source run)
-        client.a2_arm = 'key'
-        client._a2_init_task_protection(run_args)
+    # ---- stage 1: every client transitions BEFORE any probe training ----
+    prepare_probe_task(server, run_args, probe_round, args.probe_task)
 
     reports = []
     for cid in client_ids:

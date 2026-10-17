@@ -19,7 +19,9 @@ Gates:
      implemented loss equals an INDEPENDENTLY-coded reference
      2*(1-cos) formula (no shared helpers — a bug must not verify itself)
   S4 gradient scope: backward(_a4_dir_loss()) touches ONLY the protected
-     key rows: unprotected key rows, anchor_pool, head all zero/None
+     key rows: unprotected key rows, anchor_pool, head AND every
+     trainable ViT/prompt parameter (client.vit — prompts do not live
+     in the Tail_Anchor model) all zero/None
   S5 tangential gradient: per protected row |<g_dir, k_hat>|/|g_dir| —
      the normalization Jacobian (I - k_hat k_hat^T)/||k|| must project
      g_dir onto the tangent space (max radial leakage < 1e-5; zero-grad
@@ -27,11 +29,13 @@ Gates:
   S6 soft-not-hard preservation: one REAL optimizer step on
      base + lambda*L_dir moves BOTH the protected key rows (no hidden
      post-step restore) and the anchor (plasticity preserved)
-  S7 task-transition equivalence: a SECOND independent bootstrap + the
-     server-ordered update_data pass must reproduce, per client, EXACTLY
-     the same train/test split indices, protected slots and key snapshot
-     (closes the RNG-ordering question: compared by value, not by
-     control-flow reasoning)
+  S7 task-transition equivalence: the OFFICIAL server-ordered transition
+     (update_data; protection init runs inside it on the task switch) vs
+     THE ACTUAL probe stage-1 (a4_lambda_probe.prepare_probe_task,
+     imported and invoked — not a re-implementation), compared per
+     client on train/test split indices, protected slots and key
+     snapshot by VALUE (closes the RNG-ordering question and would catch
+     any future regression of the probe's ordering)
   S8 resume equivalence: fixed-batch trajectory
        step1, step2 | save -> reload -> fresh-optimizer step3
      vs
@@ -63,7 +67,7 @@ import torch
 import torch.nn.functional as F
 
 from diag_utils import load_args_from_run_dir, resolve_checkpoint
-from a4_lambda_probe import phase2_forward_loss
+from a4_lambda_probe import phase2_forward_loss, prepare_probe_task
 from runtime_utils import atomic_save_checkpoint
 
 # FP32 tolerances (GPT round-3 spec): the snapshot-point zeros are exact
@@ -199,10 +203,15 @@ def main():
     client._a2_init_task_protection(run_args)
     ok1 = (torch.equal(slots1, client._a2_protected_slots)
            and torch.equal(snap1, client._a2_key_snapshot))
-    gate("S1 protected-set identity", ok1, {
+    gate("S1 shared protection-path identity", ok1, {
         "n_protected": int(slots1.numel()),
         "slots_equal": bool(torch.equal(slots1, client._a2_protected_slots)),
         "snapshot_equal": bool(torch.equal(snap1, client._a2_key_snapshot)),
+        "note": "A2-key and A4 intentionally share the same protection "
+                "initializer (_a2_init_task_protection, a2_arm='key'); "
+                "this gate verifies exact deterministic re-initialization "
+                "on the shared path, NOT a cross-method equivalence "
+                "between two independent implementations",
     })
 
     # ---------------- S2: zero at the snapshot point ---------------------
@@ -236,6 +245,7 @@ def main():
 
     # ---------------- S4: gradient scope ---------------------------------
     client.model.zero_grad()
+    client.vit.zero_grad()
     client._a4_dir_loss().backward()
     g = key.grad.detach()
     prot_max = float(g[slots].abs().max())
@@ -249,13 +259,24 @@ def main():
     for pn, pm in client.model.named_parameters():
         if pm.grad is not None and not pn.startswith("key"):
             non_key_max = max(non_key_max, float(pm.grad.abs().max()))
+    # prompts / ViT live in client.vit, NOT in the Tail_Anchor model —
+    # A4 must never touch them; check every trainable ViT parameter
+    vit_max = 0.0
+    n_vit_trainable = 0
+    for pm in client.vit.parameters():
+        if pm.requires_grad:
+            n_vit_trainable += 1
+            if pm.grad is not None:
+                vit_max = max(vit_max, float(pm.grad.abs().max()))
     gate("S4 gradient scope",
          prot_max > 0 and unprot_max == 0 and anchor_max == 0
-         and non_key_max == 0, {
+         and non_key_max == 0 and vit_max == 0, {
              "protected_key_grad_max": prot_max,
              "unprotected_key_grad_max": unprot_max,
              "anchor_grad_max": anchor_max,
              "non_key_param_grad_max": non_key_max,
+             "vit_prompt_grad_max": vit_max,
+             "n_vit_trainable_params": n_vit_trainable,
          })
 
     # ---------------- S5: tangential gradient ----------------------------
@@ -299,10 +320,19 @@ def main():
          })
 
     # ---------------- S7: task-transition equivalence --------------------
+    # Path A = the OFFICIAL transition (server-ordered update_data; the
+    #          protection init runs inside update_data on the task switch
+    #          — exactly what Server_DF.train_clients() triggers)
+    # Path B = THE ACTUAL probe stage-1 function (prepare_probe_task,
+    #          imported from a4_lambda_probe — not a re-implementation),
+    #          so a future regression of the probe's ordering would be
+    #          caught here, not silently pass
     _, server_b = build_gate_server(
         args.run_dir, ckpt, device=args.device, data_path=args.data_path)
-    server_task_transition(server_b, run_args, gate_round)
-    detail = {"clients_checked": 0, "all_equal": True}
+    prepare_probe_task(server_b, run_args, gate_round, args.gate_task)
+    detail = {"path_b": "a4_lambda_probe.prepare_probe_task (actual "
+                        "probe stage-1)",
+              "clients_checked": 0, "all_equal": True}
     for cid in range(server.client_num):
         ca, cb = server.clients[cid], server_b.clients[cid]
         if ca._a2_protected_slots is None and cb._a2_protected_slots is None:
@@ -343,19 +373,28 @@ def main():
     c8.vit.to(c8.device)
     batches8 = fetch_fixed_batches(c8, run_args, 3)
 
-    # shared prefix: two steps on one optimizer (a "round"), then save a
-    # round-boundary-style checkpoint of the WHOLE server to a temp dir
+    # shared prefix: two steps on one optimizer simulate completing the
+    # FIRST ROUND of gate_task; save a round-boundary checkpoint of the
+    # WHOLE server to a temp dir. round_id = gate_round (completed round
+    # belongs to gate_task, matching the state being saved — a checkpoint
+    # labeled gate_round-1 would claim the previous task's last round
+    # while holding gate_task state, a state that never exists in
+    # production). server.task_id is set to match the simulated round
+    # completion (train_clients updates it when the round's task begins).
     opt8 = torch.optim.Adam(c8.model.parameters(), lr=c8.lr,
                             weight_decay=1e-03)
     a4_step(c8, run_args, gate_round, batches8[0], opt8)
     a4_step(c8, run_args, gate_round, batches8[1], opt8)
+    server_b.task_id = args.gate_task
     tmp_dir = tempfile.mkdtemp(prefix="a4_gate_s8_")
     tmp_ckpt = str(Path(tmp_dir) / "s8_round_boundary.pth")
-    atomic_save_checkpoint(server_b.build_checkpoint(gate_round - 1),
+    atomic_save_checkpoint(server_b.build_checkpoint(gate_round),
                            tmp_ckpt)
 
     # Path A: continuous — fresh per-round optimizer (official resume
-    # semantics: train() rebuilds Adam every round), step3 in memory
+    # semantics: train() rebuilds Adam every round; requires
+    # global_epoch >= 2 so gate_round+1 is still inside gate_task),
+    # step3 in memory
     optA = torch.optim.Adam(c8.model.parameters(), lr=c8.lr,
                             weight_decay=1e-03)
     a4_step(c8, run_args, gate_round, batches8[2], optA)
