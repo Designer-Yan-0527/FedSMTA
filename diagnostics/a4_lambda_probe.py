@@ -41,10 +41,13 @@ Protocol (probe state is DISCARDED, never polluting a real run):
                   INSIDE no_grad exactly as train()) and Adam over
                   model.parameters(), for max_steps steps;
   4. at the probe steps (default 1/5/20, AFTER the step's update), the
-     measurement uses n_measure INDEPENDENT batches (never the batch that
+     measurement uses n_measure batches drawn from a SEPARATE DataLoader
+     instance (an independent shuffle RNG stream): never the batch that
      just produced the displacement — reusing it would artificially
      inflate the negative correlation between g_base_tan and g_dir, since
-     Delta_k ~ -eta*g_base and g_dir points back at k_old). Per batch:
+     Delta_k ~ -eta*g_base and g_dir points back at k_old — and never
+     consuming the training iterator, which would break the continuity of
+     the drift trajectory. Per batch:
        g_base_tan = tangential part of d(base loss)/d(key)[protected rows]
        g_dir      = d(L_dir)/d(key)[protected rows]
      reporting aggregate + per-row median/IQR of
@@ -53,6 +56,15 @@ Protocol (probe state is DISCARDED, never polluting a real run):
      plus the current drift cos(k_hat, k_hat_old) per row and the radial
      leakage |<g_dir, k_hat>| / |g_dir| (theory: ~0; the Jacobian
      (I - k_hat k_hat^T)/||k|| projects g_dir onto the tangent space).
+     Rows with a numerically zero g_dir are excluded from the ratios
+     (0/0) and reported as n_zero_dir_rows instead.
+
+Probe bootstrap note: the run_dir may belong to ANY method. The
+Client-side a4_lambda fail-closed check only triggers for
+method == 'fedta_a4', and a fedta_a4 source run by construction recorded
+a concrete lambda in its args.json (it could not have started otherwise),
+so the probe can never hit the fail-closed path; the probe itself never
+builds the A4 total loss (lambda=0 drift + raw _a4_dir_loss() reads).
 
 Even with phase-1 replicated, this is still a magnitude/direction probe
 on 20 steps of one round: the suggested lambda is a STARTING POINT, to be
@@ -196,27 +208,37 @@ def measure_batch(client, run_args, round_id, input, target):
     g_dir = client.model.key.grad[slots].detach().clone()
     client.model.zero_grad()
 
-    # tangential decomposition of the base gradient (per row):
-    # routing only sees the key DIRECTION, so the radial component
-    # (g . k_hat) k_hat never matters for routing
+    def med_iqr(x):
+        x = x.cpu().numpy().astype(np.float64)
+        if x.size == 0:
+            return {"median": float("nan"), "iqr": float("nan")}
+        q25, q50, q75 = np.percentile(x, [25, 50, 75])
+        return {"median": float(q50), "iqr": float(q75 - q25)}
+
+    # per-row statistics (rows with a numerically-zero g_dir are excluded
+    # from the ratios — dot/norm there is 0/0 — and counted instead)
     k = client.model.key.data[slots]
     k_hat = client.model.l2_normalize(k, dim=1)
     g_base_tan = g_base - (g_base * k_hat).sum(dim=1, keepdim=True) * k_hat
 
-    # per-row statistics
     gb_n = g_base_tan.norm(dim=1)                    # [n]
     gd_n = g_dir.norm(dim=1)                         # [n]
+    valid = gd_n > 1e-12
+    n_zero = int((~valid).sum())
     dot = (g_base_tan * g_dir).sum(dim=1)            # [n]
-    ratio_row = gb_n / gd_n.clamp_min(1e-30)
-    cos_row = dot / (gb_n * gd_n).clamp_min(1e-30)
-    lam_cancel_row = -dot / gd_n.pow(2).clamp_min(1e-30)
+    ratio_row = med_iqr((gb_n / gd_n.clamp_min(1e-30))[valid])
+    cos_row = med_iqr(
+        (dot / (gb_n * gd_n).clamp_min(1e-30))[valid])
+    lam_cancel_row = med_iqr(
+        (-dot / gd_n.pow(2).clamp_min(1e-30))[valid])
     # radial leakage of g_dir: theory says <g_dir, k_hat> ~ 0 (the
     # normalization Jacobian projects onto the tangent space)
-    radial_row = (g_dir * k_hat).sum(dim=1).abs() / gd_n.clamp_min(1e-30)
+    radial_row = med_iqr(
+        ((g_dir * k_hat).sum(dim=1).abs() / gd_n.clamp_min(1e-30))[valid])
     # current drift: cos(k_now, k_old) per row (1 = undrifted)
     k_old_hat = client.model.l2_normalize(
         client._a2_key_snapshot.to(k.dtype), dim=1)
-    drift_row = (k_hat * k_old_hat).sum(dim=1)
+    drift_row = med_iqr((k_hat * k_old_hat).sum(dim=1))
 
     def med_iqr(x):
         x = x.cpu().numpy().astype(np.float64)
@@ -236,6 +258,7 @@ def measure_batch(client, run_args, round_id, input, target):
         "loss_base": float(base_loss.detach()),
         "loss_dir": float(dir_loss.detach()),
         "n_protected": int(slots.numel()),
+        "n_zero_dir_rows": n_zero,
         "ratio_agg": ratio_agg,
         "cos_agg": cos_agg,
         "lam_cancel_agg": lam_cancel_agg,
@@ -251,12 +274,13 @@ def measure_batch(client, run_args, round_id, input, target):
 def combine_measures(per_batch):
     """Median/min/max across the n_measure independent batches."""
     out = {}
-    keys = [k for k in per_batch[0] if k != "n_protected"]
-    out["n_protected"] = per_batch[0]["n_protected"]
+    passthrough = ["n_protected", "n_zero_dir_rows"]
     scalars = ["loss_base", "loss_dir", "ratio_agg", "cos_agg",
                "lam_cancel_agg"]
-    for key in keys:
-        if key in scalars:
+    for key in per_batch[0]:
+        if key in passthrough:
+            out[key] = per_batch[0][key]
+        elif key in scalars:
             vals = [b[key] for b in per_batch]
             out[key] = {"median": float(np.median(vals)),
                         "min": float(np.min(vals)),
@@ -366,6 +390,28 @@ def main():
             target = target.long().to(client.device, non_blocking=True)
             return input, target
 
+        # SEPARATE measurement stream: an independent DataLoader instance
+        # so measurement batches never consume the training iterator's
+        # sample sequence (otherwise the drift trajectory becomes
+        # step1, measure x3, step2, ... instead of a continuous
+        # step1, step2, ... run; the shuffle RNG streams are independent)
+        measure_loader = DataLoader(client.traindata, batch_size=16,
+                                    num_workers=run_args.num_workers,
+                                    shuffle=True)
+        measure_iter = iter(measure_loader)
+
+        def next_measure_batch():
+            nonlocal measure_iter
+            try:
+                input, target = next(measure_iter)
+            except StopIteration:
+                measure_iter = iter(measure_loader)
+                input, target = next(measure_iter)
+            input = Variable(input, requires_grad=False).to(
+                client.device, non_blocking=True)
+            target = target.long().to(client.device, non_blocking=True)
+            return input, target
+
         # ---- phase-1 replica: full prompt optimization ----
         # (the real phase-2 — and thus the real g_base — sees z AFTER
         # phase-1 moved the prompts; skipping it is only a preliminary
@@ -403,13 +449,16 @@ def main():
                 loss.backward()
                 optimizer_p2.step()
                 if step in probe_steps:
-                    # measurement on INDEPENDENT batches (never the batch
-                    # that just produced the displacement: Delta_k ~ -eta*
-                    # g_base, so re-measuring on it would artificially
-                    # inflate the negative g_base_tan / g_dir correlation)
+                    # measurement on INDEPENDENT batches from the separate
+                    # measurement stream (never the batch that just
+                    # produced the displacement: Delta_k ~ -eta*g_base, so
+                    # re-measuring on it would artificially inflate the
+                    # negative g_base_tan / g_dir correlation; and never
+                    # consuming the training iterator, which would break
+                    # the continuity of the drift trajectory)
                     per_batch = []
                     for _ in range(args.n_measure):
-                        m_input, m_target = next_batch()
+                        m_input, m_target = next_measure_batch()
                         per_batch.append(
                             measure_batch(client, run_args, probe_round,
                                           m_input, m_target))
@@ -432,7 +481,8 @@ def main():
                   f"lam_cancel={pt['lam_cancel_agg']['median']:.3e} | "
                   f"radial_leak={pt['radial_leak_row']['median']:.2e} "
                   f"drift_cos={pt['drift_cos_row']['median']:.4f} "
-                  f"keynorm={pt['key_norm_row']['median']:.4f}")
+                  f"keynorm={pt['key_norm_row']['median']:.4f} "
+                  f"zero_g_dir_rows={pt['n_zero_dir_rows']}")
         reports.append(rep)
 
     if not reports:
@@ -459,7 +509,7 @@ def main():
 
     # flat CSV for cross-run comparison
     out_csv = args.out_csv or str(Path(out_json).with_suffix(".csv"))
-    fields = ["client_id", "step", "n_protected",
+    fields = ["client_id", "step", "n_protected", "n_zero_dir_rows",
               "loss_base_median", "loss_dir_median",
               "ratio_agg_median", "cos_agg_median", "lam_cancel_agg_median",
               "radial_leak_row_median", "drift_cos_row_median",
@@ -472,6 +522,7 @@ def main():
                 w.writerow({
                     "client_id": rep["client_id"], "step": pt["step"],
                     "n_protected": pt["n_protected"],
+                    "n_zero_dir_rows": pt["n_zero_dir_rows"],
                     "loss_base_median": pt["loss_base"]["median"],
                     "loss_dir_median": pt["loss_dir"]["median"],
                     "ratio_agg_median": pt["ratio_agg"]["median"],
