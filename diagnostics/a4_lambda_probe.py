@@ -89,6 +89,7 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader
 
 from diag_utils import bootstrap_server
+from runtime_utils import rng_state_dict, restore_rng_state
 
 
 def parse_args():
@@ -240,11 +241,6 @@ def measure_batch(client, run_args, round_id, input, target):
         client._a2_key_snapshot.to(k.dtype), dim=1)
     drift_row = med_iqr((k_hat * k_old_hat).sum(dim=1))
 
-    def med_iqr(x):
-        x = x.cpu().numpy().astype(np.float64)
-        q25, q50, q75 = np.percentile(x, [25, 50, 75])
-        return {"median": float(q50), "iqr": float(q75 - q25)}
-
     # aggregates (all protected rows flattened into one vector)
     gb_flat = g_base_tan.reshape(-1)
     gd_flat = g_dir.reshape(-1)
@@ -262,11 +258,11 @@ def measure_batch(client, run_args, round_id, input, target):
         "ratio_agg": ratio_agg,
         "cos_agg": cos_agg,
         "lam_cancel_agg": lam_cancel_agg,
-        "ratio_row": med_iqr(ratio_row),
-        "cos_row": med_iqr(cos_row),
-        "lam_cancel_row": med_iqr(lam_cancel_row),
-        "radial_leak_row": med_iqr(radial_row),
-        "drift_cos_row": med_iqr(drift_row),
+        "ratio_row": ratio_row,
+        "cos_row": cos_row,
+        "lam_cancel_row": lam_cancel_row,
+        "radial_leak_row": radial_row,
+        "drift_cos_row": drift_row,
         "key_norm_row": med_iqr(k.norm(dim=1)),
     }
 
@@ -388,7 +384,6 @@ def main():
         train_loader = DataLoader(client.traindata, batch_size=16,
                                   num_workers=run_args.num_workers,
                                   shuffle=True)
-        batch_iter = iter(train_loader)
 
         def next_batch():
             nonlocal batch_iter
@@ -397,28 +392,6 @@ def main():
             except StopIteration:
                 batch_iter = iter(train_loader)
                 input, target = next(batch_iter)
-            input = Variable(input, requires_grad=False).to(
-                client.device, non_blocking=True)
-            target = target.long().to(client.device, non_blocking=True)
-            return input, target
-
-        # SEPARATE measurement stream: an independent DataLoader instance
-        # so measurement batches never consume the training iterator's
-        # sample sequence (otherwise the drift trajectory becomes
-        # step1, measure x3, step2, ... instead of a continuous
-        # step1, step2, ... run; the shuffle RNG streams are independent)
-        measure_loader = DataLoader(client.traindata, batch_size=16,
-                                    num_workers=run_args.num_workers,
-                                    shuffle=True)
-        measure_iter = iter(measure_loader)
-
-        def next_measure_batch():
-            nonlocal measure_iter
-            try:
-                input, target = next(measure_iter)
-            except StopIteration:
-                measure_iter = iter(measure_loader)
-                input, target = next(measure_iter)
             input = Variable(input, requires_grad=False).to(
                 client.device, non_blocking=True)
             target = target.long().to(client.device, non_blocking=True)
@@ -442,6 +415,37 @@ def main():
                     optimizer_p1.zero_grad()
                     loss.backward()
                     optimizer_p1.step()
+
+        # phase-2 training iterator is created ONLY AFTER phase-1: the
+        # real train() runs phase-2's DataLoader pass after phase-1's,
+        # so creating it earlier would lock a pre-phase-1 permutation
+        batch_iter = iter(train_loader)
+
+        # SEPARATE measurement stream: an independent DataLoader with its
+        # OWN generator, so (a) measurement batches never consume the
+        # training iterator's sample sequence (otherwise the drift
+        # trajectory becomes step1, measure x3, step2, ... instead of a
+        # continuous step1, step2, ... run) and (b) measurement shuffles
+        # never touch the global RNG stream that drives the trajectory
+        measure_gen = torch.Generator()
+        measure_gen.manual_seed(
+            int(run_args.seed) + 100003 * cid + 1009 * args.probe_task)
+        measure_loader = DataLoader(client.traindata, batch_size=16,
+                                    num_workers=run_args.num_workers,
+                                    shuffle=True, generator=measure_gen)
+        measure_iter = iter(measure_loader)
+
+        def next_measure_batch():
+            nonlocal measure_iter
+            try:
+                input, target = next(measure_iter)
+            except StopIteration:
+                measure_iter = iter(measure_loader)
+                input, target = next(measure_iter)
+            input = Variable(input, requires_grad=False).to(
+                client.device, non_blocking=True)
+            target = target.long().to(client.device, non_blocking=True)
+            return input, target
 
         # ---- phase-2 replica: lambda=0 drift + probe-point measurement ----
         optimizer_p2 = torch.optim.Adam(client.model.parameters(),
@@ -467,13 +471,21 @@ def main():
                     # re-measuring on it would artificially inflate the
                     # negative g_base_tan / g_dir correlation; and never
                     # consuming the training iterator, which would break
-                    # the continuity of the drift trajectory)
+                    # the continuity of the drift trajectory). The global
+                    # RNG state is snapshotted/restored around the whole
+                    # measurement block: the ViT forward inside
+                    # phase2_forward_loss may fire stochastic ops (dropout)
+                    # and must not shift the drift trajectory's stream.
+                    rng_snapshot = rng_state_dict()
                     per_batch = []
-                    for _ in range(args.n_measure):
-                        m_input, m_target = next_measure_batch()
-                        per_batch.append(
-                            measure_batch(client, run_args, probe_round,
-                                          m_input, m_target))
+                    try:
+                        for _ in range(args.n_measure):
+                            m_input, m_target = next_measure_batch()
+                            per_batch.append(
+                                measure_batch(client, run_args, probe_round,
+                                              m_input, m_target))
+                    finally:
+                        restore_rng_state(rng_snapshot)
                     rep["points"].append(
                         {"step": step, **combine_measures(per_batch)})
                 if step >= args.max_steps:

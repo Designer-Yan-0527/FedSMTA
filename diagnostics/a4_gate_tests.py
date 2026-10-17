@@ -80,7 +80,6 @@ TOL_S2_LOSS = 1e-12
 TOL_S2_GRAD = 1e-10
 TOL_S3_REL = 1e-5
 TOL_S5_MAX_RADIAL = 1e-5
-GATE_LAMBDA = 1.0  # construction-only value to drive optimizer steps
 
 RESULTS = []
 
@@ -396,11 +395,20 @@ def main():
 
     # Path A: continuous — fresh per-round optimizer (official resume
     # semantics: train() rebuilds Adam every round; requires
-    # global_epoch >= 2 so gate_round+1 is still inside gate_task),
-    # step3 in memory
+    # global_epoch >= 2 so the resumed round is still inside gate_task),
+    # step3 in memory. update_data(next_round) is called symmetrically
+    # on BOTH paths (same task -> normally a no-op, but it matches the
+    # official server lifecycle where every round starts with update_data;
+    # since Path B's RNG was restored to the post-step2 snapshot, the
+    # symmetric call consumes the identical RNG stream on both paths)
+    if run_args.global_epoch < 2:
+        raise SystemExit("S8 requires global_epoch >= 2 (the resumed "
+                         "round must stay inside gate_task)")
+    next_round = gate_round + 1
+    c8.update_data(round=next_round, args=run_args)
     optA = torch.optim.Adam(c8.model.parameters(), lr=c8.lr,
                             weight_decay=1e-03)
-    a4_step(c8, run_args, gate_round, batches8[2], optA)
+    a4_step(c8, run_args, next_round, batches8[2], optA)
     k_a = c8.model.key.data.clone()
     a_a = c8.model.anchor_pool.data.clone()
     s_a = c8._a2_protected_slots.clone()
@@ -416,9 +424,10 @@ def main():
         c8d.vit.load_prompts(c8d.prompts)
     c8d.model.to(c8d.device)
     c8d.vit.to(c8d.device)
+    c8d.update_data(round=next_round, args=run_args)
     optB = torch.optim.Adam(c8d.model.parameters(), lr=c8d.lr,
                             weight_decay=1e-03)
-    a4_step(c8d, run_args, gate_round, batches8[2], optB)
+    a4_step(c8d, run_args, next_round, batches8[2], optB)
     k_b = c8d.model.key.data.clone()
     a_b = c8d.model.anchor_pool.data.clone()
 
@@ -462,7 +471,7 @@ def main():
         "client": client.id,
         "method": run_args.method,
         "a4_lambda_at_source": getattr(run_args, "a4_lambda", None),
-        "gate_lambda": GATE_LAMBDA,
+        "effective_a4_lambda": float(client.a4_lambda),
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
         "cuda_device": (torch.cuda.get_device_name(0)
