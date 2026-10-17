@@ -5,21 +5,25 @@ over 30 epochs) yet old-task retention stays at baseline level.  Two
 questions decide the next chapter:
 
 Q1 (routing transfer): does the bank routing consistency ALSO hold on
-    OLD-TASK PRIVATE test samples?  If private routing still drifts
-    while bank routing is locked -> surrogate reference mismatch.  If
-    private routing is locked too -> routing consistency itself is not
-    sufficient for retention.
+    OLD-TASK PRIVATE test samples?  NOTE: cur_ckpt is saved AFTER
+    server prompt fusion, so the bank KL measured here is the
+    POST-FUSION deployed consistency -- deliberately different from
+    the local phase-2 compat_kl in the training log (pre-fusion
+    local prompt).  Three-branch reading:
+      bank KL high  -> fusion breaks what A3 learned (injection-point
+                       problem, not a mechanism failure)
+      bank low / private high -> surrogate reference mismatch
+      both low      -> routing consistency itself insufficient
     Metrics per client: KL(R_old||R_new), top-1 flip rate, routing
     agreement, on (a) the private task-t test set and (b) the stored A3
-    reference bank (sanity: should reproduce the logged compat_kl).
-    Private metrics are split by EMERGENT-SUPPORT rows (rows that
-    task-t train features top-1 route to under the old generation --
-    the A2 protection-set definition) vs the rest.
+    reference bank.  Private metrics are split by EMERGENT-SUPPORT
+    rows (rows that task-t train features top-1 route to under the old
+    generation -- the A2 protection-set definition) vs the rest.
 
 Q2 (2x2 counterfactual): {old,new} prompt x {old,new} key+anchor
     evaluated on the old-task test set, A1/compatibility_drift protocol
     (current head, strict combo order, seeded eval).  Isolates prompt
-    drift vs key drift vs their interaction.
+    drift vs Tail_Anchor-side (key/anchor) drift vs their interaction.
       old = task_XX_end.pth generation (the task that learned t)
       new = --cur_ckpt generation (e.g. round_0008.pth mid-task-1)
 
@@ -241,9 +245,19 @@ def main():
                     "domain": "private_test", **m,
                     "n_support_rows": len(support_rows)})
 
-            # stored A3 reference bank: teacher = R_old(bank) cached at
-            # task start; recompute R_new(bank) now -> should reproduce
-            # the logged compat_kl (sanity anchor for the whole pipeline)
+            # stored A3 reference bank.
+            # IMPORTANT: cur_ckpt is a round-boundary checkpoint saved
+            # AFTER server prompt fusion. Therefore this measures
+            # POST-FUSION deployed routing consistency and is NOT
+            # expected to reproduce the local phase-2 compat_kl printed
+            # during training (that one used the client's pre-fusion
+            # local prompt).
+            #
+            # If post-fusion surrogate-bank KL is much larger than the
+            # logged local phase-2 KL, server prompt fusion reintroduces
+            # interface drift AFTER A3 (fusion breaks the compatibility
+            # A3 just learned) -> fix the injection point, not the
+            # mechanism.
             if (getattr(client, "_a3_teacher_probs", None) is not None
                     and getattr(client, "_a3_ref_raw", None) is not None):
                 raw = client._a3_ref_raw
@@ -304,14 +318,19 @@ def main():
         print(f"{dom:>14} {split:>12} {kl:>8.3f} {fl:>7.3f} "
               f"{len(vals)*1:>5}")
 
-    print("\nReading guide:")
-    print("  Q1 private_test KL >> surrogate_bank KL  -> surrogate "
-          "reference mismatch (A3 protects the wrong distribution)")
-    print("  Q1 private_test KL ~= surrogate_bank KL, but Q2 old/old >> "
-          "new/new -> routing consistency itself is insufficient")
+    print("\nReading guide (Q1 is POST-FUSION, see script header):")
+    print("  1. surrogate_bank KL >> logged local compat_kl (~4-5)"
+          "  -> server prompt fusion breaks the compatibility A3 just"
+          " learned; fix the injection point, not the mechanism")
+    print("  2. surrogate_bank KL low, private_test KL high"
+          "  -> surrogate reference mismatch (A3 protects the wrong"
+          " distribution)")
+    print("  3. both KL low but Q2 old/old >> new/new"
+          "  -> routing consistency itself is insufficient for retention")
     print("  Q2 newP+oldKA drop -> prompt drift dominant; oldP+newKA drop "
-          "-> key structure dominant; both single drops small but new/new "
-          "collapses -> cross-generation interaction")
+          "-> Tail_Anchor-side (key/anchor) drift dominant (sub-split "
+          "key vs anchor only if this cell dominates); both single drops "
+          "small but new/new collapses -> cross-generation interaction")
 
 
 if __name__ == "__main__":
