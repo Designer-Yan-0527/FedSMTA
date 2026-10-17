@@ -152,13 +152,23 @@ def build_server(args, run_manager=None):
 
 
 def validate_method_args(args):
-    """Phase 5 A3: fail-fast config validation (method isolation).
+    """Phase 5 A3 / Phase 6 A4: fail-fast config validation (method
+    isolation).
 
-    A3 (fedta_a3) is mutually exclusive with A2 (fedta_a2) by construction:
-    a single --method choice. A3 never freezes key/anchor rows — the only
-    freeze mechanism in this codebase is A2's post-step restore, gated on
-    method == 'fedta_a2'. The frozen fedta baseline accepts no A3 arguments.
+    A3 (fedta_a3) and A4 (fedta_a4) are mutually exclusive with A2
+    (fedta_a2) by construction: a single --method choice. A3 never freezes
+    key/anchor rows and does not use the A2 protection-set mask; A4 reuses
+    the A2 protection-set mask and snapshot code but replaces the hard
+    post-step restore with a soft direction loss (key rows only, anchors
+    fully FedTA-trained). The frozen fedta baseline accepts no A3/A4
+    arguments.
     """
+    if args.method == 'fedta_a4':
+        if not (float(args.a4_lambda) > 0):
+            raise ValueError(
+                "invalid fedta_a4 configuration: --a4_lambda must be > 0 "
+                "(set it from diagnostics/a4_lambda_probe.py, not by guess)")
+        return
     if args.method != 'fedta_a3':
         return
     problems = []

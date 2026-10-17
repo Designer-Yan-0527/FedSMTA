@@ -675,6 +675,11 @@ class Server_DF(object):
         # absent in old baseline checkpoints -> skipped there.
         "a3_lambda", "a3_tau", "a3_n_ref",
         "a3_ref_batch_size", "a3_compat_every",
+        # Phase 6 A4: a fedta_a4 checkpoint resumed with a different
+        # a4_lambda would silently change the constraint (the a4_state
+        # loader inside Client_DF also checks this, fail-closed). Key is
+        # absent in old checkpoints -> skipped there.
+        "a4_lambda",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):

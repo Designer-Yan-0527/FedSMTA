@@ -105,13 +105,16 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--print_freq', type=int, default=10, help = 'The frequency of printing')
 
     # Ours
-    subparsers.add_argument('--method', type=str, default='fedta', choices=['fedta', 'fedta_a2', 'fedta_a3'],
+    subparsers.add_argument('--method', type=str, default='fedta', choices=['fedta', 'fedta_a2', 'fedta_a3', 'fedta_a4'],
                             help='fedta = frozen Phase-0 baseline (read-only); '
                                  'fedta_a2 = Phase 4 A2 routing-interface protection arms (mutually '
                                  'exclusive with A3 by construction: single --method choice); '
                                  'fedta_a3 = Phase 5 A3-KL v1 functional routing consistency '
                                  '(KL(R_old||R_new) on a fixed public surrogate reference bank; '
-                                 'compatibility gradient reaches ONLY the key)')
+                                 'compatibility gradient reaches ONLY the key); '
+                                 'fedta_a4 = Phase 6 A4 selective soft key preservation '
+                                 '(normalized-direction loss on the A2 protected key rows; '
+                                 'anchor rows are fully FedTA-trained)')
     subparsers.add_argument('--a2_arm', type=str, default='anchor', choices=['key', 'anchor', 'both'],
                             help='A2 protection arm (only used with --method fedta_a2): '
                                  'key = freeze protected key rows; anchor = freeze protected '
@@ -146,6 +149,20 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--a3_compat_every', type=int, default=1,
                             help='Apply the A3 compatibility term every N phase-2 optimizer '
                                  'steps (only used with --method fedta_a3). v1 fixes this at 1.')
+    # Phase 6 A4 (--method fedta_a4): selective soft key preservation.
+    # Reuses the A2 protection-set mask VERBATIM (same emergent support
+    # slots, same task-start snapshot) but replaces the post-step hard
+    # restore with L_dir = mean_{i in P} ||norm(k_i) - sg(norm(k_i^old))||^2
+    # (= 2(1 - cos)); anchor rows are fully FedTA-trained. task 0 is
+    # inactive (empty protection set, same as A2).
+    subparsers.add_argument('--a4_lambda', type=float, default=1.0,
+                            help='A4 direction-loss weight (only used with --method fedta_a4). '
+                                 'WARNING: this is a GRADIENT-scale lambda and MUST be set from '
+                                 'diagnostics/a4_lambda_probe.py (tangential gradient-ratio / '
+                                 'lambda-cancel calibration), NOT guessed from loss magnitudes '
+                                 'or raw gradient norms (A3 lesson: the l2-normalization '
+                                 'Jacobian ~ 1/||k|| makes the direction-loss gradient scale '
+                                 'numerically large even when the loss itself is tiny).')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
     subparsers.add_argument('--client_num', default=5, type=int,

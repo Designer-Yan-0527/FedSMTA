@@ -77,6 +77,24 @@ class Client_DF(object):
             self._a2_anchor_snapshot = None   # frozen anchor rows (arm anchor/both)
             self._a2_task_id = None           # task the current protection belongs to
 
+        # Phase 6 A4 (--method fedta_a4): selective soft key preservation.
+        # Reuses the A2 protection-set infrastructure VERBATIM (identical
+        # emergent-support slot computation, identical task-start key-row
+        # snapshot) but replaces A2's post-step hard restore with a
+        # normalized-direction loss on the protected key rows (see
+        # _a4_dir_loss). Anchor rows are NEVER constrained (fully
+        # FedTA-trained). Attributes are ONLY created for the A4 method;
+        # the frozen fedta baseline keeps its __init__ / checkpoint schema
+        # untouched. A4 is mutually exclusive with A2/A3 by construction
+        # (single --method choice).
+        if method == 'fedta_a4':
+            self.a2_arm = 'key'   # reuse the A2 snapshot code path (key rows only)
+            self.a4_lambda = float(getattr(args, 'a4_lambda', 1.0))
+            self._a2_protected_slots = None   # LongTensor: protected slot ids
+            self._a2_key_snapshot = None      # task-start key rows (A4 anchor: detached)
+            self._a2_anchor_snapshot = None   # always None for A4 (anchors unconstrained)
+            self._a2_task_id = None           # task the current protection belongs to
+
         # Phase 5 A3 (--method fedta_a3): functional routing-consistency state
         # (A3-KL v1). Attributes are ONLY created for the A3 method; the
         # frozen fedta baseline keeps its __init__ / checkpoint schema
@@ -133,10 +151,13 @@ class Client_DF(object):
             # only cifar100 / ImageNet-R are supported in this project
             self.get_data(task)
             self.task_id = task
-            # Phase 4 A2: entering a new task -> recompute the protected slot
-            # set + row snapshots from the CURRENT (post-previous-task) key /
-            # anchor state. No-op for task 0 (empty protection set).
-            if self.method == 'fedta_a2':
+            # Phase 4 A2 / Phase 6 A4: entering a new task -> recompute the
+            # protected slot set + row snapshots from the CURRENT
+            # (post-previous-task) key / anchor state. No-op for task 0
+            # (empty protection set). A4 shares the A2 mask/snapshot code
+            # (its a2_arm is fixed to 'key'); only the USE of the snapshot
+            # differs (soft direction loss vs post-step restore).
+            if self.method in ('fedta_a2', 'fedta_a4'):
                 self._a2_init_task_protection(args)
             # Phase 5 A3: entering a new task -> build the fixed public
             # surrogate reference bank and the previous-generation routing
@@ -255,6 +276,36 @@ class Client_DF(object):
             self.model.key.data[self._a2_protected_slots] = self._a2_key_snapshot
         if self.a2_arm in ('anchor', 'both') and self._a2_anchor_snapshot is not None:
             self.model.anchor_pool.data[self._a2_protected_slots] = self._a2_anchor_snapshot
+
+    def _a4_dir_loss(self):
+        """A4: normalized-direction preservation loss on the protected key
+        rows. Only called when method == 'fedta_a4' with an active
+        protection set.
+
+          L_dir = mean_{i in P} || norm(k_i) - sg(norm(k_i^old)) ||_2^2
+                = mean_{i in P} 2 * (1 - cos(k_i, k_i^old))
+
+        Design (pre-registered):
+          * normalization REUSES Tail_Anchor.l2_normalize (same epsilon
+            floor as the actual routing geometry — never F.normalize);
+          * the task-start snapshot is a detached buffer (no gradient);
+          * gradient flows only into the protected key rows' directions;
+            the radial (norm) component of the base gradient is left
+            unconstrained by the regularizer (it is routing-irrelevant);
+          * anchor rows never appear in the loss (fully FedTA-trained).
+
+        Numerical note: dL_dir/dk passes through the l2-normalization
+        Jacobian ~ 1/||k||, so the gradient scale can be large even for a
+        tiny loss — a4_lambda must be calibrated with the tangential
+        gradient-ratio probe (diagnostics/a4_lambda_probe.py), not from
+        loss magnitudes.
+        """
+        slots = self._a2_protected_slots
+        key = self.model.key.reshape(-1, self.model.key_size)[slots]
+        k_hat = self.model.l2_normalize(key, dim=1)
+        k_old = self._a2_key_snapshot.to(key.dtype)
+        k_old_hat = self.model.l2_normalize(k_old, dim=1)
+        return ((k_hat - k_old_hat) ** 2).sum(dim=1).mean()
 
     # ------------------------------------------------------------------
     # Phase 5 A3 (--method fedta_a3): functional routing consistency.
@@ -522,14 +573,25 @@ class Client_DF(object):
         a3_active = (self.method == 'fedta_a3'
                      and self._a3_teacher_probs is not None
                      and self._a3_task_id == self.task_id)
+        # Phase 6 A4 (fedta_a4): the direction regularizer is active from
+        # task 1 onward whenever the protection set exists and belongs to
+        # the current task (task 0 has an empty protection set, exactly
+        # like A2). Inactive for every other method.
+        a4_active = (self.method == 'fedta_a4'
+                     and self._a2_protected_slots is not None
+                     and self._a2_key_snapshot is not None
+                     and self._a2_task_id == self.task_id)
         if a3_active:
             a3_n_batches = ((len(self._a3_ref_raw)
                              + self.a3_ref_batch_size - 1)
                             // self.a3_ref_batch_size)
         a3_epoch_acc = None
+        a4_epoch_acc = None
         for epoch in tqdm(range(self.local_epoch)):
             if a3_active:
                 a3_epoch_acc = {"base": [], "kl": [], "lam_kl": []}
+            if a4_active:
+                a4_epoch_acc = {"base": [], "dir": [], "lam_dir": []}
             for iteration, (input, target) in enumerate(train_loader):
                 input, target = Variable(input, requires_grad=False).to(self.device, non_blocking=True), target.long().to(
                     self.device, non_blocking=True)
@@ -589,6 +651,22 @@ class Client_DF(object):
                     loss = loss + self.a3_lambda * loss_kl
                 a3_step += 1
 
+                # Phase 6 A4 (fedta_a4): add the normalized-direction
+                # preservation term on the protected key rows to the
+                # OFFICIAL phase-2 loss. The official loss / optimizer /
+                # weight decay are untouched; the anchor rows never appear
+                # in the regularizer (fully FedTA-trained), and the radial
+                # (norm) direction of the protected key rows is left free
+                # (routing uses normalized keys only).
+                if a4_active:
+                    loss_dir = self._a4_dir_loss()
+                    if a4_epoch_acc is not None:
+                        a4_epoch_acc["base"].append(float(loss.detach()))
+                        a4_epoch_acc["dir"].append(float(loss_dir.detach()))
+                        a4_epoch_acc["lam_dir"].append(
+                            float(self.a4_lambda) * float(loss_dir.detach()))
+                    loss = loss + self.a4_lambda * loss_dir
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -608,6 +686,17 @@ class Client_DF(object):
                       f'base_loss={m_base:.4f} compat_kl={m_kl:.4f} '
                       f'lam*kl={m_lkl:.3e} '
                       f'teacher_top1={self._a3_teacher_top1:.4f}')
+
+            # Phase 6 A4: per-local-epoch logging (means over this epoch's
+            # constrained steps), mirroring the A3 discipline
+            if a4_epoch_acc is not None and a4_epoch_acc["dir"]:
+                m_base = sum(a4_epoch_acc["base"]) / len(a4_epoch_acc["base"])
+                m_dir = sum(a4_epoch_acc["dir"]) / len(a4_epoch_acc["dir"])
+                m_ldir = sum(a4_epoch_acc["lam_dir"]) / len(a4_epoch_acc["lam_dir"])
+                print(f'[A4] client {self.id} task {self.task_id} epoch {epoch}: '
+                      f'base_loss={m_base:.4f} dir_loss={m_dir:.4f} '
+                      f'lam*dir={m_ldir:.3e} '
+                      f'n_protected={self._a2_protected_slots.numel()}')
 
 
         target_list = []
@@ -903,6 +992,11 @@ class Client_DF(object):
         # instead of recomputing it from the already-drifted state.)
         if self.method == 'fedta_a2':
             state["a2_state"] = self._a2_state_for_checkpoint()
+        # Phase 6 A4: same discipline (mid-task resume must restore the
+        # task-start snapshot instead of recomputing it from the
+        # already-drifted state).
+        elif self.method == 'fedta_a4':
+            state["a4_state"] = self._a4_state_for_checkpoint()
 
         # Phase 5 A3 routing-consistency state. Key is ONLY added for
         # fedta_a3 so the frozen fedta baseline keeps a bit-identical
@@ -1010,6 +1104,80 @@ class Client_DF(object):
                                  else key_snap.to(self.device))
         self._a2_anchor_snapshot = (None if anchor_snap is None
                                     else anchor_snap.to(self.device))
+
+    def _a4_state_for_checkpoint(self):
+        """Serialize A4 soft-preservation state; always a dict for
+        fedta_a4, never called for the other methods (schema untouched).
+
+        Contents: an explicit method marker (so an A2 a2_state can never be
+        mistaken for an a4_state), the calibrated lambda (fail-closed
+        resume validation), the task the snapshot belongs to, and the
+        protected slot ids + task-start key rows."""
+        if self.method != 'fedta_a4':
+            return None
+        return {
+            "method": "fedta_a4",
+            "a4_lambda": self.a4_lambda,
+            "task_id": self._a2_task_id,
+            "protected_slots": (None if self._a2_protected_slots is None
+                                else self._a2_protected_slots.cpu().tolist()),
+            "key_snapshot": (None if self._a2_key_snapshot is None
+                             else self._a2_key_snapshot.detach().cpu()),
+        }
+
+    def _a4_load_checkpoint_state(self, state):
+        """Restore A4 soft-preservation state, FAIL-CLOSED.
+
+        A fedta_a4 resume from a checkpoint without a4_state (or with a
+        state written by another method) would silently continue without
+        the direction constraint or with a wrong snapshot. Same failure
+        class as the A2/A3 discipline: the state MUST exist and be
+        internally consistent, or we refuse.
+        """
+        if self.method != 'fedta_a4':
+            return
+        a4 = state.get("a4_state")
+        if not a4:
+            raise RuntimeError(
+                f"client {self.id}: fedta_a4 resume requires a4_state in "
+                f"the checkpoint, got "
+                f"{'missing key' if 'a4_state' not in state else 'None/empty'}"
+                f" — refusing to silently continue without the direction "
+                f"constraint (fail-closed; re-run from scratch or use a "
+                f"fedta_a4 checkpoint)")
+        if a4.get("method") != 'fedta_a4':
+            raise RuntimeError(
+                f"client {self.id}: a4_state method marker mismatch "
+                f"(checkpoint={a4.get('method')!r}) — corrupted or "
+                f"wrong-method checkpoint; refusing to continue")
+        # fail-closed hyper-parameter consistency (exact match: identical
+        # CLI parse -> identical float)
+        if float(a4.get("a4_lambda", -1.0)) != self.a4_lambda:
+            raise RuntimeError(
+                f"client {self.id}: A4 lambda mismatch on resume "
+                f"(checkpoint={a4.get('a4_lambda')}, "
+                f"current={self.a4_lambda})")
+        if a4.get("task_id") != state.get("task_id"):
+            raise RuntimeError(
+                f"client {self.id}: A4 protection task_id "
+                f"({a4.get('task_id')}) != checkpoint task_id "
+                f"({state.get('task_id')}); corrupted a4_state")
+        self._a2_task_id = a4.get("task_id")
+        slots = a4.get("protected_slots")
+        self._a2_protected_slots = (None if slots is None
+                                    else torch.tensor(slots, dtype=torch.long,
+                                                      device=self.device))
+        key_snap = a4.get("key_snapshot")
+        if slots is not None:
+            n = len(slots)
+            if key_snap is None or key_snap.shape[0] != n:
+                raise RuntimeError(
+                    f"client {self.id}: fedta_a4 requires a key_snapshot "
+                    f"with {n} rows, got "
+                    f"{'None' if key_snap is None else key_snap.shape[0]}")
+        self._a2_key_snapshot = (None if key_snap is None
+                                 else key_snap.to(self.device))
+        self._a2_anchor_snapshot = None  # A4 never constrains anchors
 
     def _a3_load_checkpoint_state(self, state):
         """Restore A3 routing-consistency state, FAIL-CLOSED.
@@ -1130,6 +1298,10 @@ class Client_DF(object):
         # Phase 4 A2: restore protection snapshot AFTER task_id is restored,
         # so update_data() does not recompute it mid-task.
         self._a2_load_checkpoint_state(state)
+
+        # Phase 6 A4: restore the task-start key snapshot AFTER task_id is
+        # restored, so update_data() does not recompute it mid-task.
+        self._a4_load_checkpoint_state(state)
 
         # Phase 5 A3: restore the reference bank + teacher targets AFTER
         # task_id is restored, so update_data() does not rebuild it mid-task.
