@@ -677,6 +677,12 @@ class Client_DF(object):
         # uninterrupted run without persisting the cursor. Inactive for the
         # frozen fedta baseline.
         a3_step = 0
+        # safe default: only consumed inside _phase2_train_step when
+        # a3_active (the fedta_a3 branch overwrites it right below);
+        # the hoisting of a3_n_batches into an unconditional call
+        # argument made the old lazy initialization an
+        # UnboundLocalError for every non-A3 method
+        a3_n_batches = 0
         a3_active = (self.method == 'fedta_a3'
                      and self._a3_teacher_probs is not None
                      and self._a3_task_id == self.task_id)
