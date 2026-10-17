@@ -10,8 +10,10 @@ Q1 (routing transfer): does the bank routing consistency ALSO hold on
     POST-FUSION deployed consistency -- deliberately different from
     the local phase-2 compat_kl in the training log (pre-fusion
     local prompt).  Three-branch reading:
-      bank KL high  -> fusion breaks what A3 learned (injection-point
-                       problem, not a mechanism failure)
+      bank KL high  -> deployed post-fusion interface is no longer
+                       protected; fusion is a leading candidate, but
+                       not yet causally isolated (logged compat_kl is
+                       an in-epoch mini-batch mean)
       bank low / private high -> surrogate reference mismatch
       both low      -> routing consistency itself insufficient
     Metrics per client: KL(R_old||R_new), top-1 flip rate, routing
@@ -320,8 +322,12 @@ def main():
 
     print("\nReading guide (Q1 is POST-FUSION, see script header):")
     print("  1. surrogate_bank KL >> logged local compat_kl (~4-5)"
-          "  -> server prompt fusion breaks the compatibility A3 just"
-          " learned; fix the injection point, not the mechanism")
+          "  -> substantial routing drift is present at the POST-FUSION"
+          " deployed checkpoint. This is consistent with server prompt"
+          " fusion reintroducing drift, but the comparison is not a"
+          " strict causal isolation because logged compat_kl is an"
+          " in-epoch mini-batch mean, not a pre-fusion final full-bank"
+          " measurement.")
     print("  2. surrogate_bank KL low, private_test KL high"
           "  -> surrogate reference mismatch (A3 protects the wrong"
           " distribution)")
