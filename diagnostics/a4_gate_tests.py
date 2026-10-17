@@ -36,11 +36,14 @@ Gates:
      client on train/test split indices, protected slots and key
      snapshot by VALUE (closes the RNG-ordering question and would catch
      any future regression of the probe's ordering)
-  S8 resume equivalence: fixed-batch trajectory
+  S8 A4 checkpoint round-trip equivalence: fixed-batch trajectory
        step1, step2 | save -> reload -> fresh-optimizer step3
      vs
        step1, step2 | step3 (continuous)
-     must end bit-identical on key / anchor / slots / snapshot. Batches
+     must end bit-identical on key / anchor / slots / snapshot. This
+     proves A4-state serialization/restore equivalence ONLY — NOT an
+     end-to-end federated-round resume proof (prompt fusion, all-client
+     aggregation etc. are deliberately out of scope). Batches
      are pre-fetched tensors fed to both paths, so this tests A4-state
      checkpointing only — DataLoader RNG restoration is deliberately NOT
      mixed in (official checkpoints are round-boundary: the per-round
@@ -424,12 +427,14 @@ def main():
     slots_eq = torch.equal(s_a, c8d._a2_protected_slots)
     snap_eq = torch.equal(snap_a, c8d._a2_key_snapshot)
     max_diff = float((k_a - k_b).abs().max())
-    gate("S8 resume equivalence",
+    gate("S8 A4 checkpoint round-trip equivalence",
          key_eq and anchor_eq and slots_eq and snap_eq, {
              "key_equal": bool(key_eq), "anchor_equal": bool(anchor_eq),
              "slots_equal": bool(slots_eq),
              "snapshot_equal": bool(snap_eq),
              "key_max_abs_diff": max_diff,
+             "scope": "A4-state serialization/restore equivalence only; "
+                      "not an end-to-end federated-round resume proof",
          })
 
     # cleanup temp checkpoint (never touches the source run_dir)
