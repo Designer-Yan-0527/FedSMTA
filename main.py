@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 
 from pathlib import Path
@@ -164,10 +165,15 @@ def validate_method_args(args):
     arguments.
     """
     if args.method == 'fedta_a4':
-        if not (float(args.a4_lambda) > 0):
+        if getattr(args, 'a4_lambda', None) is None:
             raise ValueError(
-                "invalid fedta_a4 configuration: --a4_lambda must be > 0 "
-                "(set it from diagnostics/a4_lambda_probe.py, not by guess)")
+                "invalid fedta_a4 configuration: --a4_lambda is REQUIRED "
+                "(no working default; set it from "
+                "diagnostics/a4_lambda_probe.py, not by guess)")
+        if not (float(args.a4_lambda) > 0) or not math.isfinite(float(args.a4_lambda)):
+            raise ValueError(
+                "invalid fedta_a4 configuration: --a4_lambda must be a "
+                "finite value > 0")
         return
     if args.method != 'fedta_a3':
         return

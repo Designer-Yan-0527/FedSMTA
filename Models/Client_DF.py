@@ -89,7 +89,17 @@ class Client_DF(object):
         # (single --method choice).
         if method == 'fedta_a4':
             self.a2_arm = 'key'   # reuse the A2 snapshot code path (key rows only)
-            self.a4_lambda = float(getattr(args, 'a4_lambda', 1.0))
+            # fail-closed: NO working default lambda (main.py validates it
+            # first; this is the belt-and-suspenders path for direct
+            # build_server() callers, e.g. diagnostics)
+            _a4_lam = getattr(args, 'a4_lambda', None)
+            if _a4_lam is None:
+                raise RuntimeError(
+                    f"client {self.id}: fedta_a4 requires an explicit "
+                    f"a4_lambda (calibrated by diagnostics/"
+                    f"a4_lambda_probe.py); refusing to run with an "
+                    f"arbitrary default")
+            self.a4_lambda = float(_a4_lam)
             self._a2_protected_slots = None   # LongTensor: protected slot ids
             self._a2_key_snapshot = None      # task-start key rows (A4 anchor: detached)
             self._a2_anchor_snapshot = None   # always None for A4 (anchors unconstrained)

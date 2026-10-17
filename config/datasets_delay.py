@@ -155,14 +155,17 @@ def get_args_parser(subparsers):
     # restore with L_dir = mean_{i in P} ||norm(k_i) - sg(norm(k_i^old))||^2
     # (= 2(1 - cos)); anchor rows are fully FedTA-trained. task 0 is
     # inactive (empty protection set, same as A2).
-    subparsers.add_argument('--a4_lambda', type=float, default=1.0,
+    subparsers.add_argument('--a4_lambda', type=float, default=None,
                             help='A4 direction-loss weight (only used with --method fedta_a4). '
-                                 'WARNING: this is a GRADIENT-scale lambda and MUST be set from '
+                                 'REQUIRED and must be explicitly passed: there is NO working '
+                                 'default. It is a GRADIENT-scale lambda and MUST be set from '
                                  'diagnostics/a4_lambda_probe.py (tangential gradient-ratio / '
                                  'lambda-cancel calibration), NOT guessed from loss magnitudes '
                                  'or raw gradient norms (A3 lesson: the l2-normalization '
                                  'Jacobian ~ 1/||k|| makes the direction-loss gradient scale '
-                                 'numerically large even when the loss itself is tiny).')
+                                 'numerically large even when the loss itself is tiny). '
+                                 'Omitting it fails fast instead of silently running with an '
+                                 'arbitrary value.')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
     subparsers.add_argument('--client_num', default=5, type=int,
