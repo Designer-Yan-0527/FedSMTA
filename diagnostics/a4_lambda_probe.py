@@ -292,33 +292,56 @@ def combine_measures(per_batch):
 
 
 def summarize(reports):
-    """Final lambda recommendation from the LAST probe point of each
-    client (most-drifted, closest to the sustained regime), median across
-    the independent measurement batches."""
+    """Lambda recommendation from ALL probe points where the regularizer
+    actually opposes the base tangential drift.
+
+    Policy fix: the previous implementation read only the LAST probe point
+    of each client, assuming it is "closest to the sustained regime". Real
+    probe data (task-1, seed 42) disproved that assumption: on the lambda=0
+    probe trajectory the protected-key geometry enters a deep-drift regime
+    by step ~20 (drift_cos ~0.1-0.3, dir_loss ~2 = near-orthogonal), where
+    cos flips positive and last-point-only produced a misleading 0/5 empty
+    recommendation. A properly-regularized A4 run keeps the trajectory in
+    the SHALLOW-drift regime, which the early probe points (steps 1-5)
+    sample — so those are the calibration target."""
+    EARLY_STEP = 5          # steps <= this are the shallow-drift regime
+    COS_OPPOSE = -0.05      # near-orthogonal points (e.g. cos ~ -0.02)
+                           # give numerically meaningless tiny lam_cancel
     per_client = []
+    opposing = []           # (client_id, step, cos, lam_cancel)
     for rep in reports:
         last = rep["points"][-1]
         per_client.append((rep["client_id"], last["cos_agg"]["median"],
-                           last["lam_cancel_agg"]["median"],
                            last["radial_leak_row"]["median"]))
-    n_opposing = sum(1 for _, c, _, _ in per_client if c < 0)
-    lams = [lc for _, c, lc, _ in per_client if c < 0]
+        for pt in rep["points"]:
+            c = pt["cos_agg"]["median"]
+            lc = pt["lam_cancel_agg"]["median"]
+            if c < COS_OPPOSE:
+                opposing.append((rep["client_id"], pt["step"], c, lc))
+    n_opposing = sum(1 for _, c, _ in per_client if c < 0)
+    early = [lc for _, s, _, lc in opposing if s <= EARLY_STEP]
     rec = {
-        "clients_opposing_drift": f"{n_opposing}/{len(per_client)}",
+        "clients_opposing_drift_last_point": f"{n_opposing}/{len(per_client)}",
+        "n_opposing_points_all_steps": len(opposing),
         "radial_leak_median_max": float(max(rl for *_, rl in per_client)),
-        "note": "lam_cancel is only meaningful where cos_agg < 0 "
-                "(regularizer gradient opposes the base tangential drift); "
-                "lambda = lam_cancel FULLY cancels the tangential base "
-                "gradient on the protected rows, 0.5*lam_cancel is a "
-                "half-strength starting point. This is a 20-step probe "
-                "value: cross-check stability across probe steps and "
-                "refine from the [A4] epoch logs (dir_loss should stay "
+        "note": "lam_cancel is only meaningful where cos_agg < "
+                f"{COS_OPPOSE} (regularizer gradient genuinely opposes the "
+                "base tangential drift); near-orthogonal points are "
+                "excluded. lambda = lam_cancel FULLY cancels the tangential "
+                "base gradient on the protected rows; 0.5*lam_cancel is a "
+                "half-strength starting point. EARLY points (shallow drift) "
+                "upper-bound the needed lambda; later opposing points "
+                "reflect the self-stabilizing regime (L_dir gradient grows "
+                "with drift, so maintaining control needs less lambda). "
+                "Refine from the [A4] epoch logs (dir_loss should stay "
                 "small but NON-zero; a flat-zero dir_loss means "
                 "over-constraining ~ A2 hard freeze).",
     }
-    if lams:
-        rec["lam_cancel_median"] = float(np.median(lams))
-        rec["suggested_lambda_start"] = float(0.5 * np.median(lams))
+    if opposing:
+        rec["lam_cancel_median_early_steps"] = (
+            float(np.median(early)) if early else None)
+        rec["lam_cancel_median_all_opposing"] = float(
+            np.median([lc for *_, lc in opposing]))
     return rec
 
 
