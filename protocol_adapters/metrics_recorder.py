@@ -88,6 +88,9 @@ class MetricsRecorder(object):
         }
         rec.update(extra)
         self.records.append(rec)
+        # defensive: the metrics dir may have been removed after init
+        # (e.g. an over-eager cleanup); never let a log write kill training
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
         with open(self.records_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
 
@@ -98,6 +101,7 @@ class MetricsRecorder(object):
         summary metrics from the full record list. Call after every task
         boundary (cheap: a few hundred rows)."""
         task_num = int(task_num)
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
         by_client = {}
         for r in self.records:
             by_client.setdefault(r["client_id"], []).append(r)
