@@ -24,6 +24,19 @@ Two parts, both CPU-only and training-free:
 PASS requires every Part B item bit-identical (ordered lists) and no
 structural violations. Exit code 0 only on PASS.
 
+  Part C — bug-fix seals (gating):
+      apply the three documented official-repo bug fixes in
+      run_fedmgp.py's exact order and verify each: (a) the official
+      source still contains the bug anchor (repo-drift protection:
+      if upstream fixes the bug the seal fails loudly -> re-audit),
+      (b) the patch is in effect on the live class, (c) where cheap,
+      the fixed behavior is exercised for real (CustomedSubset gets a
+      PIL-only transform that crashes on raw numpy pre-fix).
+        C1  Client_DF.train np.arange(200) -> args.nb_classes
+        C2  Client_DF.train wrapped with update_data (official
+            Server_DF.train_clients never calls it for cifar100)
+        C3  CustomedSubset.__getitem__ PIL conversion restored
+
 Usage (FedSMTA conda env, from the FedSMTA repo root):
 
   python protocol_adapters/gate_fedmgp.py \
@@ -198,11 +211,84 @@ def main():
     all_ok = partB_ok and struct_ok
 
     # ------------------------------------------------------------------
+    # Part C: bug-fix seals (gating) — in run_fedmgp.py's exact order
+    # ------------------------------------------------------------------
+    import inspect
+    import textwrap
+
+    partC_ok = True
+
+    # C1 (applied FIRST: it rewrites Client_DF.train's source; the C2
+    # wrapper must wrap the FIXED train). The patch itself fail-louds
+    # if the official source no longer contains the anchor line.
+    from Models.Client_DF import Client_DF
+    official_train = textwrap.dedent(inspect.getsource(Client_DF.train))
+    c1_anchor = "np.setdiff1d(np.arange(200), mask)" in official_train
+    manifest_splitter.patch_client_train_nb_classes_bug()
+    c1_ok = (c1_anchor
+             and Client_DF.train.__code__.co_filename
+             == "<Client_DF.train nb_classes bugfix>")
+    partC_ok &= c1_ok
+    rows.append({"item": "C1 Client_DF.train np.arange(200) -> "
+                         "args.nb_classes (official anchor + patched "
+                         "code object active)",
+                 "pass": bool(c1_ok), "got_len": 0, "want_len": 1})
+
+    # C2: official Server_DF.train_clients must NOT call update_data
+    # (that IS the bug); the patch wraps train with FedMGP's own
+    # update_data
+    from Models.Server_DF import Server_DF
+    server_src = textwrap.dedent(
+        inspect.getsource(Server_DF.train_clients))
+    c2_anchor = "update_data" not in server_src
+    manifest_splitter.patch_client_train_update_data()
+    c2_ok = (c2_anchor
+             and "update_data" in Client_DF.train.__code__.co_names
+             and Client_DF.train.__code__.co_filename.endswith(
+                 "manifest_splitter.py"))
+    partC_ok &= c2_ok
+    rows.append({"item": "C2 Client_DF.train wrapped with update_data "
+                         "(official Server never calls it + wrapper "
+                         "active)",
+                 "pass": bool(c2_ok), "got_len": 0, "want_len": 1})
+
+    # C3: official CustomedSubset.__getitem__ has the PIL conversion
+    # commented out; apply the fix and exercise it with a PIL-only
+    # transform (RandomResizedCrop raises TypeError on raw numpy
+    # pre-fix)
+    from data.cifar100_subset_spliter import CustomedSubset
+    official_getitem = textwrap.dedent(
+        inspect.getsource(CustomedSubset.__getitem__))
+    c3_anchor = "# img = Image.fromarray(img)" in official_getitem
+    manifest_splitter.patch_customed_subset_pil()
+    import torch as _torch
+    import torchvision.transforms as _T
+
+    class _FakeDS:
+        data = np.zeros((2, 32, 32, 3), dtype=np.uint8)
+        targets = [3, 7]
+    sub = CustomedSubset(_FakeDS(), [0, 1],
+                         _T.Compose([_T.RandomResizedCrop(224),
+                                     _T.ToTensor()]))
+    img, tgt = sub[0]
+    c3_ok = (c3_anchor and _torch.is_tensor(img)
+             and tuple(img.shape) == (3, 224, 224) and int(tgt) == 3)
+    partC_ok &= c3_ok
+    rows.append({"item": "C3 CustomedSubset PIL restore (official "
+                         "anchor + behavioral: PIL-only transform "
+                         "returns tensor)",
+                 "pass": bool(c3_ok), "got_len": 0, "want_len": 1})
+
+    all_ok = all_ok and partC_ok
+
+    # ------------------------------------------------------------------
     # report
     # ------------------------------------------------------------------
     n_fail_A = sum(1 for r in rows if r["item"].startswith("A ")
                    and not r["pass"])
     n_fail_B = sum(1 for r in rows if r["item"].startswith("B ")
+                   and not r["pass"])
+    n_fail_C = sum(1 for r in rows if r["item"].startswith("C ")
                    and not r["pass"])
     print("\n===== FedMGP protocol equivalence gate =====")
     print(f"Part A (native splitter vs manifest): "
@@ -212,6 +298,9 @@ def main():
           f"{'PASS' if partB_ok else f'FAIL ({n_fail_B} items)'}"
           f"  [gating]")
     print(f"structure seals: {'PASS' if struct_ok else 'FAIL'}")
+    print(f"Part C (bug-fix seals): "
+          f"{'PASS' if partC_ok else f'FAIL ({n_fail_C} items)'}"
+          f"  [gating]")
     for r in rows:
         if not r["pass"]:
             print(f"  [FAIL] {r['item']} got_len={r['got_len']} "
@@ -229,6 +318,7 @@ def main():
         "partA_native_equivalence": "PASS" if partA_ok else "FAIL",
         "partB_adapter_injection": "PASS" if partB_ok else "FAIL",
         "structure_seals": "PASS" if struct_ok else "FAIL",
+        "partC_bugfix_seals": "PASS" if partC_ok else "FAIL",
         "items": rows,
         "notes": [
             "Part A compares FedMGP's own same-seed split against the "

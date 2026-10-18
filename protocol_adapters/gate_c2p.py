@@ -21,6 +21,10 @@ Part B (gating, must all pass):
   B4 source-patch seal: every surgical replacement in patch_main_source
      applies exactly once (twice for the real-dict append) and the
      patched main.py still compiles
+  B5 frozen-argv seal: build_argv's frozen protocol values equal the
+     manifest protocol (clients/tasks/classes/seed + the 25-round
+     cadence), so a hand-edited drift in the adapter's hardcoded argv
+     cannot silently run off-protocol
 
 Usage (FedSMTA conda env, repo root):
 
@@ -293,11 +297,47 @@ def part_b(m, data_root):
           f"{len(run_c2p.HARD_SOURCE_PATCHES)} replacements ({n_hard} "
           f"sites), patched source compiles: PASS")
 
+    # ---- B5 frozen-argv seal ----
+    argv = run_c2p.build_argv(data_root, [], m)
+    flags, i = {}, 0
+    while i < len(argv):
+        if argv[i] == "--prompt_param":  # nargs: 9 values
+            flags["prompt_param"] = argv[i + 1:i + 10]
+            i += 10
+            continue
+        flags[argv[i][2:]] = argv[i + 1]
+        i += 2
+    p = m["protocol"]
+    want = {
+        "dataset": "ImageNet_R",
+        "num_clients": str(p["client_num"]),
+        "local_clients": str(p["client_num"]),
+        "tasks_global": str(p["task_num"]),
+        "epochs_global": str(5 * p["task_num"]),  # 5 rounds/task cadence
+        "numclass": str(p["nb_classes"]),
+        "num_classes": str(p["nb_classes"]),
+        "class_per_task": "8",   # == mask size, enforced by B1
+        "task_size": "8",
+        "seed": str(m["seed"]),
+    }
+    for k, v in want.items():
+        if flags.get(k) != v:
+            fail(f"B5: frozen argv --{k} is {flags.get(k)!r}, expected "
+                 f"{v!r} (manifest protocol drift)")
+    if flags.get("prompt_param") != ["25", "10", "10", "8", "0", "0", "6",
+                                     "10", "8"]:
+        fail(f"B5: prompt_param is {flags.get('prompt_param')!r}, expected "
+             "the official scripts/run_imagenetr.sh values")
+    print("[part B5] build_argv frozen values == manifest protocol "
+          "(clients/tasks/classes/seed/cadence + official prompt_param): "
+          "PASS")
+
     return {
         "B1_manifest_structure": "PASS",
         "B2_class_distribution_injection": "PASS",
         "B3_dataset_patches": "PASS",
         "B4_source_patch_seal": "PASS",
+        "B5_frozen_argv_seal": "PASS",
     }
 
 

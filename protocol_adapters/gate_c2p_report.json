@@ -23,6 +23,7 @@
     "B1_manifest_structure": "PASS",
     "B2_class_distribution_injection": "PASS",
     "B3_dataset_patches": "PASS",
-    "B4_source_patch_seal": "PASS"
+    "B4_source_patch_seal": "PASS",
+    "B5_frozen_argv_seal": "PASS"
   }
 }
