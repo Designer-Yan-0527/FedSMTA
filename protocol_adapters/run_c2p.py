@@ -49,7 +49,14 @@ Injection points (all fail-loud):
           froze. Without this, 15 of the 25 frozen client-tasks would
           never train.
   7. nni stub (get_next_parameter -> {}, report_* -> no-op), same pattern
-          as the FedMGP deepluke stub.
+     as the FedMGP deepluke stub.
+  8. metrics recorder (protocol_adapters/metrics_recorder.py): OBSERVES
+     the native task-boundary eval (which already evaluates every trained
+     client-task on the manifest test pool) and records
+     (client_id, after_task, test_task, accuracy) into the RunManager-
+     format CSV tree output/ImageNet-R/c2prompt/manifest_adapter/
+     seed_{seed}/metrics/. Pure observation: zero extra computation, zero
+     RNG impact, official stdout/log_train.txt unchanged.
 
 Protocol mapping (frozen, enforced against the manifest):
   dataset=ImageNet_R, num_clients=5, tasks_global=5 (5 tasks/client),
@@ -87,6 +94,8 @@ ADAPTER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = ADAPTER_DIR.parent
 if str(ADAPTER_DIR) not in sys.path:
     sys.path.insert(0, str(ADAPTER_DIR))
+
+import metrics_recorder  # noqa: E402
 
 C2P_ROOT = REPO_ROOT / "external_baselines" / "NeurIPS2025-C2Prompt"
 
@@ -318,6 +327,20 @@ SOURCE_PATCHES = [
                     old_client_1 = [0, 4]""",
      "            pass",
      1),
+    # 10. metrics recorder: observe the native boundary eval (it already
+    #     evaluates EVERY trained client-task on the manifest test pool)
+    #     and record the R[after_task][test_task] entry per client
+    ("            acc_global_list.append(acc_global)",
+     "            acc_global_list.append(acc_global)\n"
+     "            _C2P_RECORDER.record(int(client_index), "
+     "int(ep_g // args.tasks_global), int(model_task_id), "
+     "float(acc_global), phase=\"boundary\")",
+     1),
+    # 11. flush the recorder CSVs after each boundary eval block
+    ("        del model_for_eval",
+     "        del model_for_eval\n"
+     "        _C2P_RECORDER.flush(int(args.tasks_global))",
+     1),
 ]
 
 
@@ -457,6 +480,15 @@ def main():
     m = load_manifest(known.manifest)
     build_state(known.data_root)
 
+    recorder = metrics_recorder.MetricsRecorder(
+        out_root=REPO_ROOT / "output", dataset="ImageNet-R",
+        method="c2prompt", seed=int(m["seed"]),
+        meta={"manifest": str(Path(known.manifest).resolve()),
+              "adapter": "protocol_adapters/run_c2p.py",
+              "eval_pool": "manifest test_pool via C2Prompt native "
+                           "model_global_eval_hard (observation only, "
+                           "no added eval)"})
+
     root = str(C2P_ROOT.resolve())
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -474,6 +506,7 @@ def main():
     mod = types.ModuleType("c2prompt_main")
     mod.__file__ = src_path
     mod.__dict__["_C2P_MANIFEST"] = m
+    mod.__dict__["_C2P_RECORDER"] = recorder
 
     sys.argv = ["main.py"] + build_argv(known.data_root, forwarded, m)
 
@@ -487,6 +520,7 @@ def main():
               "surrogate_num", "nb_classes"):
         print(f"[protocol-adapter] {k:18s}= {p[k]}")
     print(f"[protocol-adapter] seed               = {m['seed']}")
+    print(f"[protocol-adapter] metrics            = {recorder.run_dir}")
     print("[protocol-adapter] frozen: tasks_global=5 epochs_global=25 "
           "local_clients=5 numclass=200 class_per_task=8")
     print("[protocol-adapter] method-native: lr=0.005 batch=64 "
