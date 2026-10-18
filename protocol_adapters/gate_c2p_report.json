@@ -1,0 +1,28 @@
+{
+  "manifest": "/root/autodl-tmp/users/ych/FedSMTA/protocol_manifests/inr_c5t5p40s5_seed42.json",
+  "part_a_native_vs_manifest": {
+    "verdict": "informational (expected: native != manifest)",
+    "native_structure": {
+      "classes_per_task": 20,
+      "virtual_class_space": 500,
+      "real_class_space": 200,
+      "tasks_per_client": 5,
+      "data_slice_per_task": "20% of each class (proportion)",
+      "sim": 0
+    },
+    "manifest_structure": {
+      "classes_per_task": 8,
+      "class_space": 200,
+      "tasks_per_client": 5,
+      "data_per_task": "inner-70% of the frozen outer subset"
+    },
+    "mean_overlap_native_real_vs_manifest_mask": 1.08,
+    "note": "a same-seed unadapted run sees a different partition; the adapter is required for sample-assignment equality"
+  },
+  "part_b": {
+    "B1_manifest_structure": "PASS",
+    "B2_class_distribution_injection": "PASS",
+    "B3_dataset_patches": "PASS",
+    "B4_source_patch_seal": "PASS"
+  }
+}

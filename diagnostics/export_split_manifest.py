@@ -54,6 +54,14 @@ Usage (FedSMTA conda env, from the repo root):
       --reference-checkpoint output/cifar100/fedta_a2/a2_anchor/seed_42/checkpoints/latest.pth \
       -o protocol_manifests/cifar100_c5t5p15s20_seed42.json \
       --verify-task0-replay
+
+ImageNet-R (reference run: output/ImageNet-R/fedta/inr_base_p40/seed_42;
+the fedta baseline itself, so S1/S4 are self-consistency seals):
+
+  python diagnostics/export_split_manifest.py --dataset ImageNet-R \
+      --reference-checkpoint output/ImageNet-R/fedta/inr_base_p40/seed_42/checkpoints/latest.pth \
+      -o protocol_manifests/inr_c5t5p40s5_seed42.json \
+      --verify-task0-replay
 """
 
 import argparse
@@ -123,6 +131,7 @@ def verify_task0_replay(args, manifest):
         "--client_num", str(args.client_num), "--task_num", str(args.task_num),
         "--private_class_num", str(args.private_class_num),
         "--surrogate_num", str(args.surrogate_num),
+        "--data_name", args.dataset,
     ])
     server = build_server(replay_args, run_manager=None)
     server.init_client()
@@ -146,11 +155,18 @@ def verify_task0_replay(args, manifest):
 
 def main():
     p = argparse.ArgumentParser("export the frozen split manifest")
+    p.add_argument("--dataset", choices=["cifar100", "ImageNet-R"],
+                   default="cifar100")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--client_num", type=int, default=5)
     p.add_argument("--task_num", type=int, default=5)
-    p.add_argument("--private_class_num", type=int, default=15)
-    p.add_argument("--surrogate_num", type=int, default=20)
+    p.add_argument("--private_class_num", type=int, default=15,
+                   help="15 for cifar100; 40 for ImageNet-R "
+                        "(200 classes - 5 clients x 40 = all private)")
+    p.add_argument("--surrogate_num", type=int, default=20,
+                   help="20/class for cifar100; ImageNet-R is always 5 "
+                        "(official FedTA main.py hardcodes process_testdata"
+                        "(5)); the flag is ignored for ImageNet-R")
     p.add_argument("--input_size", type=int, default=224)
     p.add_argument("--data_path", default="./local_datasets")
     p.add_argument("--reference-checkpoint", required=True,
@@ -165,21 +181,39 @@ def main():
 
     import numpy as np
 
+    if args.dataset == "ImageNet-R":
+        # official FedTA semantics: 200 classes, all private
+        # (5 clients x 40), surrogate fixed at 5/class
+        args.private_class_num = 40
+        args.surrogate_num = 5
+        nb_classes, test_size = 200, 6000
+    else:
+        nb_classes, test_size = 100, 10000
+
     # ---- regenerate outer + surrogate/test pool (exact RNG order) ----
     random.seed(args.seed)
     np.random.seed(args.seed)
-    from data.cifar100_subset_spliter import cifar100_Data_Spliter
+    if args.dataset == "cifar100":
+        from data.cifar100_subset_spliter import cifar100_Data_Spliter as \
+            Spliter
+    else:
+        from data.imagenet_r_subset_spliter import ImagenetR_spliter as \
+            Spliter
 
-    spliter = cifar100_Data_Spliter(
+    spliter = Spliter(
         client_num=args.client_num, task_num=args.task_num,
         private_class_num=args.private_class_num,
         input_size=args.input_size, data_path=args.data_path)
     client_data, client_mask = spliter.random_split()
-    spliter2 = cifar100_Data_Spliter(
+    spliter2 = Spliter(
         client_num=args.client_num, task_num=args.task_num,
         private_class_num=args.private_class_num,
         input_size=args.input_size, data_path=args.data_path)
-    surro_data, test_pool = spliter2.process_testdata(args.surrogate_num)
+    if args.dataset == "ImageNet-R":
+        # official FedTA main.py hardcodes the ImageNet-R surrogate count
+        surro_data, test_pool = spliter2.process_testdata(5)
+    else:
+        surro_data, test_pool = spliter2.process_testdata(args.surrogate_num)
 
     outer = {}
     for i in range(args.client_num):
@@ -242,24 +276,25 @@ def main():
     print("[seal S2] inner 70/30 sizes + disjoint cover: PASS")
 
     # ---- seal S3: surrogate + test pool partition the test set ----
-    if sorted(surrogate_indices + test_pool_indices) != list(range(10000)):
-        fail("surrogate + test_pool do not partition the 10k test set")
-    n_per_class = len(surrogate_indices) // 100
+    if sorted(surrogate_indices + test_pool_indices) != list(range(test_size)):
+        fail("surrogate + test_pool do not partition the test set")
+    n_per_class = len(surrogate_indices) // nb_classes
     print(f"[seal S3] surrogate({len(surrogate_indices)}, "
           f"{n_per_class}/class) + test_pool({len(test_pool_indices)}) "
           f"partition the test set: PASS")
 
     manifest = {
         "schema": "fedsmta-split-manifest-v1",
-        "dataset": "cifar100",
+        "dataset": args.dataset,
         "seed": args.seed,
         "protocol": {
+            "data_name": args.dataset,
             "client_num": args.client_num,
             "task_num": args.task_num,
             "private_class_num": args.private_class_num,
             "surrogate_num": args.surrogate_num,
             "input_size": args.input_size,
-            "nb_classes": 100,
+            "nb_classes": nb_classes,
         },
         "outer": outer,
         "surrogate": {"indices": surrogate_indices},
@@ -285,10 +320,12 @@ def main():
         json.dump(manifest, f)
     n_train = sum(len(outer[c][t]["raw_indices"])
                   for c in outer for t in outer[c])
+    total_train = 24000 if args.dataset == "ImageNet-R" else 50000
     print(f"\n[export_split_manifest] wrote {out}")
+    print(f"  dataset: {args.dataset}")
     print(f"  outer train samples: {n_train} "
           f"(official dirichlet int() truncation drops "
-          f"{50000 - n_train} samples; identical in both codebases)")
+          f"{total_train - n_train} samples; identical in both codebases)")
     print(f"  clients/tasks: {args.client_num} x {args.task_num}")
     print(f"  inner source: {manifest['provenance']['inner_source']}")
 

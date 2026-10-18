@@ -466,3 +466,64 @@ python protocol_adapters/run_fedmgp.py \
 - FedMGP 官方仓库 cifar100 路径有 3 个 bug，adapter 已运行时修复（不改文件）：①Server 从不给 client `update_data`（FedTA 语义恢复）②`CustomedSubset.__getitem__` PIL 转换被注释 ③local-prompt 阶段硬编码 `np.arange(200)` 在 100 类上触发 CUDA assert
 - 时序参考：25 rounds × 5 clients × 2 阶段 × 30 epochs，空闲 GPU 约 12–15h；当前 A4 pilot 占卡时约 35h（约 17s/epoch/client）
 - 环境：FedSMTA conda env 直接可用（torch 1.12.1 + timm 0.6.7 满足 FedMGP 依赖；deeplake 已 stub，无需安装）
+
+## 18. 外部 baseline（C²Prompt，ImageNet-R，原仓库 + protocol adapter）
+
+> C²Prompt 只在 ImageNet-R 上对齐（官方 CIFAR-100 路径是其私有 500 虚拟类协议，与我们 5c5t manifest 不兼容；主表 CIFAR-100 不含 C²Prompt）。
+> `external_baselines/NeurIPS2025-C2Prompt` 为官方仓库克隆，**零编辑**；所有注入通过 `protocol_adapters/run_c2p.py` 运行时完成（main.py 源码补丁 7 组 8 处 + vit_coda_p_hard.py 源码补丁 2 处 + iIMAGENET_R dataset override + nni stub）。训练 = manifest inner.train（与 FedTA/FedMGP 完全相同样本）；评测 = C²Prompt 原生 global eval（累计已训类），样本池 = manifest test_pool（6000 测试集去掉 1000 个 surrogate）。Replay/Memory: none（官方 v2 method 的 exemplar 路径是死代码，C²Prompt 只训当前 task 数据）。
+
+### 18.1 协议 manifest（冻结的划分真值，一次生成）
+
+```bash
+python diagnostics/export_split_manifest.py --dataset ImageNet-R \
+    --reference-checkpoint output/ImageNet-R/fedta/inr_base_p40/seed_42/checkpoints/latest.pth \
+    --verify-task0-replay \
+    -o protocol_manifests/inr_c5t5p40s5_seed42.json
+```
+
+- 已生成并通过四重 seal（S1 重生成 outer 与 checkpoint outer_split_manifest bit-identical / S2 inner 70/30 结构 / S3 surrogate 1000 + test_pool 5000 划满 6000 测试集 / S4 task-0 CPU 重放 fedta RNG 流验证 inner split）
+
+### 18.2 protocol equivalence gate（训练前必须 PASS）
+
+```bash
+python protocol_adapters/gate_c2p.py \
+    --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
+    --data-root local_datasets/imagenet-r \
+    -o protocol_adapters/gate_c2p_report.json
+```
+
+- Part A（同 seed 未适配原生分布 vs manifest，informational：官方 500 虚拟类/20 类 task/sim 重采样/20% 切片，mean overlap 1.08/8 类）+ B1 manifest 结构 + B2 补丁源码 exec 后三个 class_distribution dict == manifest masks/[0,1] + B3 dataset patches（getTrainData == inner-70% 样本×25 client-task、get_image_class_dict 一致、getTestData_hard == test_pool）+ B4 源码 seal（main.py 7 组 8 处 + vit_coda_p_hard.py 2 处，替换计数 + compile）——全 PASS（2026-10-18），报告 `protocol_adapters/gate_c2p_report.json`
+
+### 18.3 冒烟（已通过，2026-10-18）
+
+```bash
+# 1-task 全路径（round 5 eval）
+python protocol_adapters/run_c2p.py \
+    --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
+    --epochs_global 6 --tasks_global 6 --epochs_local 1
+# 2-task 边界路径（round 6 task 边界 + round 11 累计类 eval）
+python protocol_adapters/run_c2p.py \
+    --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
+    --epochs_global 12 --tasks_global 6 --epochs_local 1
+```
+
+- 两者均 `Finisned Training!` 零异常：1-task Avg=87.70；2-task Avg=90.43（含 Incremental_learning、全 client task 前进、边界/非边界 choosing 轮、t 温度、累计类 per-client eval）
+
+### 18.4 正式训练（izfree，tmux）
+
+```bash
+# izfree 环境需先装（FedTA_PLUS_NEW_Server 环境内）：
+pip install pyyaml transformers torch_optimizer
+
+tmux new -s c2p_inr_seed42
+cd /path/to/FedSMTA
+python protocol_adapters/run_c2p.py \
+    --manifest protocol_manifests/inr_c5t5p40s5_seed42.json
+```
+
+- **协议冻结**（与 manifest 不符直接退出）：ImageNet-R、200 类、5 clients × 5 tasks、class_per_task/task_size 8、epochs_global 25、local_clients 5（全参与）、seed 42
+- **协议映射**：epochs_global 25 = 官方 cadence（每 task 5 round，官方 15/3）；task progression 替换为全 client 前进（官方 50% client 采样 + ImageNet_R 硬编码 `ep_g//3` 2-client 切换是 tasks_global=3 专用语义，在 5 task 下会留 15 个 client-task 永不训练）
+- **method-native**（官方默认，可 forwarded flag 覆盖）：lr 0.005、batch 64、epochs_local 10、global_update_lr 100、prompt_param `25 10 10 8 0 0 6 10 8`（首项 25 = e_task_number，恰等于 5×5 个 global task）
+- 官方仓库有 2 个 cadence-latent bug（官方 15 轮/3-task cadence 下不可达，我们 25 轮/5-task 下必触发），adapter 已运行时修复（不改文件）：①`updateweight_with_promptchoosing` 的 global_class_stats recompute 读取内层循环残留 `std`，非边界 choosing 轮（ep_g%3==0 且 new_task=False）class_features 为空 → UnboundLocalError——加 `and class_features` guard（边界轮官方语义逐位不变）②task 相似度温度 `t` 的硬编码表在 ep_g>14 返回 None → TypeError——替换为等价闭式（ep_g 0–14 逐位相同）
+- 首次运行会下载 timm `vit_base_patch16_224` 的 augreg npz 权重（~330MB）到 `~/.cache/torch/hub/checkpoints/`；AutoDL 侧已预置
+- 环境：torch 1.12.1 + timm 0.6.7 + numpy 1.23.5（与 FedSMTA/FedTA_PLUS_NEW_Server 一致）
