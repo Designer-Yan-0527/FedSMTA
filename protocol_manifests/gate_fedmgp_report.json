@@ -1,0 +1,947 @@
+{
+  "test": "fedmgp_protocol_equivalence_gate",
+  "generated_at": "2026-10-18 11:50:46",
+  "manifest": "/root/autodl-tmp/users/ych/FedSMTA/protocol_manifests/cifar100_c5t5p15s20_seed42.json",
+  "fedmgp_root": "/root/autodl-tmp/users/ych/FedSMTA/external_baselines/FedMGP",
+  "result": "PASS",
+  "partA_native_equivalence": "PASS",
+  "partB_adapter_injection": "PASS",
+  "structure_seals": "PASS",
+  "items": [
+    {
+      "item": "A outer class_mask c0t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c0t0",
+      "pass": true,
+      "got_len": 1226,
+      "want_len": 1226
+    },
+    {
+      "item": "A outer class_mask c0t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c0t1",
+      "pass": true,
+      "got_len": 3182,
+      "want_len": 3182
+    },
+    {
+      "item": "A outer class_mask c0t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c0t2",
+      "pass": true,
+      "got_len": 1894,
+      "want_len": 1894
+    },
+    {
+      "item": "A outer class_mask c0t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c0t3",
+      "pass": true,
+      "got_len": 2148,
+      "want_len": 2148
+    },
+    {
+      "item": "A outer class_mask c0t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c0t4",
+      "pass": true,
+      "got_len": 1932,
+      "want_len": 1932
+    },
+    {
+      "item": "A outer class_mask c1t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c1t0",
+      "pass": true,
+      "got_len": 2453,
+      "want_len": 2453
+    },
+    {
+      "item": "A outer class_mask c1t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c1t1",
+      "pass": true,
+      "got_len": 1544,
+      "want_len": 1544
+    },
+    {
+      "item": "A outer class_mask c1t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c1t2",
+      "pass": true,
+      "got_len": 2011,
+      "want_len": 2011
+    },
+    {
+      "item": "A outer class_mask c1t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c1t3",
+      "pass": true,
+      "got_len": 2336,
+      "want_len": 2336
+    },
+    {
+      "item": "A outer class_mask c1t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c1t4",
+      "pass": true,
+      "got_len": 1586,
+      "want_len": 1586
+    },
+    {
+      "item": "A outer class_mask c2t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c2t0",
+      "pass": true,
+      "got_len": 2275,
+      "want_len": 2275
+    },
+    {
+      "item": "A outer class_mask c2t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c2t1",
+      "pass": true,
+      "got_len": 1706,
+      "want_len": 1706
+    },
+    {
+      "item": "A outer class_mask c2t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c2t2",
+      "pass": true,
+      "got_len": 1838,
+      "want_len": 1838
+    },
+    {
+      "item": "A outer class_mask c2t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c2t3",
+      "pass": true,
+      "got_len": 2037,
+      "want_len": 2037
+    },
+    {
+      "item": "A outer class_mask c2t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c2t4",
+      "pass": true,
+      "got_len": 2176,
+      "want_len": 2176
+    },
+    {
+      "item": "A outer class_mask c3t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c3t0",
+      "pass": true,
+      "got_len": 2440,
+      "want_len": 2440
+    },
+    {
+      "item": "A outer class_mask c3t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c3t1",
+      "pass": true,
+      "got_len": 2362,
+      "want_len": 2362
+    },
+    {
+      "item": "A outer class_mask c3t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c3t2",
+      "pass": true,
+      "got_len": 1372,
+      "want_len": 1372
+    },
+    {
+      "item": "A outer class_mask c3t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c3t3",
+      "pass": true,
+      "got_len": 2219,
+      "want_len": 2219
+    },
+    {
+      "item": "A outer class_mask c3t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c3t4",
+      "pass": true,
+      "got_len": 1621,
+      "want_len": 1621
+    },
+    {
+      "item": "A outer class_mask c4t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c4t0",
+      "pass": true,
+      "got_len": 2683,
+      "want_len": 2683
+    },
+    {
+      "item": "A outer class_mask c4t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c4t1",
+      "pass": true,
+      "got_len": 1741,
+      "want_len": 1741
+    },
+    {
+      "item": "A outer class_mask c4t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c4t2",
+      "pass": true,
+      "got_len": 1991,
+      "want_len": 1991
+    },
+    {
+      "item": "A outer class_mask c4t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c4t3",
+      "pass": true,
+      "got_len": 1604,
+      "want_len": 1604
+    },
+    {
+      "item": "A outer class_mask c4t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "A outer raw_indices c4t4",
+      "pass": true,
+      "got_len": 1559,
+      "want_len": 1559
+    },
+    {
+      "item": "A surrogate indices",
+      "pass": true,
+      "got_len": 2000,
+      "want_len": 2000
+    },
+    {
+      "item": "A test_pool indices",
+      "pass": true,
+      "got_len": 8000,
+      "want_len": 8000
+    },
+    {
+      "item": "B outer class_mask c0t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c0t0",
+      "pass": true,
+      "got_len": 1226,
+      "want_len": 1226
+    },
+    {
+      "item": "B inner train c0t0",
+      "pass": true,
+      "got_len": 858,
+      "want_len": 858
+    },
+    {
+      "item": "B inner test (eval set) c0t0",
+      "pass": true,
+      "got_len": 368,
+      "want_len": 368
+    },
+    {
+      "item": "B outer class_mask c0t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c0t1",
+      "pass": true,
+      "got_len": 3182,
+      "want_len": 3182
+    },
+    {
+      "item": "B inner train c0t1",
+      "pass": true,
+      "got_len": 2227,
+      "want_len": 2227
+    },
+    {
+      "item": "B inner test (eval set) c0t1",
+      "pass": true,
+      "got_len": 955,
+      "want_len": 955
+    },
+    {
+      "item": "B outer class_mask c0t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c0t2",
+      "pass": true,
+      "got_len": 1894,
+      "want_len": 1894
+    },
+    {
+      "item": "B inner train c0t2",
+      "pass": true,
+      "got_len": 1325,
+      "want_len": 1325
+    },
+    {
+      "item": "B inner test (eval set) c0t2",
+      "pass": true,
+      "got_len": 569,
+      "want_len": 569
+    },
+    {
+      "item": "B outer class_mask c0t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c0t3",
+      "pass": true,
+      "got_len": 2148,
+      "want_len": 2148
+    },
+    {
+      "item": "B inner train c0t3",
+      "pass": true,
+      "got_len": 1503,
+      "want_len": 1503
+    },
+    {
+      "item": "B inner test (eval set) c0t3",
+      "pass": true,
+      "got_len": 645,
+      "want_len": 645
+    },
+    {
+      "item": "B outer class_mask c0t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c0t4",
+      "pass": true,
+      "got_len": 1932,
+      "want_len": 1932
+    },
+    {
+      "item": "B inner train c0t4",
+      "pass": true,
+      "got_len": 1352,
+      "want_len": 1352
+    },
+    {
+      "item": "B inner test (eval set) c0t4",
+      "pass": true,
+      "got_len": 580,
+      "want_len": 580
+    },
+    {
+      "item": "B outer class_mask c1t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c1t0",
+      "pass": true,
+      "got_len": 2453,
+      "want_len": 2453
+    },
+    {
+      "item": "B inner train c1t0",
+      "pass": true,
+      "got_len": 1717,
+      "want_len": 1717
+    },
+    {
+      "item": "B inner test (eval set) c1t0",
+      "pass": true,
+      "got_len": 736,
+      "want_len": 736
+    },
+    {
+      "item": "B outer class_mask c1t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c1t1",
+      "pass": true,
+      "got_len": 1544,
+      "want_len": 1544
+    },
+    {
+      "item": "B inner train c1t1",
+      "pass": true,
+      "got_len": 1080,
+      "want_len": 1080
+    },
+    {
+      "item": "B inner test (eval set) c1t1",
+      "pass": true,
+      "got_len": 464,
+      "want_len": 464
+    },
+    {
+      "item": "B outer class_mask c1t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c1t2",
+      "pass": true,
+      "got_len": 2011,
+      "want_len": 2011
+    },
+    {
+      "item": "B inner train c1t2",
+      "pass": true,
+      "got_len": 1407,
+      "want_len": 1407
+    },
+    {
+      "item": "B inner test (eval set) c1t2",
+      "pass": true,
+      "got_len": 604,
+      "want_len": 604
+    },
+    {
+      "item": "B outer class_mask c1t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c1t3",
+      "pass": true,
+      "got_len": 2336,
+      "want_len": 2336
+    },
+    {
+      "item": "B inner train c1t3",
+      "pass": true,
+      "got_len": 1635,
+      "want_len": 1635
+    },
+    {
+      "item": "B inner test (eval set) c1t3",
+      "pass": true,
+      "got_len": 701,
+      "want_len": 701
+    },
+    {
+      "item": "B outer class_mask c1t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c1t4",
+      "pass": true,
+      "got_len": 1586,
+      "want_len": 1586
+    },
+    {
+      "item": "B inner train c1t4",
+      "pass": true,
+      "got_len": 1110,
+      "want_len": 1110
+    },
+    {
+      "item": "B inner test (eval set) c1t4",
+      "pass": true,
+      "got_len": 476,
+      "want_len": 476
+    },
+    {
+      "item": "B outer class_mask c2t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c2t0",
+      "pass": true,
+      "got_len": 2275,
+      "want_len": 2275
+    },
+    {
+      "item": "B inner train c2t0",
+      "pass": true,
+      "got_len": 1592,
+      "want_len": 1592
+    },
+    {
+      "item": "B inner test (eval set) c2t0",
+      "pass": true,
+      "got_len": 683,
+      "want_len": 683
+    },
+    {
+      "item": "B outer class_mask c2t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c2t1",
+      "pass": true,
+      "got_len": 1706,
+      "want_len": 1706
+    },
+    {
+      "item": "B inner train c2t1",
+      "pass": true,
+      "got_len": 1194,
+      "want_len": 1194
+    },
+    {
+      "item": "B inner test (eval set) c2t1",
+      "pass": true,
+      "got_len": 512,
+      "want_len": 512
+    },
+    {
+      "item": "B outer class_mask c2t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c2t2",
+      "pass": true,
+      "got_len": 1838,
+      "want_len": 1838
+    },
+    {
+      "item": "B inner train c2t2",
+      "pass": true,
+      "got_len": 1286,
+      "want_len": 1286
+    },
+    {
+      "item": "B inner test (eval set) c2t2",
+      "pass": true,
+      "got_len": 552,
+      "want_len": 552
+    },
+    {
+      "item": "B outer class_mask c2t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c2t3",
+      "pass": true,
+      "got_len": 2037,
+      "want_len": 2037
+    },
+    {
+      "item": "B inner train c2t3",
+      "pass": true,
+      "got_len": 1425,
+      "want_len": 1425
+    },
+    {
+      "item": "B inner test (eval set) c2t3",
+      "pass": true,
+      "got_len": 612,
+      "want_len": 612
+    },
+    {
+      "item": "B outer class_mask c2t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c2t4",
+      "pass": true,
+      "got_len": 2176,
+      "want_len": 2176
+    },
+    {
+      "item": "B inner train c2t4",
+      "pass": true,
+      "got_len": 1523,
+      "want_len": 1523
+    },
+    {
+      "item": "B inner test (eval set) c2t4",
+      "pass": true,
+      "got_len": 653,
+      "want_len": 653
+    },
+    {
+      "item": "B outer class_mask c3t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c3t0",
+      "pass": true,
+      "got_len": 2440,
+      "want_len": 2440
+    },
+    {
+      "item": "B inner train c3t0",
+      "pass": true,
+      "got_len": 1708,
+      "want_len": 1708
+    },
+    {
+      "item": "B inner test (eval set) c3t0",
+      "pass": true,
+      "got_len": 732,
+      "want_len": 732
+    },
+    {
+      "item": "B outer class_mask c3t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c3t1",
+      "pass": true,
+      "got_len": 2362,
+      "want_len": 2362
+    },
+    {
+      "item": "B inner train c3t1",
+      "pass": true,
+      "got_len": 1653,
+      "want_len": 1653
+    },
+    {
+      "item": "B inner test (eval set) c3t1",
+      "pass": true,
+      "got_len": 709,
+      "want_len": 709
+    },
+    {
+      "item": "B outer class_mask c3t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c3t2",
+      "pass": true,
+      "got_len": 1372,
+      "want_len": 1372
+    },
+    {
+      "item": "B inner train c3t2",
+      "pass": true,
+      "got_len": 960,
+      "want_len": 960
+    },
+    {
+      "item": "B inner test (eval set) c3t2",
+      "pass": true,
+      "got_len": 412,
+      "want_len": 412
+    },
+    {
+      "item": "B outer class_mask c3t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c3t3",
+      "pass": true,
+      "got_len": 2219,
+      "want_len": 2219
+    },
+    {
+      "item": "B inner train c3t3",
+      "pass": true,
+      "got_len": 1553,
+      "want_len": 1553
+    },
+    {
+      "item": "B inner test (eval set) c3t3",
+      "pass": true,
+      "got_len": 666,
+      "want_len": 666
+    },
+    {
+      "item": "B outer class_mask c3t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c3t4",
+      "pass": true,
+      "got_len": 1621,
+      "want_len": 1621
+    },
+    {
+      "item": "B inner train c3t4",
+      "pass": true,
+      "got_len": 1134,
+      "want_len": 1134
+    },
+    {
+      "item": "B inner test (eval set) c3t4",
+      "pass": true,
+      "got_len": 487,
+      "want_len": 487
+    },
+    {
+      "item": "B outer class_mask c4t0",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c4t0",
+      "pass": true,
+      "got_len": 2683,
+      "want_len": 2683
+    },
+    {
+      "item": "B inner train c4t0",
+      "pass": true,
+      "got_len": 1878,
+      "want_len": 1878
+    },
+    {
+      "item": "B inner test (eval set) c4t0",
+      "pass": true,
+      "got_len": 805,
+      "want_len": 805
+    },
+    {
+      "item": "B outer class_mask c4t1",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c4t1",
+      "pass": true,
+      "got_len": 1741,
+      "want_len": 1741
+    },
+    {
+      "item": "B inner train c4t1",
+      "pass": true,
+      "got_len": 1218,
+      "want_len": 1218
+    },
+    {
+      "item": "B inner test (eval set) c4t1",
+      "pass": true,
+      "got_len": 523,
+      "want_len": 523
+    },
+    {
+      "item": "B outer class_mask c4t2",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c4t2",
+      "pass": true,
+      "got_len": 1991,
+      "want_len": 1991
+    },
+    {
+      "item": "B inner train c4t2",
+      "pass": true,
+      "got_len": 1393,
+      "want_len": 1393
+    },
+    {
+      "item": "B inner test (eval set) c4t2",
+      "pass": true,
+      "got_len": 598,
+      "want_len": 598
+    },
+    {
+      "item": "B outer class_mask c4t3",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c4t3",
+      "pass": true,
+      "got_len": 1604,
+      "want_len": 1604
+    },
+    {
+      "item": "B inner train c4t3",
+      "pass": true,
+      "got_len": 1122,
+      "want_len": 1122
+    },
+    {
+      "item": "B inner test (eval set) c4t3",
+      "pass": true,
+      "got_len": 482,
+      "want_len": 482
+    },
+    {
+      "item": "B outer class_mask c4t4",
+      "pass": true,
+      "got_len": 8,
+      "want_len": 8
+    },
+    {
+      "item": "B outer raw_indices c4t4",
+      "pass": true,
+      "got_len": 1559,
+      "want_len": 1559
+    },
+    {
+      "item": "B inner train c4t4",
+      "pass": true,
+      "got_len": 1091,
+      "want_len": 1091
+    },
+    {
+      "item": "B inner test (eval set) c4t4",
+      "pass": true,
+      "got_len": 468,
+      "want_len": 468
+    },
+    {
+      "item": "B surrogate indices",
+      "pass": true,
+      "got_len": 2000,
+      "want_len": 2000
+    },
+    {
+      "item": "B test_pool indices",
+      "pass": true,
+      "got_len": 8000,
+      "want_len": 8000
+    },
+    {
+      "item": "B structure (unique raw indices, surrogate+pool=10k, total==manifest)",
+      "pass": true,
+      "got_len": 49936,
+      "want_len": 49936
+    }
+  ],
+  "notes": [
+    "Part A compares FedMGP's own same-seed split against the manifest; a FAIL means RNG-version drift and is recorded, not fatal (the adapter replaces the splitter regardless)",
+    "Part B is gating: it verifies the exact objects FedMGP loads under run_fedmgp.py are the manifest's splits, including the inner 30% evaluation sets",
+    "run_fedmgp.py additionally applies three documented official-repo bug fixes (Server never calls Client_DF.update_data for cifar100; CustomedSubset PIL conversion commented out; local-prompt phase hardcodes np.arange(200) causing a CUDA assert on 100-class logits) \u2014 none of them touch the data protocol; see protocol_adapters/manifest_splitter.py docstrings"
+  ]
+}

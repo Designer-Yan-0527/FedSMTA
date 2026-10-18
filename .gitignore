@@ -39,6 +39,9 @@ pretrain_model/
 Thumbs.db
 desktop.ini
 
+# ===== 外部 baseline 仓库（独立 git 仓库，单独管理）=====
+external_baselines/
+
 # ===== 临时文件 =====
 *.tmp
 ~$*

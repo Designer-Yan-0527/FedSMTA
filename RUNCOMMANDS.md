@@ -422,3 +422,47 @@ python tests/test_a1_parity.py --data-path <DATA_PATH>
 ```
 
 执行顺序：T0 → T1 → T2 → T3 → A1 正式评估 → A2 三臂正式训练。
+
+## 17. 外部 baseline（FedMGP，原仓库 + protocol adapter）
+
+> 论文表述：*We preserve the official implementation of each baseline and replace only the dataset partition interface to ensure identical client-task sample assignments.*
+> `external_baselines/FedMGP` 为官方仓库克隆，**零编辑**；所有注入/修复通过 `protocol_adapters/manifest_splitter.py` 的运行时 monkey-patch 完成。`local_datasets`、`pretrain_model` 在 FedMGP 目录内是指向本仓库的同名 symlink。
+
+### 17.1 协议 manifest（冻结的划分真值，一次生成）
+
+```bash
+python diagnostics/export_split_manifest.py \
+    --reference-checkpoint output/cifar100/fedta_a2/a2_anchor/seed_42/checkpoints/latest.pth \
+    --verify-task0-replay \
+    -o protocol_manifests/cifar100_c5t5p15s20_seed42.json
+```
+
+- 已生成并通过四重 seal（S1 outer 与 checkpoint bit-identical / S2 inner 70/30 结构 / S3 surrogate+pool 划满 10k 测试集 / S4 task-0 CPU 重放 fedta RNG 流验证 inner split）
+- inner split 取自 a2_anchor seed_42 checkpoint（证据链：A2 三臂 dsi bit-identical + RNG-neutral 设计 + S4 重放 PASS）；正式 fedta seed_42 checkpoint 拷回后可用 `--reference-checkpoint` 重新导出升级 provenance
+
+### 17.2 protocol equivalence gate（训练前必须 PASS）
+
+```bash
+python protocol_adapters/gate_fedmgp.py \
+    --manifest protocol_manifests/cifar100_c5t5p15s20_seed42.json
+```
+
+- Part A（FedMGP 原生 splitter 同 seed vs manifest，informational）+ Part B（adapter 注入后实际加载对象 vs manifest，gating）+ 结构 seal（索引唯一性、surrogate+pool=10k、总数=49936）——三项全 PASS（2026-10-18），报告 `protocol_manifests/gate_fedmgp_report.json`
+
+### 17.3 正式训练（tmux）
+
+```bash
+tmux new -s fedmgp_seed42
+cd /root/autodl-tmp/users/ych/FedSMTA
+python protocol_adapters/run_fedmgp.py \
+    --manifest protocol_manifests/cifar100_c5t5p15s20_seed42.json \
+    --device cuda
+```
+
+- **协议冻结**（与 manifest 不符直接退出）：cifar100、5 clients × 5 tasks、private_class_num 15、surrogate 20/类、global_epoch 5、seed 42
+- **协议对齐**（默认 30，可 `--local_epoch` 覆盖）：FedMGP 与 FedTA 同源，local epoch 语义直接可比
+- **method-native**（FedMGP 官方默认，可覆盖）：lr 0.001875、threshold 0.1、batch_size 16
+- 未知 CLI flag 原样转发给 FedMGP 自己的 `config/cifar100_delay.py`
+- FedMGP 官方仓库 cifar100 路径有 3 个 bug，adapter 已运行时修复（不改文件）：①Server 从不给 client `update_data`（FedTA 语义恢复）②`CustomedSubset.__getitem__` PIL 转换被注释 ③local-prompt 阶段硬编码 `np.arange(200)` 在 100 类上触发 CUDA assert
+- 时序参考：25 rounds × 5 clients × 2 阶段 × 30 epochs，空闲 GPU 约 12–15h；当前 A4 pilot 占卡时约 35h（约 17s/epoch/client）
+- 环境：FedSMTA conda env 直接可用（torch 1.12.1 + timm 0.6.7 满足 FedMGP 依赖；deeplake 已 stub，无需安装）
