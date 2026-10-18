@@ -75,6 +75,12 @@ def main():
     p.add_argument("--fedmgp_root", default=str(FEDMGP_ROOT))
     p.add_argument("-o", "--report", default="")
     args = p.parse_args()
+    # resolve the -o path against the invocation cwd BEFORE the chdir
+    # into the FedMGP root below: a relative report path would
+    # otherwise land inside the external repo, polluting the zero-edit
+    # checkout
+    if args.report:
+        args.report = str(Path(args.report).resolve())
 
     import numpy as np
     import os

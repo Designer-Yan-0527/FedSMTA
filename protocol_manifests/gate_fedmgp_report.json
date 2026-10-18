@@ -1,12 +1,13 @@
 {
   "test": "fedmgp_protocol_equivalence_gate",
-  "generated_at": "2026-10-18 11:50:46",
+  "generated_at": "2026-10-18 18:05:11",
   "manifest": "/root/autodl-tmp/users/ych/FedSMTA/protocol_manifests/cifar100_c5t5p15s20_seed42.json",
   "fedmgp_root": "/root/autodl-tmp/users/ych/FedSMTA/external_baselines/FedMGP",
   "result": "PASS",
   "partA_native_equivalence": "PASS",
   "partB_adapter_injection": "PASS",
   "structure_seals": "PASS",
+  "partC_bugfix_seals": "PASS",
   "items": [
     {
       "item": "A outer class_mask c0t0",
@@ -937,6 +938,24 @@
       "pass": true,
       "got_len": 49936,
       "want_len": 49936
+    },
+    {
+      "item": "C1 Client_DF.train np.arange(200) -> args.nb_classes (official anchor + patched code object active)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 1
+    },
+    {
+      "item": "C2 Client_DF.train wrapped with update_data (official Server never calls it + wrapper active)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 1
+    },
+    {
+      "item": "C3 CustomedSubset PIL restore (official anchor + behavioral: PIL-only transform returns tensor)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 1
     }
   ],
   "notes": [
