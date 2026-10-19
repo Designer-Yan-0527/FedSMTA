@@ -358,7 +358,7 @@ def patch_main_source(src):
 
 # ---------------------------------------------------------------------------
 # models_Cprompt/vit_coda_p_hard.py source-level surgical patches (official
-# cadence latents; both are masked by the official ImageNet-R cadence
+# cadence latents; all are masked by the official ImageNet-R cadence
 # epochs_global=15 / tasks_global=3, where every ep_g%3==0 round is a task
 # boundary and ep_g never exceeds 14. Under the frozen 25/5 protocol they
 # fire.)
@@ -366,16 +366,30 @@ def patch_main_source(src):
 
 HARD_SOURCE_PATCHES = [
     # (old, new, expected occurrence count)
-    # 8. updateweight_with_promptchoosing: the global_class_stats recompute
-    #    block reads `std` left over from the class_features loop; on
-    #    non-boundary choosing rounds (ep_g%3==0 with new_task=False)
-    #    class_features is empty -> UnboundLocalError. Guard the block so it
-    #    only runs when there is something to aggregate (boundary rounds
-    #    keep the official semantics bit-for-bit; on non-boundary rounds
-    #    the block is an identity recompute over unchanged class_stats and
-    #    global_class_stats persists).
+    # 8. global_class_stats fill gate (updateweight_with_promptchoosing):
+    #    one line, two cadence latents.
+    #    (a) non-boundary %3 rounds: the fill block reads `std` left over
+    #    from the class_features loop, but the calculate loop only runs on
+    #    new_task rounds, so class_features is empty -> UnboundLocalError.
+    #    `and class_features` guards it (boundary rounds keep the official
+    #    semantics bit-for-bit; a skipped non-boundary round is an identity
+    #    recompute over unchanged class_stats anyway, and
+    #    global_class_stats persists across rounds).
+    #    (b) task starts that are not %3 rounds (observed: round 5 of the
+    #    formal run, KeyError 126 in train_class): the official 15/3
+    #    cadence makes task_id = ep_g//3 change exactly on %3 rounds, so
+    #    `ep_g % 3 == 0` accidentally encodes "task start". Under the
+    #    frozen 25/5 cadence task starts are ep_g=5,10,15,20; at ep_g=5
+    #    the fill is skipped while train_class (which runs EVERY round,
+    #    `ep_g >= 0`) queries the new task's classes -> KeyError on the
+    #    first new-class batch. `or new_task` restores the official
+    #    invariant "stats are filled before train_class at every task
+    #    start". Equivalence: officially {new_task rounds} ==
+    #    {ep_g%3==0 rounds} == {0,3,6,9,12} and class_features is
+    #    non-empty exactly on those rounds, so the patched condition has
+    #    the identical truth table on the official cadence.
     ("        if ep_g % 3 == 0:",
-     "        if ep_g % 3 == 0 and class_features:",
+     "        if (ep_g % 3 == 0 or new_task) and class_features:",
      1),
     # 9. task-similarity sharpening temperature t: the official ImageNet_R
     #    schedule {1 if r%3==0; 0.9 for r in {2,5,8,11,14}=r%3==2;
@@ -475,6 +489,11 @@ def main():
                      help="imagenet-r folder containing train/ and test/ "
                           "(our FedTA layout; forwarded to C2Prompt as "
                           "--dataroot)")
+    cli.add_argument("--run-name", default="manifest_adapter",
+                     help="recorder run dir name under output/ImageNet-R/"
+                          "c2prompt/ (default manifest_adapter; use a "
+                          "distinct name for smoke runs so their metrics "
+                          "never mix with the formal run)")
     known, forwarded = cli.parse_known_args()
 
     m = load_manifest(known.manifest)
@@ -482,7 +501,7 @@ def main():
 
     recorder = metrics_recorder.MetricsRecorder(
         out_root=REPO_ROOT / "output", dataset="ImageNet-R",
-        method="c2prompt", seed=int(m["seed"]),
+        method="c2prompt", seed=int(m["seed"]), run_name=known.run_name,
         meta={"manifest": str(Path(known.manifest).resolve()),
               "adapter": "protocol_adapters/run_c2p.py",
               "eval_pool": "manifest test_pool via C2Prompt native "
@@ -531,8 +550,9 @@ def main():
           "inner-70% of the frozen outer subsets; eval pool = manifest "
           "test_pool), fork_rng devices=[] (single GPU), FedTA-aligned "
           "full task progression, nni stub, vit_coda_p_hard cadence-latent "
-          "bug fixes x2 (std guard on non-boundary choosing rounds; t "
-          "temperature closed form)")
+          "bug fixes x3 (std guard; global_class_stats fill gate fires on "
+          "every task start, not just ep_g%3==0 rounds; t temperature "
+          "closed form)")
     print("=" * 70)
 
     # C2Prompt main.py is a script (module-level training loop); executing

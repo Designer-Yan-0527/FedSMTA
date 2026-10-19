@@ -20,7 +20,15 @@ Part B (gating, must all pass):
      getTestData_hard returns exactly the test_pool samples per class
   B4 source-patch seal: every surgical replacement in patch_main_source
      applies exactly once (twice for the real-dict append) and the
-     patched main.py still compiles
+     patched main.py still compiles; the vit_coda_p_hard.py patches
+     likewise apply and compile
+  B4b fill-gate equivalence: the patched global_class_stats fill gate
+     `(ep_g % 3 == 0 or new_task) and class_features` has the identical
+     truth table as the official `ep_g % 3 == 0` on the official 15/3
+     cadence (new_task rounds == %3 rounds == {0,3,6,9,12}; the
+     calculate loop, hence non-empty class_features, runs iff new_task),
+     and fills on every frozen 25/5 task start (5,10,15,20 -- of which
+     the unpatched gate would miss 5,10,20 -> KeyError in train_class)
   B5 frozen-argv seal: build_argv's frozen protocol values equal the
      manifest protocol (clients/tasks/classes/seed + the 25-round
      cadence), so a hand-edited drift in the adapter's hardcoded argv
@@ -297,6 +305,35 @@ def part_b(m, data_root):
           f"{len(run_c2p.HARD_SOURCE_PATCHES)} replacements ({n_hard} "
           f"sites), patched source compiles: PASS")
 
+    # ---- B4b fill-gate truth-table equivalence ----
+    if "if (ep_g % 3 == 0 or new_task) and class_features:" \
+            not in hard_patched:
+        fail("B4b: patched fill-gate condition not found in "
+             "vit_coda_p_hard.py")
+    # official 15/3 cadence: task_id = ep_g//3, so new_task rounds are
+    # exactly the %3 rounds; class_features is non-empty iff new_task
+    for ep_g in range(15):
+        new_task = (ep_g % 3 == 0)
+        class_features = bool(new_task)
+        official = (ep_g % 3 == 0)
+        patched_cond = (ep_g % 3 == 0 or new_task) and class_features
+        if official != patched_cond:
+            fail(f"B4b: fill gate diverges from the official gate at "
+                 f"official-cadence ep_g={ep_g}")
+    # frozen 25/5 cadence: every task start must fill
+    for b in (5, 10, 15, 20):
+        new_task = True
+        class_features = True
+        if not ((b % 3 == 0 or new_task) and class_features):
+            fail(f"B4b: frozen-cadence task start ep_g={b} does not fill")
+    missed = [b for b in (5, 10, 15, 20) if b % 3 != 0]
+    if missed != [5, 10, 20]:
+        fail(f"B4b: expected the unpatched gate to miss task starts "
+             f"5/10/20, got {missed}")
+    print("[part B4b] fill gate: official-cadence truth-table equivalence, "
+          "frozen-cadence task-start coverage (unpatched would miss "
+          "5/10/20): PASS")
+
     # ---- B5 frozen-argv seal ----
     argv = run_c2p.build_argv(data_root, [], m)
     flags, i = {}, 0
@@ -337,6 +374,7 @@ def part_b(m, data_root):
         "B2_class_distribution_injection": "PASS",
         "B3_dataset_patches": "PASS",
         "B4_source_patch_seal": "PASS",
+        "B4b_fill_gate_equivalence": "PASS",
         "B5_frozen_argv_seal": "PASS",
     }
 

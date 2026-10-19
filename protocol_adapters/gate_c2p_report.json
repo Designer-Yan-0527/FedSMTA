@@ -24,6 +24,7 @@
     "B2_class_distribution_injection": "PASS",
     "B3_dataset_patches": "PASS",
     "B4_source_patch_seal": "PASS",
+    "B4b_fill_gate_equivalence": "PASS",
     "B5_frozen_argv_seal": "PASS"
   }
 }
