@@ -470,7 +470,7 @@ python protocol_adapters/run_fedmgp.py \
 ## 18. 外部 baseline（C²Prompt，ImageNet-R，原仓库 + protocol adapter）
 
 > C²Prompt 只在 ImageNet-R 上对齐（官方 CIFAR-100 路径是其私有 500 虚拟类协议，与我们 5c5t manifest 不兼容；主表 CIFAR-100 不含 C²Prompt）。
-> `external_baselines/NeurIPS2025-C2Prompt` 为官方仓库克隆，**零编辑**；所有注入通过 `protocol_adapters/run_c2p.py` 运行时完成（main.py 源码补丁 7 组 8 处 + vit_coda_p_hard.py 源码补丁 2 处 + iIMAGENET_R dataset override + nni stub）。训练 = manifest inner.train（与 FedTA/FedMGP 完全相同样本）；评测 = C²Prompt 原生 global eval（累计已训类），样本池 = manifest test_pool（6000 测试集去掉 1000 个 surrogate）。Replay/Memory: none（官方 v2 method 的 exemplar 路径是死代码，C²Prompt 只训当前 task 数据）。
+> `external_baselines/NeurIPS2025-C2Prompt` 为官方仓库克隆，**零编辑**；所有注入通过 `protocol_adapters/run_c2p.py` 运行时完成（main.py 源码补丁 7 组 8 处 + vit_coda_p_hard.py 源码补丁 2 处 + iIMAGENET_R dataset override + nni stub）。训练 = manifest inner.train（与 FedTA/FedMGP 完全相同样本）；评测 = C²Prompt 原生 global eval（累计已训类），样本池 = manifest test_pool（6000 测试集去掉 1000 个 surrogate）。Replay/Memory: **prev-task full local re-access**（2026-10-19 修正，原记 "none" 有误）。官方 v2 method 的 exemplar 路径确是死代码，但 `vit_coda_p_hard.py` updateweight 的 mover 分支（L673-685）在每个新 task 起点先对 client 自己的 **prev task 全量训练数据**重跑 `train_class`（按类加载真实样本、每类 20 epochs、更新 per-class prompt module），再训当前 task。数据不出本地（manifest patch 逐 client 锁定样本来源，无跨 client 泄漏），故不破坏联邦隐私；但违反 exemplar-free FCL 的"旧任务原数据即弃"设定——数据访问强度高于 GLFC 的 exemplar buffer。实证：seed_42 run 中 row1→row2 旧任务 +4~6pp（T1 为直接重训效果、T0 为共享 prompt pool 正向迁移）。论文主表数据访问列：FedTA/A2 = surrogate only，GLFC = exemplar m/class，C²Prompt = prev-task full re-access。
 
 ### 18.1 协议 manifest（冻结的划分真值，一次生成）
 
