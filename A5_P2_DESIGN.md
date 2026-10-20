@@ -5,6 +5,32 @@
 
 ## 0. 证据链与设计约束
 
+### 0.1 P1 NCM probe 原始结果（INR seed42，A2 run，2026-10-20）
+
+AA（client-mean per task → mean over seen tasks）：
+
+| after_task | feat | native | NCM-cos | NCM-euc | C²P 参考 |
+|---|---|---|---|---|---|
+| T0 | z_ref（冻结特征） | 82.87 | 79.06 | 77.70 | 86.86 |
+| T0 | z_op（当前 prompt 特征） | 82.87 | 82.49 | 81.32 | 86.86 |
+| T4 | z_ref | 79.43 | 76.04 | 74.92 | 91.14 |
+| T4 | z_op | 79.43 | 80.62 | 79.21 | 91.14 |
+
+- 不变性对账：z_ref 旧行（test_task=0）T0/T4 边界逐 client 一致（diff=+0.00 ×5）→ probe 完整性确认
+- 完整数据：`diagnostics_output/ncm_probe_inr_a2.csv`（per client × test_task × feat）+ `.summary.json`
+
+### 0.2 参照系数字（同协议 seed42）
+
+| 方法 | T0 AA | T4 AA | 数据访问 |
+|---|---|---|---|
+| FedTA | 82.87 | 77.12 | 当前任务 |
+| A2（ours） | 82.87 | 79.43 | 当前任务 |
+| C²Prompt | 86.86 | 91.14 | prev-task full re-access（mover 分支） |
+
+差距记账：C²P−A2 = 11.71 = T0 起点差 3.99 + 后续扩大 7.72（上界，含重训兜底）。
+
+### 0.3 证据 → 约束
+
 | 证据 | 结论 | 对 P2 的直接约束 |
 |---|---|---|
 | P0：INR 0 公共类（200 类全单客户端） | LCDC 跨客户端同类补偿通道关闭 | INR 上只能走**跨类**语义共享 |
