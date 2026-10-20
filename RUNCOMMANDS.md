@@ -276,6 +276,7 @@ python diagnostics/verify_tkr.py \
 - **注意**：task-end checkpoint 存的是广播后 prompt，无法重建分子态，train_log.csv 是唯一数据源（要求 run 开着 instrumentation）
 - 输出三口径（author local/global、local/local、server/server）× 两种聚合（ratio-of-means、mean-of-ratios）+ t=0 client-drift premium
 - **已得判决（2026-10-10，seed 42）**：author 口径 = 84.6/92.2/95.3/95.6%——**未复现论文 105–115%**，local/global prompt 不对称解释被实证否证（Roadmap §4.10）；server/server 口径与此前部署态 KRt（88.6/93.0/90.1/90.7）精确吻合，交叉验证通过
+- **三种子复算结案（2026-10-20，seed 42/1999/2025 各自 train_log.csv）**：author 口径三种子平均（= 作者协议）= **96.4/98.4/96.1/89.6%**，t=1..3 吻合论文 "around 98%"——残余段判 **seed 方差主导**（seed_42 单种子恰为最差）；seed_1999 t=4 本地态 72.4% vs server 态 102.9% = 本地 client drift 非全局遗忘；唯一残余 = Fig 4(b) 105–115% 读数复核（Roadmap §4.10）。三种子复算命令：`python diagnostics/verify_tkr.py --train_log output/cifar100/fedta/seed_1999/metrics/train_log.csv --global_epoch 5 --out_prefix diagnostics_output/tkr_seed1999`（seed_2025 同理）
 
 ### 9.3.3 slot 级碰撞诊断 —— 已删除（已测验失败）
 
@@ -527,3 +528,37 @@ python protocol_adapters/run_c2p.py \
 - 官方仓库有 2 个 cadence-latent bug（官方 15 轮/3-task cadence 下不可达，我们 25 轮/5-task 下必触发），adapter 已运行时修复（不改文件）：①`updateweight_with_promptchoosing` 的 global_class_stats recompute 读取内层循环残留 `std`，非边界 choosing 轮（ep_g%3==0 且 new_task=False）class_features 为空 → UnboundLocalError——加 `and class_features` guard（边界轮官方语义逐位不变）②task 相似度温度 `t` 的硬编码表在 ep_g>14 返回 None → TypeError——替换为等价闭式（ep_g 0–14 逐位相同）
 - 首次运行会下载 timm `vit_base_patch16_224` 的 augreg npz 权重（~330MB）到 `~/.cache/torch/hub/checkpoints/`；AutoDL 侧已预置
 - 环境：torch 1.12.1 + timm 0.6.7 + numpy 1.23.5（与 FedSMTA/FedTA_PLUS_NEW_Server 一致）
+
+## 19. FL-only 构造基线（FedAvg / FedProx / FedNova，自实现 adapter）
+
+> 主表 FL 下界三行。FedTA 论文（arXiv 2412.18355）Table 1 中这三行同样是构造基线（FedTA 官方仓库无独立实现），故不适用"官方仓库零编辑"外部基线纪律，直接在本仓库实现：`protocol_adapters/run_fl_baseline.py`。构造口径：ViT-B/16 ImageNet 预训练（`pretrain_model/ViT-B_16.npz`，与主线 original_model 同一 create_model 调用）+ **全参数联邦微调**（无冻结、无 prompt、无 anchor）+ 固定 nb_classes 头（cifar100=100 / ImageNet-R=200，class-IL）+ 顺序任务流（无 replay）。数据 = manifest 冻结划分：本地训练用当前 task 的 inner.train，评测用 inner.test（logits 按 (client, task) class_mask 掩码，语义与 run_fedmgp._fedmgp_eval_task / 主线 evaluate 完全一致）。
+>
+> 方法差异：fedavg = 样本加权平均；fedprox = 本地损失 + (μ/2)·‖w_i−w_glo‖²（全参数，w_glo 每轮快照，主表 μ=0.01）+ fedavg 聚合；fednova = 步数归一化再加权（w ← w + a_eff·Σ(n_i/Σn)(w_i−w)/a_i，a_i=实际优化步数=local_epoch×ceil(n_i/16)，a_eff=数据加权平均步数；同质步数下精确退化为 fedavg——标准公式，Wang et al. NeurIPS 2020 Alg.1）。本地优化器与 FedTA 血统 Client_DF.train 约定一致：Adam(lr 0.001, wd 1e-3)、CE、本地 batch 16（仓库硬编码）。
+
+### 19.1 正式训练（izfree，tmux；一个方法一个会话）
+
+```bash
+# CIFAR-100（manifest 复用 17.1 的冻结划分）
+for m in fedavg fedprox fednova; do
+  tmux new -s fl_${m}_cifar100_seed42 -d \
+    "cd /path/to/FedSMTA && python protocol_adapters/run_fl_baseline.py \
+       --manifest protocol_manifests/cifar100_c5t5p15s20_seed42.json \
+       --method $m"
+done
+
+# ImageNet-R（manifest 复用 18.1 的冻结划分；注意 INR 行预期 2-8 级别近乎全崩，量级对照 FedTA Table 1）
+for m in fedavg fedprox fednova; do
+  tmux new -s fl_${m}_inr_seed42 -d \
+    "cd /path/to/FedSMTA && python protocol_adapters/run_fl_baseline.py \
+       --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
+       --method $m"
+done
+```
+
+- 常用 flag：`--fedprox_mu 0.01`（仅 fedprox，主表 0.01，可扫 0.1）；`--lr 0.001 --local_epoch 30 --global_epoch 5`（默认即协议值）；`--save_ckpt` 存 task_XX_end.pth（每个约 350MB）；`--resume auto` 从 `checkpoints/latest.pth` 轮边界续训（每轮自动写）；`--max_tasks N` 截断（仅冒烟用）
+- 产物落 `output/{dataset}/{fedavg|fedprox|fednova}/manifest_adapter/seed_{seed}/`，metrics CSV（accuracy_matrix / summary_metrics / client_X_accuracy / records.jsonl）与主线 RunManager 格式完全一致，直接进三级（分数据集/分种子/分任务）聚合
+- 无 `--seed` 参数：seed 由 manifest 锁定（跑别的种子需先 export 对应 seed 的 manifest）
+- 冒烟已通过（2026-10-20，三方法各 1-task×1-round×1-epoch 全路径零异常；聚合公式另通过单元测试：fedavg 样本加权 / fednova 归一化公式与同质退化精确性）
+- 预期量级（FedTA Table 1 对照）：CIFAR-100 FedAvg T1≈50、后期显著崩塌；ImageNet-R FL 行 2-8。若正式数字量级偏离需回查
+- 环境：FedSMTA conda env（torch 1.12.1）；显存占用约 6-8GB（batch 16 全参微调）+ 客户端权重缓冲 ~1.7GB，24GB 4090 可跑
+
