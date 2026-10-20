@@ -47,7 +47,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from diag_utils import bootstrap_server, resolve_checkpoint, REPO_ROOT
+from diag_utils import bootstrap_server, resolve_checkpoint
 
 
 def parse_args():
@@ -70,6 +70,16 @@ def parse_args():
     p.add_argument("--data_path", default=None,
                    help="override dataset root (default: value from args.json)")
     p.add_argument("--device", default=None, help="override device (default: from args.json)")
+    p.add_argument("--prompt_task_mode", default="test",
+                   choices=["test", "current"],
+                   help="which prompt set z_op is computed under: 'test' "
+                        "(default, historical Phase-1 semantics -- task_id "
+                        "= the task being extracted) or 'current' (= "
+                        "native Client_DF.evaluate semantics -- task_id = "
+                        "client.task_id, i.e. the CURRENT task's prompts "
+                        "for ALL seen tasks, matching R[t][k] numbers). "
+                        "Non-default mode is reflected in the output "
+                        "filename to keep the caches apart.")
     return p.parse_args()
 
 
@@ -138,8 +148,15 @@ def main():
                     with torch.no_grad():
                         out_ref = server.origin_model(inp)
                         z_ref = out_ref["feat"].float().cpu().numpy()
+                        # 'test' mode = task being extracted (historical
+                        # Phase-1 semantics); 'current' mode = the client's
+                        # CURRENT task prompts for every seen task, matching
+                        # Client_DF.evaluate()'s task_id=self.task_id so the
+                        # features are directly comparable to native R[t][k]
+                        op_task = (t if args_cli.prompt_task_mode == "test"
+                                   else client.task_id)
                         out_op = client.vit(
-                            inp, task_id=t,
+                            inp, task_id=op_task,
                             cls_features=out_ref["pre_logits"], train=True)
                         z_op = out_op["feat"].float().cpu().numpy()
                     b = z_ref.shape[0]
@@ -162,6 +179,8 @@ def main():
     out_dir = Path(args_cli.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"features_{run_args.data_name}_{Path(ckpt_path).stem}"
+    if args_cli.prompt_task_mode != "test":
+        stem += f"_prompt{args_cli.prompt_task_mode}"
     npz_path = out_dir / f"{stem}.npz"
 
     np.savez_compressed(
@@ -195,6 +214,7 @@ def main():
     meta = {
         "run_dir": str(Path(args_cli.run_dir).resolve()),
         "checkpoint": str(ckpt_path),
+        "prompt_task_mode": args_cli.prompt_task_mode,
         "round": completed_round,
         "data_name": run_args.data_name,
         "nb_classes": run_args.nb_classes,

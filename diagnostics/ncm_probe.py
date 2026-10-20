@@ -20,7 +20,31 @@ Design (frozen 2026-10-20, P0 audit + external review converged):
     native numbers (run metrics client CSVs) are directly comparable;
   - NCM variants: cosine and Euclidean nearest-mean;
   - native path: joined from {run_dir}/metrics/client_X_accuracy.csv
-    (recorded at the same boundaries during the A2 run).
+    (recorded at the same boundaries during the A2 run), and the joined
+    AA is cross-checked against the run's accuracy_matrix.csv (fail
+    closed on >0.02pp divergence);
+  - z_op prompt condition: --prompt_task_mode current (default) recomputes
+    z_op under the CURRENT task's prompts for all seen tasks -- the same
+    task_id=self.task_id condition Client_DF.evaluate() uses, so z_op
+    numbers are directly comparable to native R[t][k]. (extract_features
+    default 'test' mode = per-task prompts, kept for the historical
+    Phase-1 diagnostics; the mode is part of the cache filename and is
+    validated on every cache hit.)
+
+INTERPRETATION GUARDS (from the P1 review, do not weaken):
+
+  - z_ref is the MAIN result: prototypes live in a frozen feature space
+    and could be maintained online as per-class sum/count at first
+    sighting -- deployable under FCL constraints without re-visiting
+    historical private data;
+  - z_op is AUXILIARY/ORACLE: at boundary t its prototypes re-extract
+    OLD tasks' train features with the current model = retrospective
+    data access. An upper-bound diagnostic, not an online method;
+  - ImageNet-R has ZERO public classes (P0 manifest audit, 2026-10-20),
+    so NCM gains here can only evidence the value of a better
+    class-level CLASSIFICATION INTERFACE -- never federated/cross-client
+    transfer. CIFAR-100 (25 public classes) is where that claim could be
+    tested later.
 
 T0-gap criterion (from the review): if NCM already closes a large part
 of the ~4pp T0 gap to C2Prompt, A5's shared interface is primarily a
@@ -68,6 +92,10 @@ def parse_args():
                    help="optional comma-separated C2Prompt reference AAs, "
                         "one per checkpoint in the same order (e.g. "
                         "'86.86,91.14')")
+    p.add_argument("--prompt_task_mode", default="current",
+                   choices=["test", "current"],
+                   help="z_op prompt condition (see extract_features.py); "
+                        "'current' (default) matches native evaluate()")
     p.add_argument("--data_path", default=None,
                    help="forwarded to extract_features.py if extraction "
                         "is needed")
@@ -75,25 +103,35 @@ def parse_args():
     return p.parse_args()
 
 
-def ensure_features(run_dir, ckpt_rel, feat_dir, data_path, device):
+def ensure_features(run_dir, ckpt_rel, feat_dir, data_path, device,
+                    prompt_mode):
     """Return (npz_path, meta_path), extracting via extract_features.py
-    (--split both) if the cached npz does not exist yet."""
-    with open(Path(run_dir) / "args.json", "r", encoding="utf-8") as f:
+    (--split both) if the cached npz does not exist yet. On EVERY access
+    (cache hit or fresh extraction) the cached meta is validated against
+    the requested experiment identity -- run_dir, seed, checkpoint name,
+    nb_classes and prompt_task_mode -- and the probe fails closed on any
+    mismatch, so features from different runs/seeds/modes can never be
+    silently mixed."""
+    run_dir = Path(run_dir)
+    with open(run_dir / "args.json", "r", encoding="utf-8") as f:
         run_args = json.load(f)
     # diag_utils.resolve_checkpoint resolves bare names against run_dir, not
     # run_dir/checkpoints -- normalize a bare task_XX_end.pth to the
     # checkpoints/-relative form
-    if "/" not in ckpt_rel and not Path(run_dir, ckpt_rel).is_file():
+    if "/" not in ckpt_rel and not (run_dir / ckpt_rel).is_file():
         ckpt_rel = f"checkpoints/{ckpt_rel}"
     stem = f"features_{run_args['data_name']}_{Path(ckpt_rel).stem}"
+    if prompt_mode != "test":
+        stem += f"_prompt{prompt_mode}"
     npz = feat_dir / f"{stem}.npz"
-    meta = feat_dir / f"{stem}.json"
+    meta_p = feat_dir / f"{stem}.json"
     if not npz.is_file():
         feat_dir.mkdir(parents=True, exist_ok=True)
         cmd = [sys.executable, str(EXTRACT),
                "--run_dir", str(run_dir),
                "--checkpoint", str(ckpt_rel),
                "--split", "both",
+               "--prompt_task_mode", prompt_mode,
                "--out_dir", str(feat_dir)]
         if data_path:
             cmd += ["--data_path", data_path]
@@ -101,9 +139,34 @@ def ensure_features(run_dir, ckpt_rel, feat_dir, data_path, device):
             cmd += ["--device", device]
         print(f"[ncm-probe] extracting features: {' '.join(cmd)}")
         subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
-    if not npz.is_file() or not meta.is_file():
+    if not npz.is_file() or not meta_p.is_file():
         raise RuntimeError(f"feature files missing after extraction: {npz}")
-    return npz, meta
+    with open(meta_p, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    problems = []
+    if meta.get("run_dir") != str(run_dir.resolve()):
+        problems.append(f"run_dir {meta.get('run_dir')!r} != "
+                        f"{str(run_dir.resolve())!r}")
+    if meta.get("seed") != run_args.get("seed"):
+        problems.append(f"seed {meta.get('seed')!r} != "
+                        f"{run_args.get('seed')!r}")
+    if Path(str(meta.get("checkpoint", ""))).name != Path(ckpt_rel).name:
+        problems.append(f"checkpoint {meta.get('checkpoint')!r} does not "
+                        f"match requested {ckpt_rel!r}")
+    if meta.get("nb_classes") != run_args.get("nb_classes"):
+        problems.append(f"nb_classes {meta.get('nb_classes')!r} != "
+                        f"{run_args.get('nb_classes')!r}")
+    if meta.get("prompt_task_mode", "test") != prompt_mode:
+        problems.append(f"prompt_task_mode "
+                        f"{meta.get('prompt_task_mode', 'test')!r} != "
+                        f"{prompt_mode!r}")
+    if problems:
+        raise RuntimeError(
+            "cached feature file was produced by a DIFFERENT experiment "
+            f"({npz}): " + "; ".join(problems) +
+            " -- point --features_dir at a fresh directory or remove the "
+            "stale cache")
+    return npz, meta_p
 
 
 def build_protos(z, labels):
@@ -117,11 +180,14 @@ def build_protos(z, labels):
 
 
 def ncm_predict(z, protos, allowed):
-    """allowed: list of class ids with prototypes. Returns predicted
-    class ids under cosine and Euclidean NCM."""
-    classes = [c for c in allowed if c in protos]
-    if not classes:
-        raise RuntimeError("no prototype covers the class mask")
+    """allowed: list of class ids. Returns predicted class ids under
+    cosine and Euclidean NCM. Fail closed: EVERY allowed class must have
+    a prototype -- silently dropping candidates would shrink the choice
+    set and inflate accuracy."""
+    missing = [c for c in set(allowed) if c not in protos]
+    if missing:
+        raise RuntimeError(f"allowed classes without prototypes: {missing}")
+    classes = list(allowed)
     P = np.stack([protos[c] for c in classes])  # (K, d)
     zn = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1e-12)
     Pn = P / (np.linalg.norm(P, axis=1, keepdims=True) + 1e-12)
@@ -153,6 +219,10 @@ def main():
     ckpts = [c.strip() for c in args.checkpoints.split(",") if c.strip()]
     c2p = ([float(x) for x in args.c2p.split(",")]
            if args.c2p else [None] * len(ckpts))
+    if args.c2p and len(c2p) != len(ckpts):
+        raise SystemExit(f"--c2p has {len(c2p)} values but "
+                         f"--checkpoints has {len(ckpts)} -- one reference "
+                         f"AA per checkpoint, same order")
 
     native = load_native(run_dir)
     rows = []
@@ -165,7 +235,8 @@ def main():
                              f"got {ckpt!r}")
         t = int(m.group(1))
         npz_path, meta_path = ensure_features(run_dir, ckpt, feat_dir,
-                                              args.data_path, args.device)
+                                              args.data_path, args.device,
+                                              args.prompt_task_mode)
         data = np.load(npz_path)
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
@@ -221,6 +292,28 @@ def main():
                               "aa_ncm_cos": round(float(cos), 2),
                               "aa_ncm_euc": round(float(euc), 2),
                               "c2p_ref": ref})
+
+        # integrity check: the joined aa_native must reproduce the run's
+        # own accuracy_matrix.csv row for this boundary (both = client-mean
+        # per task, then mean over seen tasks). Fail closed on >0.02pp.
+        matrix = {}
+        with open(run_dir / "metrics" / "accuracy_matrix.csv", newline="",
+                  encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                vals = [float(v) for k, v in row.items()
+                        if k.startswith("T") and v not in (None, "")]
+                matrix[int(row["after_task"])] = float(np.mean(vals))
+        aa_native = [s["aa_native"] for s in summaries
+                     if s["after_task"] == t][0]
+        if t not in matrix:
+            raise RuntimeError(f"accuracy_matrix.csv has no row for "
+                               f"after_task {t}")
+        if abs(matrix[t] - aa_native) > 0.02:
+            raise RuntimeError(
+                f"aa_native from client CSVs ({aa_native:.2f}) diverges "
+                f"from accuracy_matrix.csv row ({matrix[t]:.2f}) at "
+                f"after_task {t} -- join key mismatch, do not trust this "
+                f"probe run")
 
     out_csv = Path(args.out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
