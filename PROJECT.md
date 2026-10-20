@@ -4,103 +4,87 @@ FedTA：基于 prompt 的联邦持续学习（Federated Continual Learning）项
 服务器维护全局 prompt / 原型 / 分类头，多个客户端在私有持续任务流上本地训练，
 通过 BGPS（原型贪心相似度选择/修复）与 SIKF（知识蒸馏融合 prompt）做聚合。
 
-**当前只支持 `cifar100` 和 `ImageNet-R` 两个数据集**，其他数据集（5datasets、svhn-mnist、office_home 等）的配置与代码已删除。
+**当前只支持 `cifar100` 和 `ImageNet-R` 两个数据集**，其他数据集配置与代码已删除。
 
 ## 1. 目录总览
 
 ```
 FedSMTA/
 ├── main.py                           # 训练入口：参数解析 → 数据划分 → Server_DF 启动
-├── runtime_utils.py                  # Phase 0 运行时工程：run 目录管理 / Tee 日志 /
-│                                     #   原子 checkpoint 保存 / resume / RNG 状态 / accuracy 读写
-├── utils.py                          # 通用工具：accuracy、build_transform、
-│                                     #   global_distillation_loss、CosineSimilarityClassifier
-├── test.py                           # 一次性数据脚本（从 imagenet2012 每类采样，非测试文件）
-│
-├── config/
-│   └── datasets_delay.py            # 全部命令行参数定义（cifar100 / ImageNet-R 共用，
-│                                     #   数据集由 --data_name 选择）
+├── runtime_utils.py                  # Phase 0 运行时工程：run 目录 / Tee 日志 /
+│                                     #   原子 checkpoint / resume / RNG 状态 / accuracy 读写
+├── utils.py                          # 通用工具
+├── config/datasets_delay.py          # 全部命令行参数定义（两数据集共用）
 │
 ├── data/                             # 数据集加载与划分
-│   ├── cifar100_subset_spliter.py   #   CIFAR-100 划分：客户端×任务，公共类 Dirichlet 分配，
-│   │                                 #   CustomedSubset 包装；process_testdata 产出代理/测试集
-│   ├── imagenet_r_subset_spliter.py #   ImageNet-R 划分（同上结构，200 类）
-│   ├── continual_datasets.py        #   Imagenet_R 数据集类：tar 解压检查、首次 80/20 划分
-│   │                                 #   （文件移动到 train/test 子目录，一次性固化）、按类加载
-│   └── iCIFAR100c.py                #   通用数据集包装：surrogate/test 子集构建，
-│                                     #   兼容 ragged 图片数据（ImageNet-R 尺寸不一）
+│   ├── cifar100_subset_spliter.py    #   CIFAR-100 划分（公共类 Dirichlet 分配）
+│   ├── imagenet_r_subset_spliter.py  #   ImageNet-R 划分（每客户端 40 私有类、0 公共类）
+│   ├── continual_datasets.py         #   Imagenet_R 类：tar 解压检查、一次性 80/20 固化
+│   └── iCIFAR100c.py                 #   通用包装：surrogate/test 子集、ragged 图片兼容
 │
 ├── Models/                           # 模型与联邦逻辑
-│   ├── Server_DF.py                 #   服务器：train_clients 主循环、BGPS
-│   │                                 #   (choose_best_proto_greedy_similarity_fixed_key)、
-│   │                                 #   SIKF (kd_fusion_prompt)、fed_avg_head、广播、
-│   │                                 #   Phase 0 checkpoint/评估/指标
-│   ├── Client_DF.py                 #   客户端：get_data (70/30 划分并记录索引)、本地训练
-│   │                                 #   (prompt + Tail_Anchor)、原型提取、评估、
-│   │                                 #   state_dict_for_checkpoint / rebuild_data_from_indices
-│   ├── Tail_Anchor.py               #   Tail Anchor 模块（key + anchor_pool）
-│   ├── classification_head.py       #   Chead 分类头（逐任务使用）
-│   ├── global_prompt.py             #   Global_Prompt（prompt pool）
-│   ├── vision_transformer.py        #   ViT 骨干网络
-│   ├── vision_transformer__l2p.py   #   L2P 风格 ViT（带 prompt 支持，训练用）
-│   ├── models.py                    #   timm 模型注册
-│   └── CosineSimilarityClassifier.py
+│   ├── Server_DF.py                  #   服务器：train_clients 主循环、BGPS、SIKF、
+│   │                                 #   fed_avg_head、广播、checkpoint/评估
+│   ├── Client_DF.py                  #   客户端：get_data (70/30)、本地训练 (prompt +
+│   │                                 #   Tail_Anchor)、A2 post-step restore、评估
+│   ├── Tail_Anchor.py                #   Tail Anchor（key + anchor_pool，top-1 路由）
+│   ├── classification_head.py        #   per-task Chead
+│   ├── global_prompt.py              #   prompt pool
+│   ├── vision_transformer*.py        #   ViT 骨干（含 L2P 风格变体）
+│   └── models.py                     #   timm 模型注册
 │
-├── pretrain_model/
-│   └── ViT-B_16.npz                 # ViT-B/16 预训练权重（服务器端 original_model 使用）
+├── diagnostics/                      # 诊断脚本（全部 observer-only，复刻训练 RNG 流）：
+│   │                                 #   extract_features / compatibility_drift (2×2) /
+│   │                                 #   analyze_class_retention (4combo) / verify_slot_binding (D0) /
+│   │                                 #   collision_exposure (D1 v2) / analyze_landing_spots /
+│   │                                 #   verify_tkr / a1_snapshot_eval / ncm_probe (A5 P1)
+├── tests/                            # Gate 0A/0B/0C + A2/A1 回归测试
 │
-├── RUNCOMMANDS.md                    # 运行命令说明
-└── output/                           # 训练产物（运行时自动生成，见 RUNCOMMANDS.md 第 8 节）
+├── protocol_manifests/               # 冻结划分真值（cifar100_c5t5p15s20 / inr_c5t5p40s5，
+│                                     #   ×seed42；外部基线统一协议的数据源）
+├── protocol_adapters/                # 外部基线 adapter：run_fedmgp / run_c2p /
+│                                     #   run_fl_baseline (FedAvg/FedProx/FedNova 自实现) /
+│                                     #   gate_* / manifest_splitter / metrics_recorder
+├── external_baselines/               # 官方仓库克隆（零编辑）：FedMGP、NeurIPS2025-C2Prompt
+│
+├── pretrain_model/ViT-B_16.npz       # ViT-B/16 预训练权重（original_model 用）
+├── RUNCOMMANDS.md                    # 全部运行/诊断/测试命令
+├── FEDSMTA_ROADMAP.md                # 研发路线（结论主干 / 失败存档 / A2+A5 活跃方向）
+└── output/                           # 训练产物（结构见 RUNCOMMANDS.md §8）
 ```
 
 ## 2. 核心执行流程
 
 ```
-main.py
-  ├─ 解析参数（config/datasets_delay.py）
-  ├─ 固定种子（torch / numpy / random）
-  ├─ RunManager(args)                 # 建 run 目录、Tee 日志、解析 resume 目标
-  ├─ 数据划分（cifar100 / ImageNet-R spliter）
-  │    → client_data[i][task]，client_mask[i][task]（每个客户端的任务数据与类别）
-  ├─ original_model = ViT-B/16 预训练模型（冻结，提供 cls_features）
-  └─ Server_DF(...).start()
-       ├─ init_client()               # 创建 client_num 个 Client_DF
-       ├─ load_checkpoint()           # resume 时恢复状态（RNG 状态最后恢复）
-       └─ train_clients()             # 每轮：
-            1. clients[j].update_data()   # 切换任务时做 70/30 划分（记录索引）
-            2. clients[j].train()         # 本地训练 prompt + Tail_Anchor
-            3. BGPS 原型聚合/修复          # threshold 由 --threshold 控制
-            4. SIKF kd_fusion_prompt      # 任务最后一轮之外的轮次执行
-            5. fed_avg_head               # 分类头联邦平均
-            6. 广播全局原型/头/prompt
-            7. (任务结束) 全任务评估 → 指标 → checkpoint → 日志落盘
+main.py → 解析参数 → 固定种子 → RunManager → 数据划分 → Server_DF.start()
+  每轮：clients[j].update_data()（任务切换时 70/30 切分并记录索引）
+       → clients[j].train()（prompt + Tail_Anchor；fedta_a2 下 post-step restore）
+       → BGPS 原型聚合/修复 → SIKF kd_fusion_prompt → fed_avg_head → 广播
+  任务边界：全任务评估 → 指标 CSV → checkpoint
 ```
+
+外部基线路径：`protocol_adapters/run_*.py` 读冻结 manifest → monkey-patch 官方仓库
+（FedMGP/C²P）或自实现（FL 三基线）→ `MetricsRecorder` 落 RunManager 同格式 CSV。
 
 ## 3. 关键架构约定
 
-- **共享 ViT 实例**：所有客户端共享服务器传入的同一个 ViT（`self.model`）；各客户端的 prompts 以 deepcopy 保存在客户端侧，训练前 `load_prompts` 加载。
-- **original_model**：服务器加载的冻结预训练 ViT（`pretrain_model/ViT-B_16.npz`），训练时提供 `cls_features` 做蒸馏/特征引导，不参与更新。
-- **分类头**：`client.heads[task]` 存放每个任务的 `Chead` 模块；服务器侧有 `global_head` 与 `fix_keys`（BGPS 修复的类别）。
-- **checkpoint 一致性**：`data_split_indices` 记录每个任务的 70/30 划分索引，resume 时精确重建 test_loader 与 traindata；RNG 状态（python/numpy/torch/cuda）在所有状态恢复完成后**最后**恢复。
-- **ImageNet-R 划分固化**：首次运行时把图片移动到 `train/`、`test/` 子目录，此后直接复用磁盘上的划分结果，保证多次运行一致。
+- **共享 ViT 实例**：所有客户端共享服务器传入的同一 ViT；prompts 以 deepcopy 保存在客户端侧
+- **original_model**：冻结预训练 ViT，训练时提供 cls_features 做蒸馏/特征引导
+- **method flag**：`--method fedta`（read-only 基线）/ `fedta_a2`（接口保护，`--a2_arm key|anchor|both`）
+- **checkpoint 一致性**：`data_split_indices` 记录 70/30 划分；外层 manifest 逐位校验；RNG 状态最后恢复
+- **ImageNet-R 划分固化**：首次运行 80/20 移动到 train/test 子目录后复用
 
 ## 4. 环境依赖
 
-- Python 3.9+
-- PyTorch 2.x（开发环境为 2.8.0+cu128）
-- timm（模型创建 / 优化器 / 调度器）
-- torchvision、scikit-learn、numpy、matplotlib、tqdm
-- 无需 deeplake（该依赖原本只用于已删除的 office_home 数据集）
+Python 3.9+ / PyTorch 2.x（开发环境 2.8.0+cu128；服务器 FedSMTA env 为 torch 1.12.1 + timm 0.6.7）/ timm / torchvision / scikit-learn / numpy / matplotlib / tqdm。外部基线另需 pyyaml + transformers + torch_optimizer（C²P）。
 
-## 5. 已测验失败方案存档（2026-10-10）
+## 5. 已测验失败方案存档
 
-以下方案/假说**已经实验检验失败**，命令已从 `RUNCOMMANDS.md` 移除（节号留 tombstone），完整判决依据见 [FEDSMTA_ROADMAP.md §11](file:///d:/MyWork/FedSMTA/FEDSMTA_ROADMAP.md)（唯一汇总处）：
+失败判决（多模态主线、slot id 绑定、碰撞链、slot hijacking、落点流量、瞬态命中、routing instability、key 位移直接致伤等）的唯一汇总处是 **FEDSMTA_ROADMAP.md §4**，含预注册判据与一句话依据；旧命令在 git 历史。存活结论主干见 Roadmap §3。
 
-- **多模态主线（Semantic-K2 / Oracle-K2 / UOT，Phase 2 全线）**：Phase 1 判负——robust multimodal prevalence 0/25，halt criterion 触发，主线冻结（`analyze_multimodality.py` / `synthetic_oracle_k2.py` / `check_feature_batch_sensitivity.py` 的命令已删）
-- **"slot id = class id" 显式绑定**：D0 判死（diag_share=0.000，绑定涌现形成）
-- **简单碰撞链 / slot hijacking / 落点流量 / 瞬态命中 / routing instability（KL/JS）/ key 位移直接因果**：Phase 4 D1-lite、D1 v2 与落点分析逐一证伪——损伤主通道为 anchor 内容失配，原版 `slot_collision_diagnostic.py` 被 `collision_exposure_diagnostic.py` 取代
-- **早期假说**：公共类跨客户端强化（retention 反向）、聚合介导机制（85% 走本地 KA 通道）、协议结构性脆弱（方向相反）、supra-baseline KRt 复现（已结案：seed 方差主导，三种子平均 96.4/98.4/96.1/89.6% 吻合论文 ~98%，见 Roadmap §4.10）
+## 6. 当前活跃路线
 
-失败判决按预注册判据作出、均有数据留档，属论文排除法证据链的组成部分；**存活结论主干**（表观遗忘、KA 主导、anchor 失配三因子模型、公共/私有不对称、A1/A2 修复预注册）不受影响，速查见 Roadmap §11.4。
-
-当前活跃路线：**Phase 4 接口稳定性**（Roadmap §6），下一步为 A2 四臂因果干预实验（`--method fedta_a2`）。
+- **A2 接口保护**（已实现；INR seed42 已跑：遗忘压至 2.5，差距集中在基础精度）
+- **A5 共享语义接口**（双速架构；P0 manifest 审计已判决 INR 0 公共类；P1 NCM probe 进行中）
+- **外部对比实验**（主表 ~14 行：FL 三基线已实现、FedMGP/C²P adapter 就绪、FedL2P/FedDualP/GLFC 等在队列）
+- 双机分工：izfree（4090 24GB）跑对比实验（C²P 除外 OOM）；AutoDL（4090 48GB）跑主线

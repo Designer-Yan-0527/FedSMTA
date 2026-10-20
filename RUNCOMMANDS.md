@@ -1,4 +1,4 @@
-# FedTA 运行命令
+# FedSMTA 运行命令
 
 本项目只支持 `cifar100` 和 `ImageNet-R` 两个数据集，通过 `--data_name` 选择。
 所有参数定义在 `config/datasets_delay.py`，两个数据集共用同一套参数。
@@ -19,17 +19,12 @@ python main.py datasets_delay --data_name {cifar100|ImageNet-R} [其他参数]
 python main.py datasets_delay \
     --data_name cifar100 \
     --data-path ./local_datasets \
-    --client_num 5 \
-    --task_num 5 \
-    --private_class_num 15 \
-    --global_epoch 5 \
-    --local_epoch 30 \
-    --batch-size 16 \
-    --lr 0.001 \
-    --seed 42
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 \
+    --lr 0.001 --seed 42
 ```
 
-数据集准备：**本地导入，不联网下载**。`--data-path` 目录下需已存在 `cifar-100-python/`（解压后的 CIFAR-100）；数据缺失时直接报错，不会自动下载。
+数据集准备：**本地导入，不联网下载**。`--data-path` 目录下需已存在 `cifar-100-python/`；缺失直接报错。
 
 ## 3. 运行 ImageNet-R
 
@@ -38,197 +33,144 @@ python main.py datasets_delay \
     --data_name ImageNet-R \
     --data-path ./local_datasets \
     --surrogate_num 5 \
-    --client_num 5 \
-    --task_num 5 \
-    --private_class_num 40 \
-    --global_epoch 5 \
-    --local_epoch 30 \
-    --batch-size 16 \
-    --lr 0.001 \
-    --seed 42
+    --client_num 5 --task_num 5 --private_class_num 40 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 \
+    --lr 0.001 --seed 42
 ```
 
-> **协议要点（勿改）**：官方论文 §5.1 规定 ImageNet-R 为**每客户端 40 个私有类、0 公共类、每任务 8 类**（`public_class_num = 200 − 5×40 = 0`，`class_every_task = 40/5 = 8`）。`--private_class_num 40` 是唯一正确取值；误用 CIFAR-100 的 15 会得到 125 个公共类、每任务 28 类的错误协议（2026-10-14 曾误跑，task 0 仅 56.95 vs 官方 81.5，已判废）。
+> **协议要点（勿改）**：官方论文 §5.1 规定 ImageNet-R 为每客户端 40 私有类、0 公共类、每任务 8 类（P0 manifest 审计 2026-10-20 证实 200 类全部单客户端）。`--private_class_num 40` 是唯一正确取值；误用 15 会得到 125 公共类的错误协议（2026-10-14 误跑已判废）。
 
-数据集准备（**本地导入，不联网下载**）：
-
-1. `--data-path` 目录下需已存在 `imagenet-r/`（解压后的 200 个类别目录）或 `imagenet-r.tar`（存在 tar 且未解压时会本地解压）；数据缺失时直接报错，不会自动下载；
-2. 首次运行会做**一次性**的 80/20 随机划分（把图片移动到 `imagenet-r/train/`、`imagenet-r/test/` 子目录，之后直接复用，不会重复划分）；
-3. ImageNet-R 共 30000 张图片、200 类，`args.nb_classes` 自动设为 200。
-
-> **Phase 0 严格 baseline 说明**：官方 FedTA 对 ImageNet-R 固定每类 5 个 surrogate（`process_testdata(5)`），本仓库已恢复该行为——`--surrogate_num` 只对 cifar100 生效（官方默认 20）。本地训练 batch size 也已恢复官方硬编码 16（`--batch-size` 只影响 SIKF 蒸馏加载器，与官方一致）。
+数据集准备（本地导入）：`--data-path` 下需已存在 `imagenet-r/`（200 个类别目录）或 `imagenet-r.tar`；首次运行做一次性 80/20 划分（移动到 train/test 子目录后复用）。`--surrogate_num` 只对 cifar100 生效（INR 固定官方值 5）；本地训练 batch size 固定官方硬编码 16。
 
 ## 4. 常用参数速查
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--data_name` | `cifar100` | 数据集，可选 `cifar100` / `ImageNet-R`（区分大小写） |
-| `--data-path` | `./local_datasets` | 数据集根目录（`--data_path` 亦可） |
+| `--data_name` | `cifar100` | 数据集（区分大小写） |
+| `--data-path` | `./local_datasets` | 数据集根目录 |
 | `--output_dir` | `output/` | 训练产物根目录 |
-| `--client_num` | 5 | 客户端数量 |
-| `--task_num` | 5 | 任务（阶段）数量 |
-| `--private_class_num` | 15 | 每个客户端的私有类别数 |
-| `--global_epoch` | 5 | 每个任务的联邦通信轮数 |
-| `--local_epoch` | 30 | 每轮本地训练 epoch 数 |
-| `--batch-size` | 16 | SIKF 蒸馏加载器 batch size（本地训练固定官方 16，不受此参数影响；`--batch_size` 亦可） |
+| `--client_num` / `--task_num` | 5 / 5 | 客户端 / 任务数 |
+| `--private_class_num` | 15 | 每客户端私有类数（INR 必须 40） |
+| `--global_epoch` / `--local_epoch` | 5 / 30 | 联邦轮数 / 本地 epoch 数 |
 | `--lr` | 0.001 | 学习率 |
-| `--threshold` | 0.25 | BGPS 原型修复阈值（现已生效，旧代码硬编码 0.25） |
-| `--surrogate_num` | 20 | 每类代理样本数（仅 cifar100 生效；ImageNet-R 固定官方值 5） |
+| `--threshold` | 0.25 | BGPS 原型修复阈值 |
+| `--surrogate_num` | 20 | 每类代理样本数（仅 cifar100 生效） |
 | `--seed` | 42 | 随机种子 |
-| `--num_workers` | 2 | DataLoader 进程数 |
-| `--device` | `cuda` | 训练设备 |
+| `--num_workers` / `--device` | 2 / cuda | 加载进程 / 设备 |
 
 ## 5. 运行管理参数（Phase 0 工程，不影响算法）
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--run_name` | `''`（自动生成） | 实验名。留空自动生成 `{dataset}_{method}_c.._t.._ge.._le.._lr.._seed.._{hash}` |
-| `--resume` | `''` | `''` = 全新运行；`auto` = 从 `RUN_DIR/checkpoints/latest.pth` 恢复；或传 checkpoint 显式路径 |
-| `--save_every` | 1 | 每 N 个全局轮保存一次 `round_XXXX.pth` |
-| `--keep_last` | 0 | 只保留最近 N 个 `round_XXXX.pth`（0 = 全部保留）。`latest.pth` 和 `task_XX_end.pth` 始终保留 |
-| `--eval_all_every` | 0 | 每 N 轮做一次全任务评估（0 = 仅在任务结束时评估） |
-| `--deterministic` | off | 可选确定性模式（cudnn.deterministic、关闭 benchmark、deterministic algorithms）。默认关闭 = 官方行为 |
-| `--max_rounds` | 0 | 总轮数上限，用于提前停止（0 = 完整运行）。仅截断训练循环终点，不改变任何每轮逻辑 |
-| `--no_instrumentation` | off | 关闭 Phase 0 观察者插桩（train_log.csv 本地阶段评估、全任务评估、margin 输出）。仅供 observer-invariance 测试使用，用于证明插桩不扰动训练轨迹 |
+| `--run_name` | 自动生成 | `{dataset}_{method}_c.._t.._ge.._le.._lr.._seed.._{hash}` |
+| `--resume` | `''` | `''` 全新 / `auto` 从 latest.pth / 显式 checkpoint 路径 |
+| `--save_every` / `--keep_last` | 1 / 0 | checkpoint 频率与保留数（latest 与 task_XX_end 恒保留） |
+| `--eval_all_every` | 0 | 每 N 轮全任务评估（0 = 仅任务结束时） |
+| `--deterministic` | off | 确定性模式（默认关闭 = 官方行为） |
+| `--max_rounds` | 0 | 总轮数上限（仅截断终点） |
+| `--no_instrumentation` | off | 关闭插桩（observer-invariance 测试用） |
 
 ## 6. 断点续训（resume）
 
 ```bash
-# 方式一：自动从最近 checkpoint 恢复（要求 --run_name 等参数与原运行一致）
+# 自动从最近 checkpoint 恢复（要求 --run_name 等参数与原运行一致）
 python main.py datasets_delay --data_name cifar100 --run_name <原run_name> --resume auto
 
-# 方式二：显式指定 checkpoint 路径（run_dir 自动从路径推断）
+# 显式指定 checkpoint 路径
 python main.py datasets_delay --data_name cifar100 \
     --resume output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_02_end.pth
 ```
 
-说明：
-
-- checkpoint 在**轮边界**保存，恢复时从下一轮继续，训练循环、数据划分、RNG 状态均精确还原；
-- 恢复时校验关键参数（数据集、模型、client/task 数、lr、seed 等），不一致会拒绝恢复；
-- 旧日志以追加方式保留，accuracy matrix 会接续完整历史。
+checkpoint 在轮边界保存，恢复时 RNG 精确还原；关键参数校验不一致拒绝恢复。
 
 ## 7. 磁盘占用提醒
 
-checkpoint 包含完整 ViT state_dict，**约 350MB+/轮**。默认每轮都保存（`--save_every 1`），一个 25 轮的运行约 9GB。磁盘紧张时建议：
-
-```bash
---save_every 5 --keep_last 2   # 每 5 轮存一次，只保留最近 2 个 round checkpoint
-```
+checkpoint 含完整 ViT state_dict，**约 350MB+/轮**。磁盘紧张时：`--save_every 5 --keep_last 2`。
 
 ## 8. 运行产物目录结构
 
 ```
-output/
-└── {data_name}/                  # cifar100 / ImageNet-R
-    └── {method}/                 # 默认 fedta
-        └── {run_name}/
-            └── seed_{seed}/
-                ├── command.txt           # 完整启动命令（追加式）
-                ├── args.json             # 全部参数快照（仅首次运行写入）
-                ├── git_commit.txt
-                ├── logs/
-                │   └── train.log         # 终端输出的完整副本（追加式）
-                ├── checkpoints/
-                │   ├── latest.pth        # 每轮更新，resume 默认入口
-                │   ├── round_0001.pth    # 按 --save_every 保存
-                │   └── task_00_end.pth   # 每个任务结束时的快照
-                └── metrics/
-                    ├── accuracy_matrix.csv    # 全任务准确率矩阵
-                    ├── summary_metrics.csv    # AA / Forgetting / BWT / per-task retention 汇总（每 client + mean 行）
-                    ├── margins.csv            # 各旧任务 margin 统计（mean / median / p10，全任务评估时追加）
-                    ├── train_log.csv          # 结构化训练日志（round, task, client, accuracy, phase, test_task）
-                    ├── client_0_accuracy.csv  # 各客户端准确率
-                    └── round_metrics.jsonl    # 每轮指标流水
+output/{data_name}/{method}/{run_name}/seed_{seed}/
+    ├── command.txt / args.json / git_commit.txt
+    ├── logs/train.log              # 终端输出完整副本（追加式）
+    ├── checkpoints/                # latest.pth / round_XXXX.pth / task_XX_end.pth
+    └── metrics/
+        ├── accuracy_matrix.csv     # R[t][k] 全任务准确率矩阵
+        ├── summary_metrics.csv     # AA / Forgetting / BWT 汇总
+        ├── train_log.csv           # 结构化训练日志（round, task, client, accuracy, phase, test_task）
+        ├── client_X_accuracy.csv   # 各客户端准确率
+        ├── margins.csv / round_metrics.jsonl
 ```
+
+外部 baseline adapter（§17–19）产物落 `output/{dataset}/{method}/manifest_adapter/seed_{seed}/`，metrics CSV 格式与上述一致（多 `meta.json` + `records.jsonl`）。
 
 ## 9. 诊断工具（不改变正式训练）
 
-诊断脚本通过共享的 `build_server()` 复刻训练的 RNG 流（seed → model default_cfg → 数据划分 → 建客户端），保证得到与训练完全相同的 client 数据划分。所有命令在项目根目录执行；`<run_dir>` 指 `output/{data_name}/fedta/{run_name}/seed_{seed}`。
+所有命令在项目根目录执行；`<run_dir>` 指 `output/{data_name}/{method}/{run_name}/seed_{seed}`。诊断脚本通过共享的 `build_server()` 复刻训练 RNG 流，保证与训练完全相同的数据划分。各脚本的完整判决记录见 FEDSMTA_ROADMAP.md。
 
 ### 9.1 提取特征（z_ref / z_op）
 
 ```bash
 python diagnostics/extract_features.py \
-    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
-    --checkpoint output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_04_end.pth \
+    --run_dir <run_dir> \
+    --checkpoint <run_dir>/checkpoints/task_04_end.pth \
     --out_dir diagnostics_output
 ```
 
-- 输出 `diagnostics_output/features_{data_name}_{ckpt名}.npz`（z_ref = frozen ViT 特征、z_op = 当前 prompt 增强的 pre-anchor 特征；含 labels / client_ids / task_ids / round_ids / splits / **sample_idx_relative**——`data_split_indices` 存储的**值**（client.train_data[t] 的索引），raw dataset index 不可恢复；与 precheck per-sample CSV 同坐标系，(client, task, sample_idx_relative) 可直接 join）+ 同名 `.json` 元信息（含 round、client_class_masks、public classes、**deterministic 运行态实读记录**）
-- **正式 Phase 1 协议默认值：`--split train`、`--batch_size 16`**（z_op 依赖 batch 组成，B 必须与 precheck 通过的取值一致；`--split` 的 test/both 仅限非诊断用途，多模态分析侧已硬性只接受 train）
-- **deterministic extraction**：与 precheck 脚本同协议（CUBLAS env 前置 + cudnn flags 在 bootstrap 后设置），保证正式提取与 precheck 测 floor 时的执行条件一致
-- `--checkpoint` 缺省时自动使用 `checkpoints/latest.pth`；`--data_path` / `--device` 可覆盖 args.json 中的值
+- 输出 `features_{data_name}_{ckpt名}.npz`（z_ref = frozen ViT 特征、z_op = prompt 增强特征；含 labels/client_ids/task_ids/round_ids/splits/sample_idx_relative）+ 同名 `.json` 元信息
+- 正式协议默认 `--split train --batch_size 16`（z_op 依赖 batch 组成，B 必须与 precheck 一致）；`--prompt_task_mode current` 使 z_op 用当前任务 prompt 对所有已见任务计算（= native evaluate 的 task_id=self.task_id 语义；默认 test = 被抽取任务自身的 prompt，非默认 mode 进文件名防缓存串用）
+- deterministic extraction 与 precheck 同协议（CUBLAS env 前置 + cudnn flags bootstrap 后设置）
 
-### 9.2 多模态分析 —— 已删除（已测验失败）
-
-- **Phase 1 多模态方向判负（2026-10-10）**：robust multimodal prevalence 0/25（ρ、D_cover、client 归因、切分形态、z_ref 对照五证据链全阴性），halt criterion 触发，Phase 2 主线（Semantic-K2 / Oracle-K2 / UOT）冻结。存档见 FEDSMTA_ROADMAP.md §11；原命令与完整说明见 git 历史。
-
-### 9.3 兼容性 2x2 诊断（prompt × key-anchor）
+### 9.3 兼容性 2×2 诊断（compatibility_drift.py）
 
 ```bash
 python diagnostics/compatibility_drift.py \
-    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
-    --old_ckpt output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_02_end.pth \
-    --new_ckpt output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_04_end.pth \
+    --run_dir <run_dir> \
+    --old_ckpt <run_dir>/checkpoints/task_02_end.pth \
+    --new_ckpt <run_dir>/checkpoints/task_04_end.pth \
     --old_task 2
 ```
 
-- 评估 old/current prompt × old/current key-anchor 四种组合（旧 task 始终用对应 task-specific Chead）
-- 输出默认写到 `<run_dir>/metrics/compatibility_2x2.csv`；`--old_task` 缺省时从 old_ckpt 推断
+评估 old/current prompt × old/current key-anchor 四组合（旧 task 用 task-specific Chead）。输出 `<run_dir>/metrics/compatibility_2x2.csv`。
 
-### 9.3.1 4 组合 per-class 通道分解（public vs private × 4 组合，联邦独有机制判决实验）
+### 9.3.1 4 组合 per-class 通道分解（analyze_class_retention.py）
 
 ```bash
 python diagnostics/analyze_class_retention.py \
-    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --run_dir <run_dir> \
     --old_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth \
     --new_ckpt checkpoints/task_04_end.pth \
     --out_csv diagnostics_output/class_retention_4combo.csv
 ```
 
-- 对每个 (client, old task) 评估 **4 组合**（old/old、old/cur、cur/old、cur/cur，顺序与 compatibility_drift 一致，旧 task 始终用 task-specific Chead），做 **per-class** 精度评估（复刻 evaluate 的 mask/target 语义，`predicts`/`target` 均为全局 class id）
-- 通道定义：P 通道 = oo−co（聚合 prompt 漂移，联邦独有候选）；KA 通道 = oo−oc（本地 key/anchor 漂移，架构固有）；总漂移 = oo−cc
-- public/private 身份由 `outer_split_manifest` 自证：出现在 >1 个客户端的类 = public（协议定义），缺失 manifest 时直接 RuntimeError
-- 固定 shuffle 种子 `9700+100*cid+old_task`（与 compatibility_drift 一致，四组合同 batch 顺序）；全程 RNG snapshot/restore；评估后恢复 current 组件
-- 判决目标：public 类超额损伤（相对 private）若集中在 P 通道 → 聚合介导的跨客户端接口失配坐实（联邦独有机制）；若同样在 KA 通道 → 机制架构固有，联邦只是调制项，论文降级措辞
-- 聚合必须样本加权（本地测试集 Dirichlet 切到类级）；脚本 per-client 值与 compatibility_drift 输出精确对账
-- 输出 CSV 列：client_id, old_task, class_id, scope, n_clients, n_test, prompt, key_anchor, acc（每类每组合一行）；console 汇总按 (task, scope) 样本加权通道分解 + public/private 判决 + 各客户端任务构成
+P 通道 = oo−co（聚合 prompt 漂移）、KA 通道 = oo−oc（本地 key/anchor 漂移）；public/private 由 manifest 自证（≥2 客户端持有 = public）；固定 shuffle 种子 `9700+100*cid+old_task`；样本加权。
 
-### 9.3.2 子机制判别探针（公共类 KA 超额损伤的归因，消费 9.3.1 的 CSV）
+### 9.3.2 子机制判别探针（probe_channel_correlates.py）
 
 ```bash
-python diagnostics/probe_channel_correlates.py \
-    --csv diagnostics_output/class_retention_4combo.csv
+python diagnostics/probe_channel_correlates.py --csv diagnostics_output/class_retention_4combo.csv
 ```
 
-- 在 4combo CSV 上按 (client, old_task, class) 单元计算 `KA_c=oo−oc`、`P_c=oo−co`，检验两个候选子机制：(i) 间接共适应（匹配强度下 public KA > private、KA_c~P_c 正相关）；(ii) 协议结构性脆弱（KA_c~n_test 负相关）
-- 交互表：n_test 分桶（1-15/16-40/41-80/81-171）× scope 的加权 KA/oo，plus 匹配强度对比（public n_test≥40 vs private all）与逐客户端对照
-- 汇总指标另存 `channel_correlates.json`（与输入 CSV 同目录）
-- 判决（seed42）：(ii) 否证（方向相反：r=+0.346，n_test≤15 公共类近乎免疫 wKA=+1.8）；(i) 修正版成立（匹配强度下 public +19.7 vs private +11.4，4/5 客户端，P 通道协同抬升）
+消费 9.3.1 的 CSV，检验间接共适应 vs 协议结构性脆弱两候选子机制（判决：后者否证、前者修正版成立）。
 
-### 9.3.3a 路由结构识别（Phase 4 D0：gateway，先于 D1 的有效性检查）
+### 9.3.3a 路由结构识别（verify_slot_binding.py，D0）
 
 ```bash
 python diagnostics/verify_slot_binding.py \
-    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --run_dir <run_dir> \
     --task_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth,checkpoints/task_04_end.pth \
     --out_csv diagnostics_output/slot_binding.csv \
     --out_slot_csv diagnostics_output/slot_binding_slots.csv \
     --out_npz diagnostics_output/slot_binding_matrices.npz
 ```
 
-- **动机**：`Tail_Anchor.forward(x, class_mask)` 的 class_mask 形参在函数体内未使用——路由纯相似度、无显式类绑定；slot i ↔ class i 只能涌现形成。D0 是**描述性路由结构识别实验**，输出决定 D1 用单槽位归因、加权多槽位归因还是完整路由分布分析；脚本本身不输出机制结论
-- **固定输入协议**：train_data 带 RandomResizedCrop+HorizontalFlip——先在固定种子下物化**一份**增强视图（张量缓存），t_end 状态与部署态（task_04_end prompt+key）两次路由共用同一批输入 → routing_stability 纯测模型状态变化，增强噪声完全隔离
-- 四个维度输出：①绑定集中度（diag_share、modal_share、routing entropy）；②槽位共享（within-task + **cross-task** purity/sharing——task 3 抢 task 0 槽位是劫持核心形态，within-task 看不见）；③**路由 2×2 分解**（R_oo/R_oc = key 漂移、R_oo/R_co = feature/prompt 漂移、R_oo/R_cc = 总 routing flip + 非可加性交互——与 accuracy 2×2 同坐标系，直接对桥 KA/P 通道分解）；④完整 class×slot 绑定矩阵 B（.npz：per task + per client 全序列 + top 跨任务争抢槽位表）
-- 槽位池大小取自 key.shape[0]（200，含 100–199 未训练噪声槽）；prompt 恢复在 finally 内；空结果硬报错
-- **无自动判决**：0.9/0.8 等阈值仅作描述性分组；人工读取三个输出文件后决定 D1 归因形态
+绑定集中度 / 槽位共享 / 路由 2×2 分解 / 完整 class×slot 绑定矩阵。固定种子物化一份增强视图隔离增强噪声；无自动判决。
 
-### 9.3.3b D1 v2 离线碰撞暴露诊断（collision_exposure_diagnostic.py，零前向）
+### 9.3.3b D1 v2 碰撞暴露诊断（collision_exposure_diagnostic.py，零前向）
 
 ```bash
 python diagnostics/collision_exposure_diagnostic.py \
-    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --run_dir <run_dir> \
     --task_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth,checkpoints/task_04_end.pth \
     --binding_csv diagnostics_output/slot_binding.csv \
     --binding_npz diagnostics_output/slot_binding_matrices.npz \
@@ -237,15 +179,9 @@ python diagnostics/collision_exposure_diagnostic.py \
     --out_json diagnostics_output/collision_exposure.json
 ```
 
-- **输入**：D0 的绑定 CSV + npz 矩阵、5 个 task_end checkpoint（只读 key/anchor 张量）、4combo 损伤 CSV
-- **机制链检验**：E_future（未来任务流量对旧类接口的碰撞暴露）→ d_key/d_anchor（p(j|c) 加权接口位移）→ KA_c（oo−oc 损伤），全链 Spearman 相关
-- **A2 设计岔路口**：支撑槽按未来流量 F_j>0 / F_j=0 分层的加权位移对比——劫持介导 vs 衰减介导两种损伤路径的分离；另输出 D_traffic（流量加权位移 Σ p(j|c)·(F_j/ΣF)·||ΔK_j||），区分"被访问"与"被重度访问"
-- **stabK=0.00 sanity**：旧类 modal slot 的未来流量（modal_future_traffic）——旧接口是被复用（劫持）还是被废弃（衰减）
-- **CEI_all**（GPT 形式争抢指数）与 E_future（因果方向的前瞻版）双口径；d_key_next 单窗口位移（事件驱动检查）；public/private 分层
-- **key 位移方向/范数分解**：d_key_dir（l2 归一化后 1−cos，路由相关量）+ d_key_norm_ratio（范数比，wd 存活签名）——D1 v2 FE 判决（2026-10-10）：raw ||ΔK|| 是盲指标（hit/nohit 比值 0.91×，耦合 wd Adam 使未命中槽方向随机游走+范数塌缩、命中槽被梯度钉住，两者产生相当的 raw 位移）；d_key_dir 是逐出相关量（vs modal_preserve FE rho=−0.622），脚本内打印的链相关为 pooled、判决须过 (client,task) FE（见 Roadmap §6.0 判决）
-- 纯张量/CSV 运算，约 1 分钟，无 GPU 前向；描述性审计，因果主张待 A2 干预
+E_future → d_key/d_anchor（含方向/范数分解）→ KA 链条检验；纯张量运算约 1 分钟。判决须过 (client,task) FE（Roadmap §3.7）。
 
-### 9.3.3c 落点分析（analyze_landing_spots.py，本地离线，检验集中坍缩/attractor 假说）
+### 9.3.3c 落点分析（analyze_landing_spots.py，本地离线）
 
 ```bash
 python diagnostics/analyze_landing_spots.py \
@@ -255,49 +191,43 @@ python diagnostics/analyze_landing_spots.py \
     --out_json diagnostics_output/landing_spots.json
 ```
 
-- **输入**：D0 重跑 npz（含 `_oc` 落点矩阵：同一批固定增强视图的旧特征在最终 key 下的路由）+ D1-lite 损伤 CSV（158 class-units，已验证 158/158 modal 对齐）
-- **预注册判读**：R1 落点暴露 H_landing vs KA_rel（FE）；R2 support_preserve 保护因子；R3 强绑定类 all-or-none 双峰性；R4 跨类落点坍缩
-- **已得判决（2026-10-10）**：R1/R5 证伪（落点去向无预测力，与支撑集暴露同死）、R2 存活（support_preserve FE rho=−0.197, p=0.014，迄今最强类级保护因子）、R3 单边坍缩（90.4% 强绑定类 modal_preserve<0.2，但损伤量级远小于坍缩量级）、R4 强确认（32 旧类 modal 坍缩到 4–8 个吸引子槽，top-10 落点槽承载 86–96% 质量，64.6% 落入未训练噪声区）
-- 秒级本地运行，无 GPU；描述性审计，因果主张待 A2 干预
+集中坍缩/attractor 假说检验；秒级本地运行。
 
-### 9.3.4 TKR 精确口径复算（verify_tkr.py，零 GPU，消费 train_log.csv）
+### 9.3.4 TKR 精确口径复算（verify_tkr.py，零 GPU）
 
 ```bash
 python diagnostics/verify_tkr.py \
-    --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+    --run_dir <run_dir> \
     --out_prefix diagnostics_output/tkr_seed42
-# 或直接指定 train_log.csv：
-python diagnostics/verify_tkr.py \
-    --train_log <path>/train_log.csv --global_epoch 5 \
-    --out_prefix diagnostics_output/tkr_seed42
+# 或直接指定 train_log：
+python diagnostics/verify_tkr.py --train_log <path>/train_log.csv --global_epoch 5 --out_prefix diagnostics_output/tkr_seed42
 ```
 
-- **目的**：按 FedTA 作者 2026-10-10 issue 回复的定义复算 TKR——分母 = round4 **聚合全局模型**在 task 0 本地测试集精度（`phase=server, test_task=0, round=4` 行），分子 = t>0 后**本地模型**回评 task 0（`phase=local, test_task=0, round=t*5+4` 行，本地训练后、聚合前的状态）
-- **注意**：task-end checkpoint 存的是广播后 prompt，无法重建分子态，train_log.csv 是唯一数据源（要求 run 开着 instrumentation）
-- 输出三口径（author local/global、local/local、server/server）× 两种聚合（ratio-of-means、mean-of-ratios）+ t=0 client-drift premium
-- **已得判决（2026-10-10，seed 42）**：author 口径 = 84.6/92.2/95.3/95.6%——**未复现论文 105–115%**，local/global prompt 不对称解释被实证否证（Roadmap §4.10）；server/server 口径与此前部署态 KRt（88.6/93.0/90.1/90.7）精确吻合，交叉验证通过
-- **三种子复算结案（2026-10-20，seed 42/1999/2025 各自 train_log.csv）**：author 口径三种子平均（= 作者协议）= **96.4/98.4/96.1/89.6%**，t=1..3 吻合论文 "around 98%"——残余段判 **seed 方差主导**（seed_42 单种子恰为最差）；seed_1999 t=4 本地态 72.4% vs server 态 102.9% = 本地 client drift 非全局遗忘；唯一残余 = Fig 4(b) 105–115% 读数复核（Roadmap §4.10）。三种子复算命令：`python diagnostics/verify_tkr.py --train_log output/cifar100/fedta/seed_1999/metrics/train_log.csv --global_epoch 5 --out_prefix diagnostics_output/tkr_seed1999`（seed_2025 同理）
+按作者 issue 回复定义复算 TKR（分母 = round4 聚合全局模型、分子 = t>0 本地模型）。三种子复算结案：平均 96.4/98.4/96.1/89.6% 吻合论文 "around 98%"（Roadmap §3.8）。
 
-### 9.3.3 slot 级碰撞诊断 —— 已删除（已测验失败）
-
-- **原版 D1（slot_collision_diagnostic.py）已被 D1 v2（§9.3.3b collision_exposure_diagnostic.py）取代**：其"slot id ≈ class id"单槽归因设计在 D0 判死后即不可用（diag_share=0.000），且核心假说（hits→位移→损伤线性劫持链）被 D1-lite / D1 v2 FE 判决证伪。存档见 FEDSMTA_ROADMAP.md §11；原命令见 git 历史。
-
-### 9.4 Synthetic Oracle-K2 压力测试 —— 已删除（方向已冻结）
-
-- **所属 Phase 2 主线（多模态 K2 anchor）随 Phase 1 判负冻结（2026-10-10）**，不再执行。存档见 FEDSMTA_ROADMAP.md §11；原命令见 git 历史。
-
-## 10. 官方 FedTA parity 测试（Gate 0A）
+### 9.3.5 P1 frozen NCM probe（ncm_probe.py，A5 Gate A）
 
 ```bash
-# Gate 0A smoke（默认配置：task_num=1, rounds=5, local_epoch=1，已覆盖官方 `!= 4` SIKF 分支）
-python tests/test_official_fedta_parity.py \
-    --official_repo /path/to/official_FedTA \
-    --data_path ./local_datasets \
-    --global_epoch 5 --task_num 1 --rounds 5 --local_epoch 1 \
-    --batch_size 16 --surrogate_num 20 --threshold 0.25 \
-    --seed 42 --device cuda
+python diagnostics/ncm_probe.py \
+    --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
+    --checkpoints task_00_end.pth,task_04_end.pth \
+    --out_csv diagnostics_output/ncm_probe_inr_a2.csv \
+    --c2p "86.86,91.14"
+```
 
-# Gate 0A 正式短程（覆盖 task transition）
+- z_ref（主结果，可在线增量维护）+ z_op（oracle，回溯访问上界）上的 cosine/Euclidean NCM vs native；原型仅来自已见任务 inner.train（防泄漏）；候选限制在 (client, task) class_mask（与 native R[t][k] 同语义）
+- fail-closed：缓存身份校验（run_dir/seed/checkpoint/mode 不匹配即报错）、原型全覆盖、aa_native 与 accuracy_matrix.csv 对账（>0.02pp 拒绝）
+- `--prompt_task_mode current`（默认）使 z_op 对齐 native evaluate 语义；特征缓存按 mode 分文件
+- **T0-gap 判据**：T0 行对照 C²P 参考（86.86）——NCM 若大幅缩小 ~4pp 差距，A5 优先做分类接口；增益只在 T4 出现才支持持续迁移叙事
+
+### 9.4 已删除命令（tombstone）
+
+多模态分析（旧 §9.2）、Synthetic Oracle-K2（旧 §9.4）、z_op precheck（旧 §14）、原版 slot 碰撞诊断（旧 §9.3.3）——所属假说已判负或设计判死，存档见 FEDSMTA_ROADMAP.md §4，原命令在 git 历史。
+
+## 10. 官方 FedTA parity 测试（Gate 0A，已 PASS 封板）
+
+```bash
+# smoke（task_num=1/rounds=5/local_epoch=1）与正式（task_num=2/rounds=10/local_epoch=1）：
 python tests/test_official_fedta_parity.py \
     --official_repo /path/to/official_FedTA \
     --data_path ./local_datasets \
@@ -306,85 +236,45 @@ python tests/test_official_fedta_parity.py \
     --seed 42 --device cuda
 ```
 
-- 证明最强命题：`FedSMTA --method fedta --no_instrumentation ≡ Official FedTA`（Gate 0B 只能证明"自己的代码连续跑 = 自己的代码 resume 跑"，不能证明等于官方）
-- **Gate 0A 强制 `global_epoch=5`**（传其他值直接退出）：官方 FedTA 硬编码 SIKF 分支为 `i % global_epoch != 4`，与本项目参数化的 `!= global_epoch - 1` 仅在 `global_epoch=5` 时等价；Phase 0 冻结的就是 `global_epoch=5` 的行为。**Gate 0B/0C 保持 `global_epoch=2` 不矛盾**——它们比较 ours vs ours（resume / observer），只验证工程机制，不是官方 parity
-- 官方仓库无 checkpoint 机制：测试会在官方仓库内生成一个一次性 driver 脚本，进程内复刻官方 `main()` 流程（含 RNG 消耗顺序），跑完后导出最终状态；结束后自动清理 driver/payload/dump（`--keep_driver` 保留，FAIL 时也会保留以便调试）
-- fork 侧以冻结的短程 parity 配置运行（`global_epoch=5, batch_size=16, surrogate_num=20, threshold=0.25, seed=42`，smoke 为 `task_num=1/rounds=5/local_epoch=1`，正式为 `task_num=2/rounds=10/local_epoch=1`），并强制 `--deterministic --no_instrumentation`；`--rounds` 必须等于 `task_num*global_epoch`（官方仓库总是跑完整任务循环）
-- 前置条件：`--official_repo` 为官方 FedTA 仓库的本地克隆（含 `main.py`/`Models`/`config`）；官方仓库内需有 `pretrain_model/ViT-B_16.npz`；官方代码若硬编码数据集路径需提前准备（被 drop 的 kwarg 会在 JSON 中报告）；官方仓库若需要不同环境可用 `--official_python` 指定解释器
-- 配置漂移防护：实验定义参数（client_num/task_num/.../model_name）在官方 config 中逐 key 断言存在，缺失直接报错并列出可用 key（fail loudly，绝不静默错配）；config 模块自动尝试 `config.cifar100` / `config.cifar100_delay`，可用 `--config_module` 覆盖
-- 比较项：server model / global head / global+temp protos / server prompt / 各 client heads / key / anchor / 完整 tail_anchor state / client prompts / fix_keys / 外层 manifest（raw indices + class_mask）/ 内层 70/30 split（通过 patch `random_split` + 包装 `get_data` 在官方侧记录）；两侧 inner split 均做结构校验（缺失/空/缺 train-test 键/缺已到达 task 一律 FAIL，杜绝 `{} == {}` 假 PASS）
-- 封板断言：fork checkpoint 必须记录 `no_instrumentation=True`、`deterministic=True`、跑满全部 rounds；两侧 manifest 必须存在且非空（无 `{} == {}` 假 PASS）
-- 输出 `output/regression/metrics/official_fedta_parity.json`；**PASS 要求 D=0（不容忍浮点误差）**——若出现极小非零差异，先怀疑 GPU 算子非确定性并重跑，不允许放宽 tolerance
-- v1 限制（已记录在 JSON notes，不作 gating）：accuracy 不直接比较（所有模型状态与两个 split 的 D=0 蕴含评估输出一致）；RNG states 无法比较（官方无保存机制）
+证明 `--method fedta --no_instrumentation ≡ 官方 FedTA`（13 项 D=0）。Gate 0A 强制 `global_epoch=5`（官方 SIKF 硬编码 `!= 4` 仅此时等价）；`--rounds` 必须等于 `task_num*global_epoch`；PASS 不容忍浮点误差；配置漂移 fail loudly。细节见脚本 docstring 与 git 历史。
 
-## 11. Resume 回归测试（Gate 0B）
+## 11. Resume 回归测试（Gate 0B，已 PASS 封板）
 
 ```bash
 python tests/test_resume_regression.py \
-    --data_name cifar100 \
-    --data_path ./local_datasets \
-    --rounds 4 --split_at 2 \
-    --global_epoch 2 --task_num 2 --local_epoch 2 \
+    --data_name cifar100 --data_path ./local_datasets \
+    --rounds 4 --split_at 2 --global_epoch 2 --task_num 2 --local_epoch 2 \
     --seed 42 --device cuda
 ```
 
-- A = 连续跑 4 轮；B = 用 `--max_rounds 2` 跑 2 轮后 `--resume auto` 续跑 2 轮（resume 命令显式带 `--max_rounds`，不依赖"恰巧跑满任务循环"的隐式行为）
-- 自动附加 `--deterministic`，逐项比较最终 model / head / prompt / global+temp protos / client prompts / fix_keys / 各 client 完整 tail_anchor state / client 级 global/local protos / existing_class / RNG states / accuracy_matrix.csv / 数据划分索引
-- checkpoint 现已包含**真正的联邦外层划分 manifest**（每 client/task 的原始样本 raw_indices + class_mask，位于 70/30 内层划分之前）；resume 时会重新生成划分并与之逐位比对，不一致直接拒绝恢复
-- **封板（假 PASS 防护）**：两侧 checkpoint 缺失或空 manifest 时测试直接 FAIL（`require_outer_manifest` fail-fast，杜绝 `{} == {}` 空比较通过）；**inner split 同样 fail-fast**（`require_inner_split_state`：缺失/空/缺 train-test 键/缺已到达 task 一律 FAIL，且每 client 必须含运行所到达的全部 task 的划分）；**accuracy matrix 缺失即 FAIL**（不再 `None == None → 0.0`，Gate B 插桩开启、矩阵必须存在）；`Server_DF.load_checkpoint()` 对缺失/空/不匹配 manifest 一律 `RuntimeError`（不再接受无 manifest 的旧 checkpoint）；每次运行前自动清理旧的测试 run 目录（防 stale checkpoint 触发 auto-resume）
-- 输出 `output/regression/metrics/baseline_verification.json`：两个 run 的 baseline 记录（outer split manifest hash、inner 70/30 split index hash、每 client/task train/test index hash、protos / head / prompt / key / anchor / RNG checksum、accuracy matrix hash）+ 比较字段（`accuracy_max_diff`、`global_proto_max_diff`、`temp_proto_max_diff`、`prompt_max_diff`、`client_prompt_max_diff`、`head_max_diff`、`key_max_diff`、`anchor_max_diff`、`tail_anchor_state_max_diff`、`client_global_proto_max_diff`、`client_local_proto_max_diff`、`split_equal`、`outer_split_equal`、`existing_class_equal`）
-- **Gate 0B**：`result != PASS` 时禁止进入 Phase 1
+连续跑 vs 断点续跑逐位一致（模型/RNG/数据划分/accuracy matrix）；manifest 缺失即 FAIL（防 `{} == {}` 假 PASS）。加 `--method fedta_a2 --a2_arm anchor` 验证 a2_state 逐位比较。
 
-## 12. Observer-invariance 测试（Gate 0C）
+## 12. Observer-invariance 测试（Gate 0C，已 PASS 封板）
 
 ```bash
 python tests/test_observer_invariance.py \
-    --data_name cifar100 \
-    --data_path ./local_datasets \
-    --rounds 3 \
-    --global_epoch 2 --task_num 2 --local_epoch 2 \
+    --data_name cifar100 --data_path ./local_datasets \
+    --rounds 3 --global_epoch 2 --task_num 2 --local_epoch 2 \
     --seed 42 --device cuda
 ```
 
-- 证明 Phase 0 插桩（train_log.csv 本地阶段评估、全任务评估、margin 记录）是**纯观察者**：`--no_instrumentation`（官方循环，无任何额外评估）vs 默认（插桩开启）两个短程 run 的训练轨迹必须逐位一致
-- 默认 `--rounds = global_epoch + 1`（跑完 task 0 + 进入 task 1 第 1 轮），因此比较项含**next-task split**（task 1 的 70/30 划分索引，由 RNG 流决定）
-- 比较项：server model / prompt / global+temp protos / global head / 各 client heads / key / anchor / 完整 tail_anchor state / client prompts / client 级 global/local protos / fix_keys / existing_class / RNG states / 内层 split / 外层 manifest
-- **封板断言**：checkpoint 必须记录 `no_instrumentation` off=True / on=False（否则比较是空洞的）；manifest fail-fast（缺失/空即 FAIL）；**inner split 同样 fail-fast**（`require_inner_split_state`，含 next-task split 覆盖检查）；artifact 区分验证——OFF run 不得产生任何 observer 文件（`train_log.csv`/`round_metrics.jsonl`/`accuracy_matrix.csv`/`margins.csv`），ON run 必须产生（证明 `--no_instrumentation` 真正等于 "FedTA + checkpoint only"）
-- 输出 `output/regression/metrics/observer_invariance.json`；`result != PASS` 说明插桩扰动了训练随机流（检查 `_log_local_phase` / `run_full_evaluation` 的 RNG 保护）
-- 与第 11 节互补：回归测试证明 resume 不改变当前程序自身轨迹；本测试证明插桩本身不改变轨迹
-- Gate 0B/0C 使用 `global_epoch=2` 是合法的：它们比较 ours vs ours（工程机制验证），不涉及官方 `!= 4` 硬编码的等价性（那是 Gate 0A 专属约束，见第 10 节）
+插桩 ON/OFF 训练轨迹逐位一致 + artifact 确证区分。
 
-## 13. Phase 0 Freeze（三个 Gate 全部 PASS 后）
+## 13. Phase 0 Freeze（已执行）
 
-```bash
-# 顺序：Gate 0A smoke（第 10 节）→ Gate 0A 正式 → Gate 0B（第 11 节）→ Gate 0C（第 12 节）
-# 三者全部 PASS 后：
-git add .
-git commit -m "freeze verified FedTA baseline"
-git tag phase0-fedta-baseline
-git push origin main
-git push origin phase0-fedta-baseline
-```
+三 Gate 全 PASS 后 commit + tag `phase0-fedta-baseline`。此后 `--method fedta` read-only。
 
-## 14. Phase 1-precheck（z_op batch sensitivity）—— 已删除（已测验失败）
+## 14. 硬约束（长期有效）
 
-- **服务对象（Phase 1 多模态分析）已判负（2026-10-10），precheck 不再执行**。脚本 `check_feature_batch_sensitivity.py` 保留在仓库，其 deterministic 设置顺序教训（cudnn flags 必须在 `bootstrap_server()` 之后设置）已并入工程约定。存档见 FEDSMTA_ROADMAP.md §11；原命令见 git 历史。
-
-## 15. Freeze 后的硬约束（长期有效）
-
-- 从 tag 起，`--method fedta` 视为 **read-only scientific baseline**：不得改动 FedTA loss / optimizer / BGPS / SIKF / FedAvg head / Tail Anchor 结构 / prompt 逻辑 / CIFAR 联邦划分
-- 当前活跃路线：**Phase 4 接口稳定性**（FEDSMTA_ROADMAP.md §6）——A2 干预在新方法 flag（`--method fedta_a2`）下实验；已测验失败方案的命令已从本文件移除，总存档见 FEDSMTA_ROADMAP.md §11
+- 不得改动 FedTA loss / optimizer / BGPS / SIKF / FedAvg head / Tail Anchor 结构 / prompt 逻辑 / 联邦划分
+- 活跃路线见 FEDSMTA_ROADMAP.md（A2 接口保护 + A5 共享语义接口 + 外部对比实验）；完整约束清单见 Roadmap §9
 
 ## 16. Phase 4 修复实验（A2 训练臂 + A1 快照评估）
 
-> A2 三臂各自跑一次完整训练（control 复用既有 seed42 baseline run，不新增计算）。
-> A1 为纯推理零重训实验，baseline run 跑完后几分钟即可出结果。
-> 实现机制：post-step restore（等价 freeze + wd 豁免），官方 FedTA 优化器零改动；
-> 保护集 = 已完成任务训练特征经当前 key top-1 路由的支撑槽位并集（D0 定义，运行时计算）。
-> 判读标准（预注册，roadmap §6.2）：anchor 臂 KA_rel 显著下降 = 主通道因果成立；both 臂逼近 co 上界且 cc 不受损。
+> A2 = post-step restore（freeze + wd 豁免，优化器零改动）；保护集 = 已完成任务训练特征经当前 key top-1 路由的支撑槽位并集。判读（预注册）：anchor 臂 KA_rel 降 = 主通道因果成立；both 臂逼近 co 上界且 cc 不受损。
 
 ```bash
-# A2 三臂训练（CIFAR-100，seed 42；逐臂依次运行）
+# A2 三臂训练（CIFAR-100 seed 42，逐臂依次）
 python main.py --method fedta_a2 --a2_arm anchor --seed 42 --global_epoch 5 --threshold 0.25 --data-path <DATA_PATH>
 python main.py --method fedta_a2 --a2_arm key    --seed 42 --global_epoch 5 --threshold 0.25 --data-path <DATA_PATH>
 python main.py --method fedta_a2 --a2_arm both   --seed 42 --global_epoch 5 --threshold 0.25 --data-path <DATA_PATH>
@@ -392,67 +282,45 @@ python main.py --method fedta_a2 --a2_arm both   --seed 42 --global_epoch 5 --th
 # ImageNet-R（固定 surrogate_num 5）
 python main.py --method fedta_a2 --a2_arm anchor --seed 42 --global_epoch 5 --threshold 0.25 --surrogate_num 5 --data-path <DATA_PATH>
 
-# A2 smoke（先验证接线：1 任务应输出 protected 0/200 slots 并与 control 无差异）
+# A2 smoke（1 任务应输出 protected 0/200 slots 并与 control 无差异）
 python main.py --method fedta_a2 --a2_arm both --seed 42 --task_num 1 --global_epoch 5 --local_epoch 1 --run_name a2_smoke
 
-# A1 快照评估（纯推理；对 baseline run 或 A2 run 均可运行）
+# A1 快照评估（纯推理，对 baseline 或 A2 run 均可）
 python diagnostics/a1_snapshot_eval.py \
     --run_dir output/cifar100/fedta/<run_name>/seed_42 \
     --out_csv diagnostics_output/a1_snapshot_eval.csv
 ```
 
-注意事项：
-- `--a2_arm` 仅在 `--method fedta_a2` 下生效；`--method fedta` 路径零改动（A2 代码全部藏在 method flag 后；checkpoint schema 也不变——a2_state 仅在 fedta_a2 下写入）
-- A2 checkpoint 含保护快照（a2_state），fail-closed：缺 a2_state / arm 不一致 / 快照行数不符的 resume 一律 RuntimeError
-- A1 预期结果 = 2×2 co 组合预注册值（T1 71.4→93.9 等）；显著偏离时先查 batchwise_prompt 噪声（±2pp 内正常）
-- A2 判读需配合 D1 脚本在 A2 run 上重算 KA_rel / 路由保持率，与 seed42 baseline 对照
+- `--a2_arm` 仅在 `--method fedta_a2` 下生效；A2 checkpoint 含 a2_state，resume fail-closed
+- A1 预期 = 2×2 co 组合预注册值（T1 71.4→93.9 等）；±2pp 内 batchwise_prompt 噪声正常
 
 ### 16.1 A2/A1 回归测试（正式四臂前必须全过）
 
 ```bash
-# T1. A2 resume 等价（连续 vs 断点恢复，含 a2_state 逐位比较；复用 Gate 0B harness）
-python tests/test_resume_regression.py --method fedta_a2 --a2_arm anchor --data-path <DATA_PATH>
-
-# T2. A2 fail-closed 拒绝语义（arm mismatch / 缺 a2_state / fedta schema 不变性）
-python tests/test_a2_rejections.py --data-path <DATA_PATH>
-
-# T3. A1 与 2×2 逐位对账（A1 gen t == (current, old)；A1 cur == (current, current)）
-python tests/test_a1_parity.py --data-path <DATA_PATH>
-
-# T0. fedta 基线路径未变回归（Gate 0A smoke + Gate 0B/0C，见第 10/11/12 节，改动后重跑一遍）
+python tests/test_resume_regression.py --method fedta_a2 --a2_arm anchor --data-path <DATA_PATH>  # T1
+python tests/test_a2_rejections.py --data-path <DATA_PATH>                                        # T2
+python tests/test_a1_parity.py --data-path <DATA_PATH>                                            # T3
+# T0 = Gate 0A smoke + 0B/0C 重跑（§10–12）
 ```
 
 执行顺序：T0 → T1 → T2 → T3 → A1 正式评估 → A2 三臂正式训练。
 
-## 17. 外部 baseline（FedMGP，原仓库 + protocol adapter）
+## 17. 外部 baseline：FedMGP（原仓库零编辑 + protocol adapter）
 
-> 论文表述：*We preserve the official implementation of each baseline and replace only the dataset partition interface to ensure identical client-task sample assignments.*
-> `external_baselines/FedMGP` 为官方仓库克隆，**零编辑**；所有注入/修复通过 `protocol_adapters/manifest_splitter.py` 的运行时 monkey-patch 完成。`local_datasets`、`pretrain_model` 在 FedMGP 目录内是指向本仓库的同名 symlink。
-
-### 17.1 协议 manifest（冻结的划分真值，一次生成）
+> 官方仓库克隆于 `external_baselines/FedMGP`，零编辑；注入/修复经 `protocol_adapters/` 运行时 monkey-patch。`local_datasets`/`pretrain_model` 为 symlink。
 
 ```bash
+# 17.1 协议 manifest（已生成冻结，四重 seal PASS）
 python diagnostics/export_split_manifest.py \
     --reference-checkpoint output/cifar100/fedta_a2/a2_anchor/seed_42/checkpoints/latest.pth \
     --verify-task0-replay \
     -o protocol_manifests/cifar100_c5t5p15s20_seed42.json
-```
 
-- 已生成并通过四重 seal（S1 outer 与 checkpoint bit-identical / S2 inner 70/30 结构 / S3 surrogate+pool 划满 10k 测试集 / S4 task-0 CPU 重放 fedta RNG 流验证 inner split）
-- inner split 取自 a2_anchor seed_42 checkpoint（证据链：A2 三臂 dsi bit-identical + RNG-neutral 设计 + S4 重放 PASS）；正式 fedta seed_42 checkpoint 拷回后可用 `--reference-checkpoint` 重新导出升级 provenance
-
-### 17.2 protocol equivalence gate（训练前必须 PASS）
-
-```bash
+# 17.2 protocol equivalence gate（训练前必须 PASS，已 PASS 2026-10-18）
 python protocol_adapters/gate_fedmgp.py \
     --manifest protocol_manifests/cifar100_c5t5p15s20_seed42.json
-```
 
-- Part A（FedMGP 原生 splitter 同 seed vs manifest，informational）+ Part B（adapter 注入后实际加载对象 vs manifest，gating）+ 结构 seal（索引唯一性、surrogate+pool=10k、总数=49936）——三项全 PASS（2026-10-18），报告 `protocol_manifests/gate_fedmgp_report.json`
-
-### 17.3 正式训练（tmux）
-
-```bash
+# 17.3 正式训练（tmux）
 tmux new -s fedmgp_seed42
 cd /root/autodl-tmp/users/ych/FedSMTA
 python protocol_adapters/run_fedmgp.py \
@@ -460,105 +328,67 @@ python protocol_adapters/run_fedmgp.py \
     --device cuda
 ```
 
-- **协议冻结**（与 manifest 不符直接退出）：cifar100、5 clients × 5 tasks、private_class_num 15、surrogate 20/类、global_epoch 5、seed 42
-- **协议对齐**（默认 30，可 `--local_epoch` 覆盖）：FedMGP 与 FedTA 同源，local epoch 语义直接可比
-- **method-native**（FedMGP 官方默认，可覆盖）：lr 0.001875、threshold 0.1、batch_size 16
-- 未知 CLI flag 原样转发给 FedMGP 自己的 `config/cifar100_delay.py`
-- FedMGP 官方仓库 cifar100 路径有 3 个 bug，adapter 已运行时修复（不改文件）：①Server 从不给 client `update_data`（FedTA 语义恢复）②`CustomedSubset.__getitem__` PIL 转换被注释 ③local-prompt 阶段硬编码 `np.arange(200)` 在 100 类上触发 CUDA assert
-- 时序参考：25 rounds × 5 clients × 2 阶段 × 30 epochs，空闲 GPU 约 12–15h；当前 A4 pilot 占卡时约 35h（约 17s/epoch/client）
-- 环境：FedSMTA conda env 直接可用（torch 1.12.1 + timm 0.6.7 满足 FedMGP 依赖；deeplake 已 stub，无需安装）
+- 协议冻结（与 manifest 不符退出）：cifar100、5c×5t、p15、s20、ge5、seed 42；local_epoch 默认 30；method-native：lr 0.001875 / threshold 0.1 / batch 16；未知 flag 转发 FedMGP config
+- 官方仓库 3 个 bug（update_data 缺失 / PIL 转换被注释 / np.arange(200) CUDA assert）已运行时修复
+- 空闲 GPU 约 12–15h；FedSMTA conda env 直接可用（torch 1.12.1 + timm 0.6.7，deeplake 已 stub）
 
-## 18. 外部 baseline（C²Prompt，ImageNet-R，原仓库 + protocol adapter）
+## 18. 外部 baseline：C²Prompt（ImageNet-R，原仓库零编辑 + adapter）
 
-> C²Prompt 只在 ImageNet-R 上对齐（官方 CIFAR-100 路径是其私有 500 虚拟类协议，与我们 5c5t manifest 不兼容；主表 CIFAR-100 不含 C²Prompt）。
-> `external_baselines/NeurIPS2025-C2Prompt` 为官方仓库克隆，**零编辑**；所有注入通过 `protocol_adapters/run_c2p.py` 运行时完成（main.py 源码补丁 7 组 8 处 + vit_coda_p_hard.py 源码补丁 2 处 + iIMAGENET_R dataset override + nni stub）。训练 = manifest inner.train（与 FedTA/FedMGP 完全相同样本）；评测 = C²Prompt 原生 global eval（累计已训类），样本池 = manifest test_pool（6000 测试集去掉 1000 个 surrogate）。Replay/Memory: **prev-task full local re-access**（2026-10-19 修正，原记 "none" 有误）。官方 v2 method 的 exemplar 路径确是死代码，但 `vit_coda_p_hard.py` updateweight 的 mover 分支（L673-685）在每个新 task 起点先对 client 自己的 **prev task 全量训练数据**重跑 `train_class`（按类加载真实样本、每类 20 epochs、更新 per-class prompt module），再训当前 task。数据不出本地（manifest patch 逐 client 锁定样本来源，无跨 client 泄漏），故不破坏联邦隐私；但违反 exemplar-free FCL 的"旧任务原数据即弃"设定——数据访问强度高于 GLFC 的 exemplar buffer。实证：seed_42 run 中 row1→row2 旧任务 +4~6pp（T1 为直接重训效果、T0 为共享 prompt pool 正向迁移）。论文主表数据访问列：FedTA/A2 = surrogate only，GLFC = exemplar m/class，C²Prompt = prev-task full re-access。
-
-### 18.1 协议 manifest（冻结的划分真值，一次生成）
+> 只在 ImageNet-R 对齐（官方 CIFAR 路径是私有 500 虚拟类协议，不兼容）。`external_baselines/NeurIPS2025-C2Prompt` 零编辑；注入经 `protocol_adapters/run_c2p.py`（main.py 7 组 8 处 + vit_coda_p_hard.py 2 处源码补丁 + dataset override + nni stub）。训练 = manifest inner.train；评测 = 原生 global eval（累计已训类）× manifest test_pool。
+> **数据访问 = prev-task full local re-access**（mover 分支 L673-685 每新 task 对本客户端 prev task 全量训练数据重跑 train_class；官方日志逐位一致证实激活）——数据不出本地但违反 exemplar-free 设定，主表数据访问列照此标注。
+> 官方仓库 2 个 cadence-latent bug（global_class_stats 残留 std UnboundLocalError + 温度硬编码表溢出）已运行时修复（边界轮官方语义逐位不变）。
+> 结果（seed42 after-T4 AA = 91.14，T0 = 86.86）：T0 领先来自 per-class 原型头+对比损失；低遗忘部分被 prev-task 重训兜底（Roadmap §6 差距记账）。
 
 ```bash
+# 18.1 manifest（已生成冻结，四重 seal PASS）
 python diagnostics/export_split_manifest.py --dataset ImageNet-R \
     --reference-checkpoint output/ImageNet-R/fedta/inr_base_p40/seed_42/checkpoints/latest.pth \
     --verify-task0-replay \
     -o protocol_manifests/inr_c5t5p40s5_seed42.json
-```
 
-- 已生成并通过四重 seal（S1 重生成 outer 与 checkpoint outer_split_manifest bit-identical / S2 inner 70/30 结构 / S3 surrogate 1000 + test_pool 5000 划满 6000 测试集 / S4 task-0 CPU 重放 fedta RNG 流验证 inner split）
-
-### 18.2 protocol equivalence gate（训练前必须 PASS）
-
-```bash
+# 18.2 gate（已 PASS 2026-10-18）
 python protocol_adapters/gate_c2p.py \
     --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
     --data-root local_datasets/imagenet-r \
     -o protocol_adapters/gate_c2p_report.json
-```
 
-- Part A（同 seed 未适配原生分布 vs manifest，informational：官方 500 虚拟类/20 类 task/sim 重采样/20% 切片，mean overlap 1.08/8 类）+ B1 manifest 结构 + B2 补丁源码 exec 后三个 class_distribution dict == manifest masks/[0,1] + B3 dataset patches（getTrainData == inner-70% 样本×25 client-task、get_image_class_dict 一致、getTestData_hard == test_pool）+ B4 源码 seal（main.py 7 组 8 处 + vit_coda_p_hard.py 2 处，替换计数 + compile）——全 PASS（2026-10-18），报告 `protocol_adapters/gate_c2p_report.json`
-
-### 18.3 冒烟（已通过，2026-10-18）
-
-```bash
-# 1-task 全路径（round 5 eval）
+# 18.3 冒烟（已通过 2026-10-18：1-task Avg=87.70 / 2-task Avg=90.43）
 python protocol_adapters/run_c2p.py \
     --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
     --epochs_global 6 --tasks_global 6 --epochs_local 1
-# 2-task 边界路径（round 6 task 边界 + round 11 累计类 eval）
-python protocol_adapters/run_c2p.py \
-    --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
-    --epochs_global 12 --tasks_global 6 --epochs_local 1
-```
 
-- 两者均 `Finisned Training!` 零异常：1-task Avg=87.70；2-task Avg=90.43（含 Incremental_learning、全 client task 前进、边界/非边界 choosing 轮、t 温度、累计类 per-client eval）
-
-### 18.4 正式训练（izfree，tmux）
-
-```bash
-# izfree 环境需先装（FedTA_PLUS_NEW_Server 环境内）：
-pip install pyyaml transformers torch_optimizer
-
-tmux new -s c2p_inr_seed42
-cd /path/to/FedSMTA
+# 18.4 正式训练（AutoDL——izfree 24GB OOM）
 python protocol_adapters/run_c2p.py \
     --manifest protocol_manifests/inr_c5t5p40s5_seed42.json
 ```
 
-- **协议冻结**（与 manifest 不符直接退出）：ImageNet-R、200 类、5 clients × 5 tasks、class_per_task/task_size 8、epochs_global 25、local_clients 5（全参与）、seed 42
-- **协议映射**：epochs_global 25 = 官方 cadence（每 task 5 round，官方 15/3）；task progression 替换为全 client 前进（官方 50% client 采样 + ImageNet_R 硬编码 `ep_g//3` 2-client 切换是 tasks_global=3 专用语义，在 5 task 下会留 15 个 client-task 永不训练）
-- **method-native**（官方默认，可 forwarded flag 覆盖）：lr 0.005、batch 64、epochs_local 10、global_update_lr 100、prompt_param `25 10 10 8 0 0 6 10 8`（首项 25 = e_task_number，恰等于 5×5 个 global task）
-- 官方仓库有 2 个 cadence-latent bug（官方 15 轮/3-task cadence 下不可达，我们 25 轮/5-task 下必触发），adapter 已运行时修复（不改文件）：①`updateweight_with_promptchoosing` 的 global_class_stats recompute 读取内层循环残留 `std`，非边界 choosing 轮（ep_g%3==0 且 new_task=False）class_features 为空 → UnboundLocalError——加 `and class_features` guard（边界轮官方语义逐位不变）②task 相似度温度 `t` 的硬编码表在 ep_g>14 返回 None → TypeError——替换为等价闭式（ep_g 0–14 逐位相同）
-- 首次运行会下载 timm `vit_base_patch16_224` 的 augreg npz 权重（~330MB）到 `~/.cache/torch/hub/checkpoints/`；AutoDL 侧已预置
-- 环境：torch 1.12.1 + timm 0.6.7 + numpy 1.23.5（与 FedSMTA/FedTA_PLUS_NEW_Server 一致）
+- 协议冻结：INR、200 类、5c×5t、epochs_global 25、seed 42；task progression 替换为全 client 前进（官方 50% 采样是 3-task 专用语义）
+- method-native：lr 0.005 / batch 64 / epochs_local 10 / global_update_lr 100 / prompt_param `25 10 10 8 0 0 6 10 8`
+- 环境：torch 1.12.1 + timm 0.6.7 + numpy 1.23.5；首次运行下载 timm augreg 权重 ~330MB
 
 ## 19. FL-only 构造基线（FedAvg / FedProx / FedNova，自实现 adapter）
 
-> 主表 FL 下界三行。FedTA 论文（arXiv 2412.18355）Table 1 中这三行同样是构造基线（FedTA 官方仓库无独立实现），故不适用"官方仓库零编辑"外部基线纪律，直接在本仓库实现：`protocol_adapters/run_fl_baseline.py`。构造口径：ViT-B/16 ImageNet 预训练（`pretrain_model/ViT-B_16.npz`，与主线 original_model 同一 create_model 调用）+ **全参数联邦微调**（无冻结、无 prompt、无 anchor）+ 固定 nb_classes 头（cifar100=100 / ImageNet-R=200，class-IL）+ 顺序任务流（无 replay）。数据 = manifest 冻结划分：本地训练用当前 task 的 inner.train，评测用 inner.test（logits 按 (client, task) class_mask 掩码，语义与 run_fedmgp._fedmgp_eval_task / 主线 evaluate 完全一致）。
->
-> 方法差异：fedavg = 样本加权平均；fedprox = 本地损失 + (μ/2)·‖w_i−w_glo‖²（全参数，w_glo 每轮快照，主表 μ=0.01）+ fedavg 聚合；fednova = 步数归一化再加权（w ← w + a_eff·Σ(n_i/Σn)(w_i−w)/a_i，a_i=实际优化步数=local_epoch×ceil(n_i/16)，a_eff=数据加权平均步数；同质步数下精确退化为 fedavg——标准公式，Wang et al. NeurIPS 2020 Alg.1）。本地优化器与 FedTA 血统 Client_DF.train 约定一致：Adam(lr 0.001, wd 1e-3)、CE、本地 batch 16（仓库硬编码）。
-
-### 19.1 正式训练（izfree，tmux；一个方法一个会话）
+> 主表 FL 下界三行，构造基线（FedTA 论文 Table 1 同样如此，官方仓库无独立实现），标注 "constructed following FedTA paper Table 1 setting"。`protocol_adapters/run_fl_baseline.py`：ViT-B/16 预训练 + 全参数联邦微调 + 固定 nb_classes 头（class-IL）+ 顺序任务流无 replay。数据 = manifest 冻结划分（训练 inner.train、评测 inner.test + class_mask 掩码）。
+> 方法差异：fedavg 样本加权；fedprox 全参 prox（主表 μ=0.01）；fednova 步数归一化再加权（同质步数精确退化为 fedavg）。本地优化器对齐 FedTA 血统：Adam(0.001, wd 1e-3)、CE、batch 16、30 epochs × 5 rounds/task。
 
 ```bash
-# CIFAR-100（manifest 复用 17.1 的冻结划分）
+# CIFAR-100（manifest 复用 §17.1）
 for m in fedavg fedprox fednova; do
-  tmux new -s fl_${m}_cifar100_seed42 -d \
-    "cd /path/to/FedSMTA && python protocol_adapters/run_fl_baseline.py \
-       --manifest protocol_manifests/cifar100_c5t5p15s20_seed42.json \
-       --method $m"
+  python protocol_adapters/run_fl_baseline.py \
+    --manifest protocol_manifests/cifar100_c5t5p15s20_seed42.json \
+    --method $m
 done
 
-# ImageNet-R（manifest 复用 18.1 的冻结划分；注意 INR 行预期 2-8 级别近乎全崩，量级对照 FedTA Table 1）
+# ImageNet-R（manifest 复用 §18.1；FL 行预期 2-8 级别近乎全崩，量级对照 FedTA Table 1）
 for m in fedavg fedprox fednova; do
-  tmux new -s fl_${m}_inr_seed42 -d \
-    "cd /path/to/FedSMTA && python protocol_adapters/run_fl_baseline.py \
-       --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
-       --method $m"
+  python protocol_adapters/run_fl_baseline.py \
+    --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
+    --method $m
 done
 ```
 
-- 常用 flag：`--fedprox_mu 0.01`（仅 fedprox，主表 0.01，可扫 0.1）；`--lr 0.001 --local_epoch 30 --global_epoch 5`（默认即协议值）；`--save_ckpt` 存 task_XX_end.pth（每个约 350MB）；`--resume auto` 从 `checkpoints/latest.pth` 轮边界续训（每轮自动写）；`--max_tasks N` 截断（仅冒烟用）
-- 产物落 `output/{dataset}/{fedavg|fedprox|fednova}/manifest_adapter/seed_{seed}/`，metrics CSV（accuracy_matrix / summary_metrics / client_X_accuracy / records.jsonl）与主线 RunManager 格式完全一致，直接进三级（分数据集/分种子/分任务）聚合
-- 无 `--seed` 参数：seed 由 manifest 锁定（跑别的种子需先 export 对应 seed 的 manifest）
-- 冒烟已通过（2026-10-20，三方法各 1-task×1-round×1-epoch 全路径零异常；聚合公式另通过单元测试：fedavg 样本加权 / fednova 归一化公式与同质退化精确性）
-- 预期量级（FedTA Table 1 对照）：CIFAR-100 FedAvg T1≈50、后期显著崩塌；ImageNet-R FL 行 2-8。若正式数字量级偏离需回查
-- 环境：FedSMTA conda env（torch 1.12.1）；显存占用约 6-8GB（batch 16 全参微调）+ 客户端权重缓冲 ~1.7GB，24GB 4090 可跑
-
+- 常用 flag：`--fedprox_mu 0.01`（仅 fedprox）；`--save_ckpt`（每个 ~350MB）；`--resume auto`（每轮写 latest.pth）；`--max_tasks N`（冒烟）
+- 产物落 `output/{dataset}/{method}/manifest_adapter/seed_{seed}/`，CSV 格式与主线一致，直接进三级（分数据集/分种子/分任务）聚合
+- 无 `--seed` 参数：seed 由 manifest 锁定（换种子需先 export 对应 manifest）
+- 冒烟已通过（2026-10-20）+ 聚合公式单测（含 fednova 退化精确性）
+- 显存约 6-8GB + 权重缓冲 ~1.7GB，24GB 4090 可跑；无 tmux 时直接顺序跑（izfree 不需要后台保护）
