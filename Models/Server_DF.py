@@ -84,6 +84,22 @@ class Server_DF(object):
         if self.method == 'fedta_a3':
             for c in self.clients:
                 c.surrogate_data = self.surrogate_data
+        # Phase 7 A5 (fedta_a5): generate the FIXED shared random projection
+        # V ONCE and broadcast the same tensor to every client (P2 v1.2 §1:
+        # single-factor UV — V is server-owned and never trains, so
+        # U-FedAvg stays an EXACT weighted average of effective transforms).
+        # RNG discipline: a DEDICATED torch.Generator seeded from args.seed
+        # with a fixed offset — the global torch / python / numpy streams
+        # that feed the data partition and training batches are untouched,
+        # and V is bit-reproducible on resume (validated fail-closed in
+        # Client_DF._a5_load_checkpoint_state).
+        if self.method == 'fedta_a5':
+            rank = int(getattr(self.args, 'a5_rank', 8))
+            gen = torch.Generator(device='cpu')
+            gen.manual_seed(int(self.args.seed) * 100003 + 7)
+            V = torch.randn(rank, 768, generator=gen)
+            for c in self.clients:
+                c.a5_init_shared(V)
         print("Initialization completes")
 
     def fedavg(self, sample_nums):
@@ -680,6 +696,10 @@ class Server_DF(object):
         # loader inside Client_DF also checks this, fail-closed). Key is
         # absent in old checkpoints -> skipped there.
         "a4_lambda",
+        # Phase 7 A5: rank changes the shared projection space (V shape);
+        # the a5_state loader inside Client_DF also checks this, fail-closed.
+        # Key is absent in non-A5 checkpoints -> skipped there.
+        "a5_rank",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):

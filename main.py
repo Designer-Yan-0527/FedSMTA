@@ -175,6 +175,20 @@ def validate_method_args(args):
                 "invalid fedta_a4 configuration: --a4_lambda must be a "
                 "finite value > 0")
         return
+    if args.method == 'fedta_a5':
+        if getattr(args, 'a2_arm', 'anchor') == 'none':
+            # valid: Shared-only factorial arm (P2 v1.2 §6)
+            pass
+        if int(getattr(args, 'a5_rank', 8)) <= 0:
+            raise ValueError(
+                "invalid fedta_a5 configuration: --a5_rank must be > 0")
+        return
+    if args.method == 'fedta_a2' and getattr(args, 'a2_arm', 'anchor') == 'none':
+        raise ValueError(
+            "invalid fedta_a2 configuration: --a2_arm none is ONLY valid "
+            "for --method fedta_a5 (the Shared-only factorial arm). A "
+            "fedta_a2 run with no protection arm is just the fedta "
+            "baseline under a wrong name (fail-closed).")
     if args.method != 'fedta_a3':
         return
     problems = []
