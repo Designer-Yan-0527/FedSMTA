@@ -61,7 +61,9 @@
 
 **差距记账（INR after-T4）**：C²P−A2 = 11.71pp = T0 起点差 3.99（原型头+对比损失的容量优势，非迁移）+ 后续差距扩大 7.72（持续演化贡献的**上界**，含 prev-task 重训兜底；真归因需完整 matrix+BWT+受控消融）。C²P 数据访问 = prev-task full re-access（mover 分支 L673-685，官方日志逐位一致证实激活），强度高于 GLFC exemplar buffer。
 
-**P1：frozen NCM probe（进行中，`diagnostics/ncm_probe.py`）**：z_ref（冻结特征，主结果，可在线增量维护）+ z_op（当前 prompt 特征，oracle/辅助）上的 cosine/Euclidean NCM vs native 路径。防泄漏构造（原型仅来自已见任务 inner.train）；缓存身份 fail-closed 校验；`--prompt_task_mode current` 对齐 native evaluate 的 task_id。**T0-gap 判据**：NCM 若在 T0 缩小 ~4pp 差距 → A5 首先是基础判别能力修复；增益只在后续边界 → 支持持续迁移叙事。INR 上的 NCM 增益只能证明分类接口价值，不得写成 federated transfer。
+**P1：frozen NCM probe（已完成，2026-10-20，INR seed42，`diagnostics/ncm_probe.py`）**：z_ref（冻结特征，可在线增量维护）+ z_op（当前 prompt 特征，oracle/辅助）上的 cosine/Euclidean NCM vs native 路径。防泄漏构造（原型仅来自已见任务 inner.train）；缓存身份 fail-closed 校验；`--prompt_task_mode current` 对齐 native evaluate 的 task_id。**T0-gap 判据**：NCM 若在 T0 缩小 ~4pp 差距 → A5 首先是基础判别能力修复；增益只在后续边界 → 支持持续迁移叙事。INR 上的 NCM 增益只能证明分类接口价值，不得写成 federated transfer。
+
+**P1 结果与判决**：AA（T0/T4）：native 82.87/79.43；z_ref NCM 79.06/76.04；z_op NCM 82.49/80.62；C²P 86.86/91.14。不变性对账通过（z_ref 旧行 T0/T4 逐位一致，probe 完整性确认）。判决：**T0-gap 非分类接口瓶颈**——z_op NCM(82.49)≈native Chead(82.87)，换分类器在 T0 不缩差距，冻结特征还倒退 3.8；T4 oracle NCM 仅 +1.19（量化了 A2 残余可分类器级恢复的接口损伤）。**纯统计原型分类接口判负**：差距在表征层（C²P 的对比损失 + per-class 原型训练在同数据预算下 T0 即 +4）→ A5 的共享语义层必须**可训练**（P2 走参数聚合 + 对比/原型目标路线）。z_op > z_ref 一贯（+3.4/+4.6）确认 prompt 适配特征的判别价值。
 
 **P2（按 P1 结果定）**：小型共享语义层，普通类掩码聚合 vs 类感知聚合 → 兼容性约束（surrogate 约束残差融合）→ FedTA/A2/Shared/A5 四臂析因（交互项 I=Y₁₁−Y₁₀−Y₀₁+Y₀₀，BWT 与 forgetting 分开报）。T0-gap 判据同样适用。LCDC/CPA/FedAvg 均不预设为必需组件。
 

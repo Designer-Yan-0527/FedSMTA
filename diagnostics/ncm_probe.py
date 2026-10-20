@@ -153,9 +153,13 @@ def ensure_features(run_dir, ckpt_rel, feat_dir, data_path, device,
     if Path(str(meta.get("checkpoint", ""))).name != Path(ckpt_rel).name:
         problems.append(f"checkpoint {meta.get('checkpoint')!r} does not "
                         f"match requested {ckpt_rel!r}")
-    if meta.get("nb_classes") != run_args.get("nb_classes"):
+    # nb_classes is computed at runtime and may be absent from args.json --
+    # only compare when the key exists there (identity is already pinned by
+    # run_dir + seed + checkpoint name + mode)
+    if ("nb_classes" in run_args
+            and meta.get("nb_classes") != run_args["nb_classes"]):
         problems.append(f"nb_classes {meta.get('nb_classes')!r} != "
-                        f"{run_args.get('nb_classes')!r}")
+                        f"{run_args['nb_classes']!r}")
     if meta.get("prompt_task_mode", "test") != prompt_mode:
         problems.append(f"prompt_task_mode "
                         f"{meta.get('prompt_task_mode', 'test')!r} != "
