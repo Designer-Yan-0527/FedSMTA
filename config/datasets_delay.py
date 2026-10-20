@@ -135,6 +135,17 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--a5_rank', type=int, default=8,
                             help='A5 shared-adapter rank r (only used with --method '
                                  'fedta_a5). P2 v1.2 preregistered default: 8.')
+    # Phase 7 A5 PR-2B: prototype-CE hyperparameters (P2 v1.2 frozen
+    # config §10). lambda == 0 disables proto-CE ENTIRELY (skips the
+    # computation) and is the Shared CE-only factorial arm of PR-3.
+    subparsers.add_argument('--a5_proto_lambda', type=float, default=0.5,
+                            help='A5 prototype-CE loss weight (only used with '
+                                 '--method fedta_a5). P2 v1.2 frozen default: '
+                                 '0.5. 0 = proto-CE OFF (Shared CE-only arm).')
+    subparsers.add_argument('--a5_proto_tau', type=float, default=0.07,
+                            help='A5 prototype-CE temperature on the normalized '
+                                 'inner product (only used with --method fedta_a5). '
+                                 'P2 v1.2 frozen default: 0.07.')
     # Phase 5 A3 (--method fedta_a3): A3-KL v1 hyper-parameters. A3 never
     # freezes key/anchor rows (that is A2 territory and structurally excluded
     # by the single --method choice), and does NOT use the A2 protection-set

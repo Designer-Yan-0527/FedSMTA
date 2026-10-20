@@ -182,6 +182,13 @@ def validate_method_args(args):
         if int(getattr(args, 'a5_rank', 8)) <= 0:
             raise ValueError(
                 "invalid fedta_a5 configuration: --a5_rank must be > 0")
+        if float(getattr(args, 'a5_proto_lambda', 0.5)) < 0:
+            raise ValueError(
+                "invalid fedta_a5 configuration: --a5_proto_lambda must be "
+                ">= 0 (0 = proto-CE OFF, the Shared CE-only arm)")
+        if float(getattr(args, 'a5_proto_tau', 0.07)) <= 0:
+            raise ValueError(
+                "invalid fedta_a5 configuration: --a5_proto_tau must be > 0")
         return
     if args.method == 'fedta_a2' and getattr(args, 'a2_arm', 'anchor') == 'none':
         raise ValueError(

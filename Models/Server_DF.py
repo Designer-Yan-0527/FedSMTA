@@ -58,6 +58,15 @@ class Server_DF(object):
 
         self.fix_keys = []
 
+        # Phase 7 A5 PR-2A: canonical global reference-prototype table in
+        # the FIXED z_ref space (P2 v1.2 §4). Merged ONCE per task boundary
+        # (exact sum/count), versioned monotonically, never recomputed when
+        # the adapter updates (§3). Clients hold the SAME published dict.
+        self.a5_proto_version = -1     # -1 = nothing published yet
+        self.a5_ref_protos = None      # {class_id: mu_c [768] cpu float32}
+        self.a5_proto_sums = None      # {class_id: S_c}  (exact, for resume)
+        self.a5_proto_counts = None    # {class_id: n_c}  (exact, for resume)
+
         # Phase 0: round-boundary checkpoint / resume state
         self.run_manager = run_manager
         # Phase 0: observer instrumentation switch (tests/test_observer_
@@ -101,6 +110,87 @@ class Server_DF(object):
             for c in self.clients:
                 c.a5_init_shared(V)
         print("Initialization completes")
+
+    def a5_sync_ref_protos(self, task_id):
+        """A5 PR-2A (P2 v1.2 §4 steps 2-3): task-boundary prototype sync.
+
+        1. every client runs the RNG-neutral no-grad stats pass over its
+           CURRENT-task inner-train (fixed z_ref space);
+        2. the server merges per-class sum/count EXACTLY (cumulative over
+           tasks — the table keeps every class ever seen);
+        3. publishes mu_c = S_c / n_c with a monotonically increasing
+           version; all clients receive the SAME dict object.
+
+        Fail-closed guarantees (asserted, not assumed):
+          - no FUTURE class enters the table: every key must belong to some
+            client's class_mask for a task <= task_id;
+          - counts are positive integers;
+          - a re-sync for an already-synced task is refused (resume must
+            restore from the checkpoint instead of re-accumulating).
+        Also logs the cross-client exposure rate (§4 disclosure): table
+        classes the client has not seen in tasks <= task_id.
+        """
+        if self.method != 'fedta_a5':
+            raise RuntimeError(
+                f"a5_sync_ref_protos called for method {self.method!r}")
+        if task_id <= self.a5_proto_version:
+            raise RuntimeError(
+                f"a5 proto sync: task {task_id} already synced at version "
+                f"{self.a5_proto_version} — double accumulation refused "
+                f"(resume must restore a5_proto_state from the checkpoint)")
+        stats = [c.a5_compute_proto_stats() for c in self.clients]
+
+        # exact cumulative merge (sum/count, never averaged-then-averaged)
+        if self.a5_proto_sums is None:
+            self.a5_proto_sums, self.a5_proto_counts = {}, {}
+        for cstat in stats:
+            for c, (s, n) in cstat.items():
+                if c in self.a5_proto_sums:
+                    self.a5_proto_sums[c] = self.a5_proto_sums[c] + s
+                    self.a5_proto_counts[c] = self.a5_proto_counts[c] + n
+                else:
+                    self.a5_proto_sums[c] = s.clone()
+                    self.a5_proto_counts[c] = int(n)
+
+        # no-future-class guard: every table class must be owned by SOME
+        # client in a task <= task_id (the global seen set)
+        global_seen = set()
+        for k in range(self.client_num):
+            for t in range(task_id + 1):
+                global_seen.update(int(x) for x in self.class_mask[k][t])
+        future = [c for c in self.a5_proto_sums if c not in global_seen]
+        if future:
+            raise RuntimeError(
+                f"a5 proto table leaked future classes {sorted(future)} — "
+                f"refusing to publish")
+        bad_counts = [c for c, n in self.a5_proto_counts.items() if n <= 0]
+        if bad_counts:
+            raise RuntimeError(
+                f"a5 proto table has non-positive counts {bad_counts}")
+
+        self.a5_proto_version = task_id
+        self.a5_ref_protos = {
+            c: (self.a5_proto_sums[c] / self.a5_proto_counts[c]).float()
+            for c in self.a5_proto_sums}
+
+        # publish the SAME object + version to every client
+        for c in self.clients:
+            c.a5_ref_protos = self.a5_ref_protos
+            c.a5_proto_version = self.a5_proto_version
+
+        # exposure-rate disclosure (§4): cross-client classes in the table
+        # this client has not itself seen in tasks <= task_id
+        for c in self.clients:
+            local_seen = set()
+            for t in range(task_id + 1):
+                local_seen.update(
+                    int(x) for x in self.class_mask[c.id][t])
+            exposed = len(self.a5_ref_protos) - len(
+                local_seen & set(self.a5_ref_protos.keys()))
+            print(f"[a5-proto] task {task_id} -> version "
+                  f"{self.a5_proto_version}: table="
+                  f"{len(self.a5_ref_protos)} classes; client {c.id} "
+                  f"exposed to {exposed} cross-client classes")
 
     def fedavg(self, sample_nums):
         training_num = 0
@@ -158,6 +248,13 @@ class Server_DF(object):
 
             if self.task_id != i//self.global_epoch:
                 self.task_id = i//self.global_epoch
+                # Phase 7 A5 PR-2A (P2 v1.2 §4 steps 1-3): all clients have
+                # entered the new task (update_data above) -> no-grad stats
+                # pass over each client's current-task inner-train -> exact
+                # server-side sum/count merge -> publish the versioned table.
+                # Runs for every fedta_a5 arm identically (budget-fair, §4).
+                if self.method == 'fedta_a5':
+                    self.a5_sync_ref_protos(self.task_id)
 
 
             print(f"--------round {i},task number {i//self.global_epoch}-----------")
@@ -188,6 +285,12 @@ class Server_DF(object):
                 self.kd_fusion_prompt(self.thisclients)
 
             self.fed_avg_head(self.thisclients)
+            # Phase 7 A5 PR-2C (P2 v1.2 §3): U-only sample-weighted FedAvg
+            # (exact average of the effective transforms; V untouched).
+            # PR-3's Local Adapter arm disables ONLY this call — everything
+            # else (proto table, proto-CE, budget) stays identical.
+            if self.method == 'fedta_a5':
+                self.a5_fedavg_U(self.thisclients)
 
             print('Server aggregation Compelte, results are ()：')
             # Phase 0: collect the (already existing) post-broadcast
@@ -700,6 +803,10 @@ class Server_DF(object):
         # the a5_state loader inside Client_DF also checks this, fail-closed.
         # Key is absent in non-A5 checkpoints -> skipped there.
         "a5_rank",
+        # Phase 7 A5 PR-2B: lambda/tau changes would silently change the
+        # proto-CE constraint mid-run (lambda 0 vs 0.5 = different arms).
+        # Keys are absent in non-A5 / PR-1-era checkpoints -> skipped there.
+        "a5_proto_lambda", "a5_proto_tau",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):
@@ -752,6 +859,20 @@ class Server_DF(object):
             "existing_class": sorted(self.existing_class),
 
             "server_prompt": module_state_or_none(self.prompt),
+
+            # Phase 7 A5 PR-2A: canonical reference-prototype state (exact
+            # sums/counts, not just mu, so a resume reconciles bit-exactly
+            # and never re-accumulates the current task). Key is ONLY added
+            # for fedta_a5 (schema untouched for every other method).
+            **({"a5_proto_state": {
+                    "version": self.a5_proto_version,
+                    "sums": ({c: s.clone() for c, s in
+                              self.a5_proto_sums.items()}
+                             if self.a5_proto_sums else {}),
+                    "counts": (dict(self.a5_proto_counts)
+                               if self.a5_proto_counts else {}),
+                }}
+               if self.method == 'fedta_a5' else {}),
 
             "clients": [c.state_dict_for_checkpoint() for c in self.clients],
 
@@ -859,6 +980,37 @@ class Server_DF(object):
         for client_state in checkpoint.get("clients", []):
             cid = client_state["id"]
             self.clients[cid].load_checkpoint_state(client_state)
+
+        # Phase 7 A5 PR-2A: restore the canonical reference-prototype table
+        # (exact sums/counts + version) and REPUBLISH to every client.
+        # Fail-closed: a fedta_a5 checkpoint without a5_proto_state would
+        # silently re-accumulate the current task on the next boundary
+        # (double counting) — refused, same discipline as a5_state.
+        if self.method == 'fedta_a5':
+            a5ps = checkpoint.get("a5_proto_state")
+            if not isinstance(a5ps, dict):
+                raise RuntimeError(
+                    "fedta_a5 resume requires a5_proto_state in the "
+                    "checkpoint — refusing to restart the reference-"
+                    "prototype table from scratch mid-run (fail-closed; "
+                    "re-run from scratch or use a fedta_a5 checkpoint)")
+            self.a5_proto_version = int(a5ps.get("version", -1))
+            self.a5_proto_sums = {int(c): s.float()
+                                  for c, s in a5ps.get("sums", {}).items()}
+            self.a5_proto_counts = {
+                int(c): int(n) for c, n in a5ps.get("counts", {}).items()}
+            if set(self.a5_proto_sums) != set(self.a5_proto_counts):
+                raise RuntimeError(
+                    "a5_proto_state corrupt: sums/counts key mismatch")
+            self.a5_ref_protos = {
+                c: (self.a5_proto_sums[c] / self.a5_proto_counts[c]).float()
+                for c in self.a5_proto_sums}
+            for c in self.clients:
+                c.a5_ref_protos = self.a5_ref_protos
+                c.a5_proto_version = self.a5_proto_version
+            print(f"[a5-proto] resumed table: version="
+                  f"{self.a5_proto_version}, classes="
+                  f"{len(self.a5_ref_protos)}")
 
         # RNG state must be restored LAST: model creation and split rebuild
         # above must not consume the restored random stream.
@@ -995,6 +1147,66 @@ class Server_DF(object):
         return self.prompt
 
 
+
+    def a5_fedavg_U(self, chosen_clients):
+        """A5 PR-2C (P2 v1.2 §3): U-only sample-weighted FedAvg.
+
+            U^{r+1} = sum_k (n_k / sum_j n_j) U_k^{r+1}
+
+        With V fixed and shared this is the EXACT sample-weighted average
+        of the effective transforms (sum_k p_k (U_k V) = (sum_k p_k U_k) V,
+        §1 single-factor rationale). n_k = the client's current-task
+        inner-train size (the data it actually trained on this round).
+        V is NEVER touched; every client gets its own fresh leaf copy of
+        the averaged U (independent .grad accumulation; the Adam optimizer
+        is rebuilt inside train() each round, so no stale state).
+
+        Aggregation-identity guard (fail-closed, every round): on a fixed
+        probe batch the averaged effective residual must equal the weighted
+        average of the per-client effective residuals (float tolerance).
+
+        PR-3's Local Adapter arm disables ONLY this aggregation.
+        """
+        if self.method != 'fedta_a5':
+            raise RuntimeError(
+                f"a5_fedavg_U called for method {self.method!r}")
+        ns = [len(self.clients[k].traindata) for k in chosen_clients]
+        total = sum(ns)
+        if total <= 0:
+            raise RuntimeError(
+                "a5_fedavg_U: all chosen clients have empty traindata — "
+                "sample weights undefined (fail-closed)")
+        # weighted average of the client U's (on the first client's device)
+        dev = self.clients[chosen_clients[0]].a5_U.device
+        U_avg = None
+        for w, k in zip(ns, chosen_clients):
+            Uk = self.clients[k].a5_U.detach().to(dev)
+            term = Uk * (w / total)
+            U_avg = term if U_avg is None else U_avg + term
+
+        # aggregation-identity guard: (avg U) V z == sum_k p_k (U_k V z)
+        # on a deterministic probe (dedicated generator — no RNG leak)
+        gen = torch.Generator(device='cpu')
+        gen.manual_seed(977)
+        probe = torch.randn(4, 768, generator=gen).to(dev)
+        V = self.clients[chosen_clients[0]].a5_V.to(dev)
+        lhs = (probe @ V.t()) @ U_avg.t()
+        rhs = None
+        for w, k in zip(ns, chosen_clients):
+            Uk = self.clients[k].a5_U.detach().to(dev)
+            term = (probe @ V.t()) @ Uk.t() * (w / total)
+            rhs = term if rhs is None else rhs + term
+        if not torch.allclose(lhs, rhs, atol=1e-4):
+            raise RuntimeError(
+                "a5_fedavg_U: aggregation identity violated — averaged "
+                "effective residual != weighted average of client "
+                "effective residuals (fail-closed)")
+
+        # broadcast: each client gets its own independent leaf copy
+        for k in chosen_clients:
+            c = self.clients[k]
+            c.a5_U = U_avg.detach().to(c.a5_U.device).clone() \
+                .requires_grad_(True)
 
     def fed_avg_head(self, chosen_clients):
         heads = []

@@ -127,6 +127,19 @@ class Client_DF(object):
             # None also disables the residual for diagnostics-only clients
             self.a5_U = None                  # [768, r] trainable, requires_grad
             self.a5_V = None                  # [r, 768] fixed shared projection
+            # PR-2A: published global reference-prototype table (fixed z_ref
+            # space) + its version; injected by Server_DF.a5_sync_ref_protos
+            # at every task boundary (P2 v1.2 §4 steps 3-4). Every client
+            # receives the SAME dict object, so within a round the table is
+            # version-consistent by construction.
+            self.a5_ref_protos = None         # {class_id: mu_c [768]} or None
+            self.a5_proto_version = -1        # -1 = nothing published yet
+            # PR-2B: prototype-CE hyperparameters (P2 v1.2 frozen config:
+            # tau = 0.07 temperature on the normalized inner product,
+            # lambda = 0.5 loss weight; lambda == 0 is EXACTLY proto-CE
+            # OFF, both computationally and numerically)
+            self.a5_proto_lambda = float(getattr(args, 'a5_proto_lambda', 0.5))
+            self.a5_proto_tau = float(getattr(args, 'a5_proto_tau', 0.07))
 
         # Phase 5 A3 (--method fedta_a3): functional routing-consistency state
         # (A3-KL v1). Attributes are ONLY created for the A3 method; the
@@ -357,6 +370,59 @@ class Client_DF(object):
         z = z_ref.detach().to(self.a5_U.device)
         return (z @ self.a5_V.t()) @ self.a5_U.t()
 
+    def _a5_proto_ce(self, cls_features, target):
+        """A5 PR-2B (P2 v1.2 §5): prototype-CE on the shared transformation
+        W = I + U V in the FIXED z_ref space:
+
+            L_proto = CE( cos(W z, W mu_c) / tau , y )
+
+        over the published global seen-class table (a5_ref_protos).
+        Gradient ownership: z_ref is a frozen-backbone constant, mu_c is a
+        fixed statistic, V is fixed — the ONLY trainable tensor in this
+        graph is U, reached through BOTH sides (W z and W mu). Chead,
+        Tail_Anchor, prompts and the official loss are untouched.
+
+        Fail-closed: every batch label must be a table class (the boundary
+        sync publishes the current task's classes BEFORE any training
+        round); a missing U/V or a missing table is a wiring error, not a
+        runtime state to tolerate.
+        """
+        if self.method != 'fedta_a5':
+            raise RuntimeError(
+                f"client {self.id}: _a5_proto_ce called for method "
+                f"{self.method!r} (A5 only)")
+        if self.a5_U is None or self.a5_V is None:
+            raise RuntimeError(
+                f"client {self.id}: _a5_proto_ce before a5_init_shared "
+                f"— U/V must be injected by Server_DF.init_client()")
+        if not self.a5_ref_protos:
+            raise RuntimeError(
+                f"client {self.id}: _a5_proto_ce with empty reference-"
+                f"prototype table — the task-boundary sync must publish "
+                f"before any training round")
+        classes = sorted(self.a5_ref_protos.keys())
+        cls_index = {c: i for i, c in enumerate(classes)}
+        y = []
+        for t in target:
+            t = int(t)
+            if t not in cls_index:
+                raise RuntimeError(
+                    f"client {self.id}: batch label {t} not in the "
+                    f"published table ({len(classes)} classes) — current-"
+                    f"task classes must be synced at the boundary")
+            y.append(cls_index[t])
+        y = torch.tensor(y, dtype=torch.long, device=self.device)
+        mu = torch.stack([self.a5_ref_protos[c] for c in classes]
+                         ).to(self.device)              # [C, 768] constant
+        # W z = z + U(V z); z is a no_grad constant, gradient reaches U
+        z = cls_features.detach().to(self.a5_U.device)
+        Wz = z + (z @ self.a5_V.t()) @ self.a5_U.t()
+        # W mu = mu + U(V mu); mu constant, gradient reaches U
+        Wmu = mu + (mu @ self.a5_V.t()) @ self.a5_U.t()
+        logits_proto = (F.normalize(Wz, dim=1)
+                        @ F.normalize(Wmu, dim=1).t()) / self.a5_proto_tau
+        return F.cross_entropy(logits_proto, y)
+
     def _a5_state_for_checkpoint(self):
         """Serialize A5 shared-adapter state; always a dict for fedta_a5,
         never called for other methods (checkpoint schema untouched)."""
@@ -413,6 +479,78 @@ class Client_DF(object):
                 f"server-regenerated projection does not match the "
                 f"checkpoint (check seed / a5_rank)")
         self.a5_U = U.to(self.device).clone().requires_grad_(True)
+
+    def a5_compute_proto_stats(self):
+        """A5 PR-2A (P2 v1.2 §4 step 2): no-grad class-level sum/count of
+        the FIXED z_ref feature (frozen original_model pre_logits) over the
+        CURRENT task's inner-train split (data_split_indices[task]["train"]).
+
+        z_ref needs no prompts and no adapter, so the statistics live in a
+        space that never changes when the adapter updates (§3: the table is
+        merged once per task boundary and never recomputed). RNG-neutral:
+        the extra DataLoader traversal snapshots/restores ALL RNG streams
+        exactly like _a2_init_task_protection, so the FedTA/A2 baseline
+        batch streams are untouched.
+
+        Returns {class_id: (sum [768] float32 cpu, count int)} for the
+        classes actually present in this client's current-task inner-train.
+        """
+        if self.method != 'fedta_a5':
+            raise RuntimeError(
+                f"client {self.id}: a5_compute_proto_stats called for method "
+                f"{self.method!r} (only fedta_a5 computes reference stats)")
+        t = self.task_id
+        if t not in self.data_split_indices:
+            raise RuntimeError(
+                f"client {self.id}: task {t} inner split missing — "
+                f"a5_compute_proto_stats must run after update_data() "
+                f"entered the task")
+        rng_state = {
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda_all": (torch.cuda.get_rng_state_all()
+                               if torch.cuda.is_available() else None),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+        }
+        orig_was_training = self.original_model.training
+        try:
+            self.original_model.eval()
+            dataset = Subset(self.train_data[t],
+                             self.data_split_indices[t]["train"])
+            loader = DataLoader(dataset, batch_size=16, num_workers=0,
+                                shuffle=False)
+            # dense per-class accumulation (exact; no floating-point order
+            # ambiguity across batch grouping: index_add on the class dim).
+            # z_ref dim is FROZEN at 768 by P2 v1.2 (V is [r, 768], U is
+            # [768, r]) — any other backbone dim is refused, NOT adapted to
+            # (same fail-closed discipline as a5_init_shared's V check).
+            sums = torch.zeros(self.nb_classes, 768)
+            counts = torch.zeros(self.nb_classes, dtype=torch.long)
+            for input, target in loader:
+                input = input.to(self.device, non_blocking=True)
+                target = target.to(self.device)
+                with torch.no_grad():
+                    z = self.original_model(input)['pre_logits']
+                if z.shape[1] != 768:
+                    raise RuntimeError(
+                        f"client {self.id}: a5 proto stats require the "
+                        f"frozen 768-dim z_ref space (P2 v1.2), got "
+                        f"{z.shape[1]} — refusing to adapt")
+                cls = target.long().cpu()   # sums/counts accumulate on CPU
+                sums.index_add_(0, cls, z.float().cpu())
+                counts.index_add_(0, cls,
+                                  torch.ones_like(cls))
+            present = counts.nonzero().reshape(-1)
+            return {int(c): (sums[c].clone(), int(counts[c]))
+                    for c in present}
+        finally:
+            # restore ALL RNG streams + module mode (bit-neutral pass)
+            torch.set_rng_state(rng_state["torch_cpu"])
+            if rng_state["torch_cuda_all"] is not None:
+                torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+            self.original_model.train(orig_was_training)
 
     def _a4_dir_loss(self):
         """A4: normalized-direction preservation loss on the protected key
@@ -741,6 +879,16 @@ class Client_DF(object):
             loss = loss + self.a4_lambda * loss_dir
             extra, extra_kind = float(loss_dir.detach()), 'dir'
 
+        # Phase 7 A5 PR-2B (fedta_a5): prototype-CE regularizer (P2 v1.2
+        # §5) — gradient reaches U ONLY (both W z and W mu sides); the
+        # official loss, Chead, Tail_Anchor and prompts are untouched.
+        # lambda == 0 skips the computation entirely => EXACTLY the
+        # Shared CE-only arm (identical to PR-1 behavior + PR-2A sync).
+        if self.method == 'fedta_a5' and self.a5_proto_lambda != 0:
+            loss_proto = self._a5_proto_ce(cls_features, target)
+            loss = loss + self.a5_proto_lambda * loss_proto
+            extra, extra_kind = float(loss_proto.detach()), 'proto'
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -850,11 +998,17 @@ class Client_DF(object):
                             // self.a3_ref_batch_size)
         a3_epoch_acc = None
         a4_epoch_acc = None
+        # Phase 7 A5: per-epoch proto-CE logging accumulator (mirrors the
+        # A3/A4 discipline; every batch of a fedta_a5 round contributes)
+        a5_epoch_acc = None
         for epoch in tqdm(range(self.local_epoch)):
             if a3_active:
                 a3_epoch_acc = {"base": [], "kl": [], "lam_kl": []}
             if a4_active:
                 a4_epoch_acc = {"base": [], "dir": [], "lam_dir": []}
+            if (self.method == 'fedta_a5'
+                    and self.a5_proto_lambda != 0):
+                a5_epoch_acc = {"base": [], "proto": [], "lam_proto": []}
             for iteration, (input, target) in enumerate(train_loader):
                 input, target = Variable(input, requires_grad=False).to(self.device, non_blocking=True), target.long().to(
                     self.device, non_blocking=True)
@@ -877,6 +1031,11 @@ class Client_DF(object):
                     a4_epoch_acc["dir"].append(extra_f)
                     a4_epoch_acc["lam_dir"].append(
                         float(self.a4_lambda) * extra_f)
+                if a5_epoch_acc is not None and extra_kind == 'proto':
+                    a5_epoch_acc["base"].append(base_f)
+                    a5_epoch_acc["proto"].append(extra_f)
+                    a5_epoch_acc["lam_proto"].append(
+                        float(self.a5_proto_lambda) * extra_f)
 
             # Phase 5 A3: per-local-epoch logging (means over this epoch's
             # constrained steps; teacher top1 confidence is a fixed property
@@ -900,6 +1059,18 @@ class Client_DF(object):
                       f'base_loss={m_base:.4f} dir_loss={m_dir:.4f} '
                       f'lam*dir={m_ldir:.3e} '
                       f'n_protected={self._a2_protected_slots.numel()}')
+
+            # Phase 7 A5: per-local-epoch proto-CE logging (means over this
+            # epoch's batches), mirroring the A3/A4 discipline
+            if a5_epoch_acc is not None and a5_epoch_acc["proto"]:
+                m_base = sum(a5_epoch_acc["base"]) / len(a5_epoch_acc["base"])
+                m_proto = sum(a5_epoch_acc["proto"]) / len(a5_epoch_acc["proto"])
+                m_lproto = sum(a5_epoch_acc["lam_proto"]) / len(a5_epoch_acc["lam_proto"])
+                print(f'[A5] client {self.id} task {self.task_id} epoch {epoch}: '
+                      f'base_loss={m_base:.4f} proto_ce={m_proto:.4f} '
+                      f'lam*proto={m_lproto:.3e} '
+                      f'proto_version={self.a5_proto_version} '
+                      f'n_table={len(self.a5_ref_protos)}')
 
 
         target_list = []
