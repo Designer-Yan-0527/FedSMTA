@@ -185,6 +185,54 @@ def test_b6_no_nan():
         c.a5_U.grad = None
 
 
+def test_b7_noncontiguous_class_ids():
+    """P0-A (external review of 9829638): the published table's class IDs
+    are NOT contiguous global labels. The proto logits column j must map
+    to class classes[j] (sorted order), and a batch label y must map to
+    index_Cseen(y) — NOT to y itself. Verified by comparing the loss and
+    the U-gradient against an independent computation with a SHUFFLED
+    insertion order of the same table (sorted() must neutralize it)."""
+    c = _client(nb=5, seed=5)
+    # rebuild the table with non-contiguous ids {2,7,19,53,91}; insertion
+    # order deliberately different from sorted order
+    shuffled = {new: c.a5_ref_protos[old]
+                for new, old in zip([53, 2, 91, 7, 19], range(5))}
+    c.a5_ref_protos = shuffled
+    z = torch.randn(6, 768)
+    # labels in GLOBAL id space: 91, 2, 19, 53, 7, 2
+    target = torch.tensor([91, 2, 19, 53, 7, 2])
+    loss = c._a5_proto_ce(z, target)
+    loss.backward()
+    gA = c.a5_U.grad.clone()
+    c.a5_U.grad = None
+
+    # independent recomputation with the sorted mapping
+    classes = sorted(shuffled.keys())
+    assert classes == [2, 7, 19, 53, 91]
+    mu = torch.stack([shuffled[k] for k in classes])
+    Wz = z + (z @ c.a5_V.t()) @ c.a5_U.t().detach()
+    Wmu = mu + (mu @ c.a5_V.t()) @ c.a5_U.t().detach()
+    logits = (F.normalize(Wz, dim=1) @ F.normalize(Wmu, dim=1).t()) / TAU
+    y = torch.tensor([classes.index(int(t)) for t in target])
+    ref = F.cross_entropy(logits, y)
+    assert abs(ref.item() - loss.item()) < 1e-5, \
+        f"non-contiguous mapping loss mismatch: {ref.item()} vs {loss.item()}"
+    # index sanity: label 91 must map to column 4, label 2 to column 0
+    assert y.tolist() == [4, 0, 2, 3, 1, 0]
+
+    # insertion-order invariance: same table built in sorted order must
+    # give the IDENTICAL loss and U-gradient
+    c2 = _client(nb=5, seed=5)
+    c2.a5_ref_protos = {k: shuffled[k] for k in sorted(shuffled)}
+    c2.a5_U = c.a5_U.detach().clone().requires_grad_(True)
+    loss2 = c2._a5_proto_ce(z, target)
+    loss2.backward()
+    assert abs(loss2.item() - loss.item()) < 1e-6, \
+        "table insertion order changed the loss"
+    assert torch.allclose(gA, c2.a5_U.grad, atol=1e-6), \
+        "table insertion order changed the U-gradient"
+
+
 def main():
     tests = [
         test_b1_b3_gradient_isolation_and_formula,
@@ -192,6 +240,7 @@ def main():
         test_b4_lambda_zero_equivalence,
         test_b5_fail_closed_paths,
         test_b6_no_nan,
+        test_b7_noncontiguous_class_ids,
     ]
     failed = 0
     for t in tests:
