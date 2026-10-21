@@ -164,6 +164,16 @@ def validate_method_args(args):
     fully FedTA-trained). The frozen fedta baseline accepts no A3/A4
     arguments.
     """
+    # Phase 7 A5 PR-3: the legacy-checkpoint migration declaration is an
+    # A5-only policy flag; every other method has no prototype table to
+    # migrate, so accepting it there would be cargo-cult usage.
+    if (getattr(args, 'allow_proto_migration', False)
+            and args.method != 'fedta_a5'):
+        raise ValueError(
+            "invalid configuration: --allow_proto_migration is ONLY valid "
+            "with --method fedta_a5 (it declares an explicit legacy-A5 "
+            "checkpoint migration; no other method carries the prototype "
+            "table)")
     if args.method == 'fedta_a4':
         if getattr(args, 'a4_lambda', None) is None:
             raise ValueError(

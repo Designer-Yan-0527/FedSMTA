@@ -67,6 +67,12 @@ class Server_DF(object):
         self.a5_proto_sums = None      # {class_id: S_c}  (exact, for resume)
         self.a5_proto_counts = None    # {class_id: n_c}  (exact, for resume)
 
+        # Phase 7 A5 PR-3: set True by load_checkpoint when a legacy
+        # (pre-PR-2) fedta_a5 checkpoint is resumed under the explicit
+        # --allow_proto_migration declaration (fresh table; see
+        # load_checkpoint).
+        self._a5_proto_migration = False
+
         # Phase 0: round-boundary checkpoint / resume state
         self.run_manager = run_manager
         # Phase 0: observer instrumentation switch (tests/test_observer_
@@ -191,6 +197,87 @@ class Server_DF(object):
                   f"{self.a5_proto_version}: table="
                   f"{len(self.a5_ref_protos)} classes; client {c.id} "
                   f"exposed to {exposed} cross-client classes")
+
+    def _a5_load_proto_state(self, a5ps, task_id):
+        """PR-3: strict validation + restore of the A5 reference-prototype
+        table on resume (external review 2026-10-21: "not just lambda/tau
+        presence — validate the table schema, the version, and the resume
+        boundary").
+
+        Checks (all fail-closed):
+          - version == checkpoint server_task_id: the task-entry sync ran
+            for the checkpointed task (a PR-2 checkpoint ALWAYS carries
+            version == task_id after the entry sync), so the table matches
+            the resume boundary — not a wrong prototype state;
+          - schema: sums/counts are dicts with identical int keys, counts
+            are positive integers, sums are 1-D float tensors of one
+            consistent width;
+          - no future classes: every table class belongs to some client's
+            class_mask for a task <= task_id (same invariant the live
+            a5_sync_ref_protos enforces);
+          - a synced version (>= 0) implies a non-empty table.
+        """
+        version = int(a5ps.get("version", -2))
+        task_id = int(task_id)
+        if version != task_id:
+            raise RuntimeError(
+                f"a5_proto_state version {version} != checkpoint task_id "
+                f"{task_id} — the table does not match the resume boundary "
+                f"(a PR-2 checkpoint carries version == task_id after the "
+                f"task-entry sync); refusing to resume from a wrong "
+                f"prototype state")
+        sums = a5ps.get("sums", {})
+        counts = a5ps.get("counts", {})
+        if not isinstance(sums, dict) or not isinstance(counts, dict):
+            raise RuntimeError(
+                "a5_proto_state corrupt: sums/counts must be dicts")
+        if set(sums) != set(counts):
+            raise RuntimeError(
+                "a5_proto_state corrupt: sums/counts key mismatch")
+        if version >= 0 and not sums:
+            raise RuntimeError(
+                "a5_proto_state corrupt: synced version "
+                f"{version} with an EMPTY table")
+        width = None
+        for c, s in sums.items():
+            if (not isinstance(s, torch.Tensor) or s.dim() != 1
+                    or not s.is_floating_point()):
+                raise RuntimeError(
+                    f"a5_proto_state corrupt: sums[{c}] is not a 1-D float "
+                    f"tensor")
+            if width is None:
+                width = s.numel()
+            elif s.numel() != width:
+                raise RuntimeError(
+                    f"a5_proto_state corrupt: inconsistent sums widths "
+                    f"(class {c})")
+        for c, n in counts.items():
+            if int(n) <= 0:
+                raise RuntimeError(
+                    f"a5_proto_state corrupt: non-positive count for class "
+                    f"{c}")
+        self.a5_proto_version = version
+        self.a5_proto_sums = {int(c): s.float() for c, s in sums.items()}
+        self.a5_proto_counts = {int(c): int(n) for c, n in counts.items()}
+        # no-future-class guard against the CURRENT partition's class masks
+        global_seen = set()
+        for k in range(self.client_num):
+            for t in range(task_id + 1):
+                global_seen.update(int(x) for x in self.class_mask[k][t])
+        future = [c for c in self.a5_proto_sums if c not in global_seen]
+        if future:
+            raise RuntimeError(
+                f"a5_proto_state leaked future classes {sorted(future)} — "
+                f"refusing to resume from a wrong prototype state")
+        self.a5_ref_protos = {
+            c: (self.a5_proto_sums[c] / self.a5_proto_counts[c]).float()
+            for c in self.a5_proto_sums}
+        for c in self.clients:
+            c.a5_ref_protos = self.a5_ref_protos
+            c.a5_proto_version = self.a5_proto_version
+        print(f"[a5-proto] resumed table: version="
+              f"{self.a5_proto_version}, classes="
+              f"{len(self.a5_ref_protos)}")
 
     def fedavg(self, sample_nums):
         training_num = 0
@@ -805,7 +892,11 @@ class Server_DF(object):
         "a5_rank",
         # Phase 7 A5 PR-2B: lambda/tau changes would silently change the
         # proto-CE constraint mid-run (lambda 0 vs 0.5 = different arms).
-        # Keys are absent in non-A5 / PR-1-era checkpoints -> skipped there.
+        # Keys are absent in non-A5 checkpoints -> skipped there.
+        # PR-3 (external review 2026-10-21): for a LEGACY PR-1-era A5
+        # checkpoint these keys are absent too — that case is no longer
+        # silently skipped but refused by the migration gate in
+        # load_checkpoint (only --allow_proto_migration gets through).
         "a5_proto_lambda", "a5_proto_tau",
     ]
 
@@ -922,6 +1013,65 @@ class Server_DF(object):
 
         self.validate_checkpoint_args(checkpoint.get("args", {}))
 
+        # Phase 7 A5 PR-3 (external review CONDITIONAL PASS, 2026-10-21):
+        # legacy A5 checkpoint migration gate — fail-closed, BEFORE any
+        # state is loaded. A PR-1-era fedta_a5 checkpoint (no
+        # a5_proto_state, no a5_proto_lambda/tau in its args) must NOT
+        # silently resume into the PR-2 prototype-CE configuration: that is
+        # an unrecorded method change (lambda would silently adopt the
+        # current CLI default). Default = refuse; the ONLY way through is
+        # the explicit --allow_proto_migration declaration.
+        if self.method == 'fedta_a5':
+            ckpt_args = checkpoint.get("args", {}) or {}
+            has_hparams = ("a5_proto_lambda" in ckpt_args
+                           and "a5_proto_tau" in ckpt_args)
+            has_proto_state = isinstance(
+                checkpoint.get("a5_proto_state"), dict)
+            if not (has_proto_state and has_hparams):
+                if not getattr(self.args, 'allow_proto_migration', False):
+                    raise RuntimeError(
+                        "Legacy A5 checkpoint (pre-PR-2 prototype-CE) "
+                        "detected: a5_proto_state="
+                        f"{'present' if has_proto_state else 'MISSING'}, "
+                        "a5_proto_lambda/tau in checkpoint args="
+                        f"{'present' if has_hparams else 'MISSING'}. "
+                        "Resuming it into the PR-2 prototype-CE "
+                        "configuration is an unrecorded method change and "
+                        "is refused (fail-closed). If the migration is "
+                        "intentional, re-run with --allow_proto_migration: "
+                        "the reference-prototype table is then rebuilt "
+                        "from the next task boundary onward (historical-"
+                        "task prototypes are NOT reconstructed; no data "
+                        "replay).")
+                # Explicit migration: the resume MUST land on a task
+                # boundary, so the fresh table is published by the next
+                # task-entry sync BEFORE any training round of the new
+                # task (a mid-task landing would train the whole remaining
+                # task without the current task's classes in the table).
+                mig_start = int(checkpoint["completed_round"]) + 1
+                if mig_start % self.global_epoch != 0:
+                    raise RuntimeError(
+                        "Legacy A5 migration must resume at a TASK "
+                        f"BOUNDARY (next round {mig_start} is mid-task; "
+                        f"global_epoch={self.global_epoch}) — otherwise "
+                        "the rebuilt prototype table would miss the "
+                        "current task's classes for the whole task. "
+                        "Resume from a checkpoint saved at the end of a "
+                        "task instead.")
+                self._a5_proto_migration = True
+                if has_proto_state:
+                    print("[a5-proto] EXPLICIT MIGRATION: checkpoint "
+                          "carries a5_proto_state but not the lambda/tau "
+                          "hyper-parameters; the table will be validated "
+                          "strictly and restored, and lambda/tau are "
+                          "ADOPTED from the current command line.")
+                else:
+                    print("[a5-proto] EXPLICIT MIGRATION: no a5_proto_state "
+                          "in the checkpoint — the reference-prototype "
+                          "table restarts EMPTY and is rebuilt from the "
+                          "next task boundary onward (historical-task "
+                          "prototypes are NOT reconstructed).")
+
         # Phase 0: the federated outer partition is regenerated from the
         # seed; verify it is bit-identical to the manifest stored in the
         # checkpoint (raw sample indices + class masks per client-task).
@@ -983,34 +1133,30 @@ class Server_DF(object):
 
         # Phase 7 A5 PR-2A: restore the canonical reference-prototype table
         # (exact sums/counts + version) and REPUBLISH to every client.
-        # Fail-closed: a fedta_a5 checkpoint without a5_proto_state would
-        # silently re-accumulate the current task on the next boundary
-        # (double counting) — refused, same discipline as a5_state.
+        # PR-3 (external review 2026-10-21): strict schema / version /
+        # resume-boundary validation — not just "key present". A fresh
+        # EMPTY table is ONLY permitted on an explicit
+        # --allow_proto_migration resume (gated above, task boundary
+        # required); every other fedta_a5 resume without a valid
+        # a5_proto_state is refused (it would silently re-accumulate /
+        # continue from a wrong prototype state).
         if self.method == 'fedta_a5':
             a5ps = checkpoint.get("a5_proto_state")
             if not isinstance(a5ps, dict):
-                raise RuntimeError(
-                    "fedta_a5 resume requires a5_proto_state in the "
-                    "checkpoint — refusing to restart the reference-"
-                    "prototype table from scratch mid-run (fail-closed; "
-                    "re-run from scratch or use a fedta_a5 checkpoint)")
-            self.a5_proto_version = int(a5ps.get("version", -1))
-            self.a5_proto_sums = {int(c): s.float()
-                                  for c, s in a5ps.get("sums", {}).items()}
-            self.a5_proto_counts = {
-                int(c): int(n) for c, n in a5ps.get("counts", {}).items()}
-            if set(self.a5_proto_sums) != set(self.a5_proto_counts):
-                raise RuntimeError(
-                    "a5_proto_state corrupt: sums/counts key mismatch")
-            self.a5_ref_protos = {
-                c: (self.a5_proto_sums[c] / self.a5_proto_counts[c]).float()
-                for c in self.a5_proto_sums}
-            for c in self.clients:
-                c.a5_ref_protos = self.a5_ref_protos
-                c.a5_proto_version = self.a5_proto_version
-            print(f"[a5-proto] resumed table: version="
-                  f"{self.a5_proto_version}, classes="
-                  f"{len(self.a5_ref_protos)}")
+                if self._a5_proto_migration:
+                    # fresh table: keep __init__ defaults (version=-1,
+                    # sums/counts=None, ref_protos=None); the next
+                    # task-entry sync rebuilds and republishes it.
+                    print("[a5-proto] migrated with a FRESH empty table "
+                          f"(version={self.a5_proto_version})")
+                else:
+                    raise RuntimeError(
+                        "fedta_a5 resume requires a5_proto_state in the "
+                        "checkpoint — refusing to restart the reference-"
+                        "prototype table from scratch mid-run (fail-closed; "
+                        "re-run from scratch or use a fedta_a5 checkpoint)")
+            else:
+                self._a5_load_proto_state(a5ps, checkpoint["server_task_id"])
 
         # RNG state must be restored LAST: model creation and split rebuild
         # above must not consume the restored random stream.

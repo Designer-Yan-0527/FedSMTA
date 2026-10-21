@@ -144,8 +144,26 @@ def get_args_parser(subparsers):
                                  '0.5. 0 = proto-CE OFF (Shared CE-only arm).')
     subparsers.add_argument('--a5_proto_tau', type=float, default=0.07,
                             help='A5 prototype-CE temperature on the normalized '
-                                 'inner product (only used with --method fedta_a5). '
-                                 'P2 v1.2 frozen default: 0.07.')
+                                 'inner product (only used with --method '
+                                 'fedta_a5). P2 v1.2 frozen default: 0.07.')
+    # Phase 7 A5 PR-3: explicit legacy-checkpoint migration declaration.
+    # A PR-1-era fedta_a5 checkpoint (no a5_proto_state / no lambda/tau in
+    # its args) is REFUSED on resume by default (external review 2026-10-21:
+    # resuming it into the PR-2 prototype-CE configuration is an unrecorded
+    # method change). This flag is the ONLY way through, and only for
+    # --method fedta_a5; the resume must additionally land on a task
+    # boundary so the rebuilt table is published before any training round.
+    subparsers.add_argument('--allow_proto_migration', action='store_true',
+                            help='Declare an EXPLICIT migration from a legacy '
+                                 '(pre-PR-2, PR-1-era) fedta_a5 checkpoint: '
+                                 'the reference-prototype table is rebuilt '
+                                 'from the next task boundary onward '
+                                 '(historical-task prototypes are NOT '
+                                 'reconstructed; no data replay). Only valid '
+                                 'with --method fedta_a5 and only when the '
+                                 'resume lands on a task boundary. Without '
+                                 'this flag, such a checkpoint is rejected '
+                                 'fail-closed.')
     # Phase 5 A3 (--method fedta_a3): A3-KL v1 hyper-parameters. A3 never
     # freezes key/anchor rows (that is A2 territory and structurally excluded
     # by the single --method choice), and does NOT use the A2 protection-set
