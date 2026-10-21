@@ -378,7 +378,11 @@ def main():
         if not latest.is_file():
             print("[fl-baseline] --resume auto but no latest.pth; fresh run")
         else:
-            st = torch.load(latest, map_location=device)
+            # map_location must be "cpu": map_location=device would move the
+            # saved CPU RNG-state ByteTensor to CUDA, and torch.set_rng_state
+            # only accepts a CPU ByteTensor (model weights are still copied
+            # cross-device by load_state_dict below).
+            st = torch.load(latest, map_location="cpu")
             model.load_state_dict(st["model"])
             rng_restore(st["rng"])
             start_task, start_round = st["task"], st["round_in_task"]
