@@ -140,6 +140,11 @@ class Client_DF(object):
             # OFF, both computationally and numerically)
             self.a5_proto_lambda = float(getattr(args, 'a5_proto_lambda', 0.5))
             self.a5_proto_tau = float(getattr(args, 'a5_proto_tau', 0.07))
+            # PR-3 (P2 v1.2 §6.2 Local Adapter contrast): U aggregation mode.
+            # 'fedavg' = PR-2C sample-weighted U-only FedAvg broadcast;
+            # 'local' = the broadcast is disabled, every client keeps its
+            # own U. Persisted in a5_state (fail-closed on resume).
+            self.a5_u_agg = str(getattr(args, 'a5_u_agg', 'fedavg'))
 
         # Phase 5 A3 (--method fedta_a3): functional routing-consistency state
         # (A3-KL v1). Attributes are ONLY created for the A3 method; the
@@ -431,6 +436,7 @@ class Client_DF(object):
         return {
             "rank": self.a5_rank,
             "a2_arm": self.a2_arm,
+            "u_agg": self.a5_u_agg,
             "U": (None if self.a5_U is None
                   else self.a5_U.detach().cpu()),
             "V": (None if self.a5_V is None
@@ -463,6 +469,21 @@ class Client_DF(object):
             raise RuntimeError(
                 f"client {self.id}: A5 a2_arm mismatch on resume "
                 f"(checkpoint={a5.get('a2_arm')}, current={self.a2_arm})")
+        # PR-3 Local Adapter switch: a u_agg mismatch would silently change
+        # the mechanism contrast mid-run. Key is absent in pre-PR-3 A5
+        # checkpoints — those were trained with the (then only) fedavg mode,
+        # so an absent key is compatible with 'fedavg' but NEVER with
+        # 'local' (a Local Adapter run must start from scratch or from a
+        # local-arm checkpoint; fail-closed).
+        ckpt_u_agg = a5.get("u_agg", "fedavg")
+        if ckpt_u_agg != self.a5_u_agg:
+            raise RuntimeError(
+                f"client {self.id}: A5 u_agg mismatch on resume "
+                f"(checkpoint={ckpt_u_agg!r}"
+                f"{' (implicit: pre-PR-3 checkpoints always FedAvg U)' if 'u_agg' not in a5 else ''}, "
+                f"current={self.a5_u_agg!r}) — the U aggregation mode is "
+                f"part of the experiment arm and cannot change mid-run "
+                f"(fail-closed)")
         U = a5.get("U")
         V = a5.get("V")
         if U is None or V is None:

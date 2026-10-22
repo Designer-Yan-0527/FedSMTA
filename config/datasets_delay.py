@@ -164,6 +164,22 @@ def get_args_parser(subparsers):
                                  'resume lands on a task boundary. Without '
                                  'this flag, such a checkpoint is rejected '
                                  'fail-closed.')
+    # Phase 7 A5 PR-3 (P2 v1.2 §6.2 Local Adapter mechanism contrast): U
+    # aggregation mode. 'fedavg' (default) = the PR-2C sample-weighted U-only
+    # FedAvg broadcast; 'local' = Local Adapter arm — disables ONLY the U
+    # aggregation (every client keeps its own U), everything else (A2
+    # protection, proto-table sync, proto-CE, budget) stays identical.
+    # Checked in RESUME_MUST_MATCH + the per-client a5_state loader
+    # (fail-closed; pre-PR-3 checkpoints implicitly ran fedavg).
+    subparsers.add_argument('--a5_u_agg', type=str, default='fedavg',
+                            choices=['fedavg', 'local'],
+                            help="A5 U aggregation mode (only used with "
+                                 "--method fedta_a5). 'fedavg' = PR-2C "
+                                 "sample-weighted U-only FedAvg (default); "
+                                 "'local' = Local Adapter arm: the U "
+                                 "broadcast is disabled and every client "
+                                 "keeps its own U (same budget, same "
+                                 "proto-table, same proto-CE).")
     # Phase 5 A3 (--method fedta_a3): A3-KL v1 hyper-parameters. A3 never
     # freezes key/anchor rows (that is A2 territory and structurally excluded
     # by the single --method choice), and does NOT use the A2 protection-set

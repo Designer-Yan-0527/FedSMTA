@@ -124,7 +124,38 @@ class Server_DF(object):
             V = torch.randn(rank, 768, generator=gen)
             for c in self.clients:
                 c.a5_init_shared(V)
+            # PR-3 (external review 2026-10-22 §三): the experiment-arm
+            # identity must be verifiable from the LOGS, not just from CLI
+            # names. Derived from the ACTUAL client attributes after init
+            # (single banner, printed once per process — also lands in
+            # logs/train.log via the RunManager tee).
+            print(f"[A5-ARM] {self._a5_arm_descriptor(human=True)}")
         print("Initialization completes")
+
+    def _a5_arm_descriptor(self, human=False):
+        """PR-3: the fedta_a5 experiment-arm identity, derived from the
+        ACTUAL runtime client state (not from CLI strings). Persisted in
+        every server checkpoint under 'a5_arm' so downstream aggregation
+        can verify arm identity from the checkpoint itself."""
+        if self.method != 'fedta_a5':
+            raise RuntimeError(
+                f"_a5_arm_descriptor called for method {self.method!r}")
+        c = self.clients[0]
+        desc = {
+            "a2_arm": c.a2_arm,
+            "proto_ce": ("on" if c.a5_proto_lambda != 0 else "off"),
+            "proto_lambda": c.a5_proto_lambda,
+            "proto_tau": c.a5_proto_tau,
+            "u_agg": c.a5_u_agg,
+            "rank": c.a5_rank,
+        }
+        if human:
+            return (f"a2_arm={desc['a2_arm']} "
+                    f"proto_ce={desc['proto_ce']} "
+                    f"(lambda={desc['proto_lambda']}, "
+                    f"tau={desc['proto_tau']}) "
+                    f"u_agg={desc['u_agg']} rank={desc['rank']}")
+        return desc
 
     def a5_sync_ref_protos(self, task_id):
         """A5 PR-2A (P2 v1.2 §4 steps 2-3): task-boundary prototype sync.
@@ -391,9 +422,11 @@ class Server_DF(object):
             self.fed_avg_head(self.thisclients)
             # Phase 7 A5 PR-2C (P2 v1.2 §3): U-only sample-weighted FedAvg
             # (exact average of the effective transforms; V untouched).
-            # PR-3's Local Adapter arm disables ONLY this call — everything
-            # else (proto table, proto-CE, budget) stays identical.
-            if self.method == 'fedta_a5':
+            # PR-3's Local Adapter arm (--a5_u_agg local) disables ONLY this
+            # call — everything else (proto table, proto-CE, budget) stays
+            # identical (P2 v1.2 §6.2 mechanism contrast).
+            if (self.method == 'fedta_a5'
+                    and getattr(self.args, 'a5_u_agg', 'fedavg') == 'fedavg'):
                 self.a5_fedavg_U(self.thisclients)
 
             print('Server aggregation Compelte, results are ()：')
@@ -915,6 +948,12 @@ class Server_DF(object):
         # silently skipped but refused by the migration gate in
         # load_checkpoint (only --allow_proto_migration gets through).
         "a5_proto_lambda", "a5_proto_tau",
+        # Phase 7 A5 PR-3: the Local Adapter switch changes the mechanism
+        # (U not aggregated); a mid-run switch would silently change the
+        # experiment arm. The per-client a5_state loader double-checks the
+        # actual persisted value (absent key = pre-PR-3 = fedavg, which is
+        # incompatible with 'local', fail-closed there).
+        "a5_u_agg",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):
@@ -980,6 +1019,13 @@ class Server_DF(object):
                     "counts": (dict(self.a5_proto_counts)
                                if self.a5_proto_counts else {}),
                 }}
+               if self.method == 'fedta_a5' else {}),
+
+            # PR-3: experiment-arm identity derived from the ACTUAL runtime
+            # client state (not CLI strings), so aggregation can verify the
+            # arm from the checkpoint itself (external review 2026-10-22 §三).
+            # Key is ONLY added for fedta_a5 (schema untouched otherwise).
+            **({"a5_arm": self._a5_arm_descriptor()}
                if self.method == 'fedta_a5' else {}),
 
             # PR-3 increment: migration provenance marker — present ONLY

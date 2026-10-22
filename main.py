@@ -174,6 +174,15 @@ def validate_method_args(args):
             "with --method fedta_a5 (it declares an explicit legacy-A5 "
             "checkpoint migration; no other method carries the prototype "
             "table)")
+    # Phase 7 A5 PR-3: the Local Adapter arm switch is an A5-only policy
+    # flag; every other method has no shared U to (not) aggregate, so
+    # accepting it there would be cargo-cult usage.
+    if (getattr(args, 'a5_u_agg', 'fedavg') == 'local'
+            and args.method != 'fedta_a5'):
+        raise ValueError(
+            "invalid configuration: --a5_u_agg local is ONLY valid with "
+            "--method fedta_a5 (the Local Adapter mechanism contrast; no "
+            "other method carries the shared U adapter)")
     if args.method == 'fedta_a4':
         if getattr(args, 'a4_lambda', None) is None:
             raise ValueError(
