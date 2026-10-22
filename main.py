@@ -164,25 +164,6 @@ def validate_method_args(args):
     fully FedTA-trained). The frozen fedta baseline accepts no A3/A4
     arguments.
     """
-    # Phase 7 A5 PR-3: the legacy-checkpoint migration declaration is an
-    # A5-only policy flag; every other method has no prototype table to
-    # migrate, so accepting it there would be cargo-cult usage.
-    if (getattr(args, 'allow_proto_migration', False)
-            and args.method != 'fedta_a5'):
-        raise ValueError(
-            "invalid configuration: --allow_proto_migration is ONLY valid "
-            "with --method fedta_a5 (it declares an explicit legacy-A5 "
-            "checkpoint migration; no other method carries the prototype "
-            "table)")
-    # Phase 7 A5 PR-3: the Local Adapter arm switch is an A5-only policy
-    # flag; every other method has no shared U to (not) aggregate, so
-    # accepting it there would be cargo-cult usage.
-    if (getattr(args, 'a5_u_agg', 'fedavg') == 'local'
-            and args.method != 'fedta_a5'):
-        raise ValueError(
-            "invalid configuration: --a5_u_agg local is ONLY valid with "
-            "--method fedta_a5 (the Local Adapter mechanism contrast; no "
-            "other method carries the shared U adapter)")
     if args.method == 'fedta_a4':
         if getattr(args, 'a4_lambda', None) is None:
             raise ValueError(
@@ -194,27 +175,6 @@ def validate_method_args(args):
                 "invalid fedta_a4 configuration: --a4_lambda must be a "
                 "finite value > 0")
         return
-    if args.method == 'fedta_a5':
-        if getattr(args, 'a2_arm', 'anchor') == 'none':
-            # valid: Shared-only factorial arm (P2 v1.2 §6)
-            pass
-        if int(getattr(args, 'a5_rank', 8)) <= 0:
-            raise ValueError(
-                "invalid fedta_a5 configuration: --a5_rank must be > 0")
-        if float(getattr(args, 'a5_proto_lambda', 0.5)) < 0:
-            raise ValueError(
-                "invalid fedta_a5 configuration: --a5_proto_lambda must be "
-                ">= 0 (0 = proto-CE OFF, the Shared CE-only arm)")
-        if float(getattr(args, 'a5_proto_tau', 0.07)) <= 0:
-            raise ValueError(
-                "invalid fedta_a5 configuration: --a5_proto_tau must be > 0")
-        return
-    if args.method == 'fedta_a2' and getattr(args, 'a2_arm', 'anchor') == 'none':
-        raise ValueError(
-            "invalid fedta_a2 configuration: --a2_arm none is ONLY valid "
-            "for --method fedta_a5 (the Shared-only factorial arm). A "
-            "fedta_a2 run with no protection arm is just the fedta "
-            "baseline under a wrong name (fail-closed).")
     if args.method != 'fedta_a3':
         return
     problems = []

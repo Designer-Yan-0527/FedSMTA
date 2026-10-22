@@ -58,30 +58,6 @@ class Server_DF(object):
 
         self.fix_keys = []
 
-        # Phase 7 A5 PR-2A: canonical global reference-prototype table in
-        # the FIXED z_ref space (P2 v1.2 §4). Merged ONCE per task boundary
-        # (exact sum/count), versioned monotonically, never recomputed when
-        # the adapter updates (§3). Clients hold the SAME published dict.
-        self.a5_proto_version = -1     # -1 = nothing published yet
-        self.a5_ref_protos = None      # {class_id: mu_c [768] cpu float32}
-        self.a5_proto_sums = None      # {class_id: S_c}  (exact, for resume)
-        self.a5_proto_counts = None    # {class_id: n_c}  (exact, for resume)
-
-        # Phase 7 A5 PR-3: set True by load_checkpoint when a legacy
-        # (pre-PR-2) fedta_a5 checkpoint is resumed under the explicit
-        # --allow_proto_migration declaration (fresh table; see
-        # load_checkpoint).
-        self._a5_proto_migration = False
-
-        # Phase 7 A5 PR-3 increment (external review 2026-10-21, §2.2):
-        # migration PROVENANCE. Once a run starts from (or descends from)
-        # an explicit legacy-A5 migration, EVERY checkpoint it writes
-        # carries the `a5_proto_migration` marker, so migrated runs can
-        # never be confused with from-scratch PR-2 runs (their prototype
-        # history is incomplete: historical-task prototypes are NOT
-        # reconstructed). None = not a migrated run (or descendant).
-        self._a5_migration_provenance = None
-
         # Phase 0: round-boundary checkpoint / resume state
         self.run_manager = run_manager
         # Phase 0: observer instrumentation switch (tests/test_observer_
@@ -108,224 +84,7 @@ class Server_DF(object):
         if self.method == 'fedta_a3':
             for c in self.clients:
                 c.surrogate_data = self.surrogate_data
-        # Phase 7 A5 (fedta_a5): generate the FIXED shared random projection
-        # V ONCE and broadcast the same tensor to every client (P2 v1.2 §1:
-        # single-factor UV — V is server-owned and never trains, so
-        # U-FedAvg stays an EXACT weighted average of effective transforms).
-        # RNG discipline: a DEDICATED torch.Generator seeded from args.seed
-        # with a fixed offset — the global torch / python / numpy streams
-        # that feed the data partition and training batches are untouched,
-        # and V is bit-reproducible on resume (validated fail-closed in
-        # Client_DF._a5_load_checkpoint_state).
-        if self.method == 'fedta_a5':
-            rank = int(getattr(self.args, 'a5_rank', 8))
-            gen = torch.Generator(device='cpu')
-            gen.manual_seed(int(self.args.seed) * 100003 + 7)
-            V = torch.randn(rank, 768, generator=gen)
-            for c in self.clients:
-                c.a5_init_shared(V)
-            # PR-3 (external review 2026-10-22 §三): the experiment-arm
-            # identity must be verifiable from the LOGS, not just from CLI
-            # names. Derived from the ACTUAL client attributes after init
-            # (single banner, printed once per process — also lands in
-            # logs/train.log via the RunManager tee).
-            print(f"[A5-ARM] {self._a5_arm_descriptor(human=True)}")
         print("Initialization completes")
-
-    def _a5_arm_descriptor(self, human=False):
-        """PR-3: the fedta_a5 experiment-arm identity, derived from the
-        ACTUAL runtime client state (not from CLI strings). Persisted in
-        every server checkpoint under 'a5_arm' so downstream aggregation
-        can verify arm identity from the checkpoint itself."""
-        if self.method != 'fedta_a5':
-            raise RuntimeError(
-                f"_a5_arm_descriptor called for method {self.method!r}")
-        c = self.clients[0]
-        desc = {
-            "a2_arm": c.a2_arm,
-            "proto_ce": ("on" if c.a5_proto_lambda != 0 else "off"),
-            "proto_lambda": c.a5_proto_lambda,
-            "proto_tau": c.a5_proto_tau,
-            "u_agg": c.a5_u_agg,
-            "rank": c.a5_rank,
-        }
-        if human:
-            return (f"a2_arm={desc['a2_arm']} "
-                    f"proto_ce={desc['proto_ce']} "
-                    f"(lambda={desc['proto_lambda']}, "
-                    f"tau={desc['proto_tau']}) "
-                    f"u_agg={desc['u_agg']} rank={desc['rank']}")
-        return desc
-
-    def a5_sync_ref_protos(self, task_id):
-        """A5 PR-2A (P2 v1.2 §4 steps 2-3): task-boundary prototype sync.
-
-        1. every client runs the RNG-neutral no-grad stats pass over its
-           CURRENT-task inner-train (fixed z_ref space);
-        2. the server merges per-class sum/count EXACTLY (cumulative over
-           tasks — the table keeps every class ever seen);
-        3. publishes mu_c = S_c / n_c with a monotonically increasing
-           version; all clients receive the SAME dict object.
-
-        Fail-closed guarantees (asserted, not assumed):
-          - no FUTURE class enters the table: every key must belong to some
-            client's class_mask for a task <= task_id;
-          - counts are positive integers;
-          - a re-sync for an already-synced task is refused (resume must
-            restore from the checkpoint instead of re-accumulating).
-        Also logs the cross-client exposure rate (§4 disclosure): table
-        classes the client has not seen in tasks <= task_id.
-        """
-        if self.method != 'fedta_a5':
-            raise RuntimeError(
-                f"a5_sync_ref_protos called for method {self.method!r}")
-        if task_id <= self.a5_proto_version:
-            raise RuntimeError(
-                f"a5 proto sync: task {task_id} already synced at version "
-                f"{self.a5_proto_version} — double accumulation refused "
-                f"(resume must restore a5_proto_state from the checkpoint)")
-        stats = [c.a5_compute_proto_stats() for c in self.clients]
-
-        # exact cumulative merge (sum/count, never averaged-then-averaged)
-        if self.a5_proto_sums is None:
-            self.a5_proto_sums, self.a5_proto_counts = {}, {}
-        for cstat in stats:
-            for c, (s, n) in cstat.items():
-                if c in self.a5_proto_sums:
-                    self.a5_proto_sums[c] = self.a5_proto_sums[c] + s
-                    self.a5_proto_counts[c] = self.a5_proto_counts[c] + n
-                else:
-                    self.a5_proto_sums[c] = s.clone()
-                    self.a5_proto_counts[c] = int(n)
-
-        # no-future-class guard: every table class must be owned by SOME
-        # client in a task <= task_id (the global seen set)
-        global_seen = set()
-        for k in range(self.client_num):
-            for t in range(task_id + 1):
-                global_seen.update(int(x) for x in self.class_mask[k][t])
-        future = [c for c in self.a5_proto_sums if c not in global_seen]
-        if future:
-            raise RuntimeError(
-                f"a5 proto table leaked future classes {sorted(future)} — "
-                f"refusing to publish")
-        bad_counts = [c for c, n in self.a5_proto_counts.items() if n <= 0]
-        if bad_counts:
-            raise RuntimeError(
-                f"a5 proto table has non-positive counts {bad_counts}")
-
-        self.a5_proto_version = task_id
-        self.a5_ref_protos = {
-            c: (self.a5_proto_sums[c] / self.a5_proto_counts[c]).float()
-            for c in self.a5_proto_sums}
-
-        # publish the SAME object + version to every client
-        for c in self.clients:
-            c.a5_ref_protos = self.a5_ref_protos
-            c.a5_proto_version = self.a5_proto_version
-
-        # exposure-rate disclosure (§4): cross-client classes in the table
-        # this client has not itself seen in tasks <= task_id
-        for c in self.clients:
-            local_seen = set()
-            for t in range(task_id + 1):
-                local_seen.update(
-                    int(x) for x in self.class_mask[c.id][t])
-            exposed = len(self.a5_ref_protos) - len(
-                local_seen & set(self.a5_ref_protos.keys()))
-            print(f"[a5-proto] task {task_id} -> version "
-                  f"{self.a5_proto_version}: table="
-                  f"{len(self.a5_ref_protos)} classes; client {c.id} "
-                  f"exposed to {exposed} cross-client classes")
-
-    def _a5_load_proto_state(self, a5ps, task_id):
-        """PR-3: strict validation + restore of the A5 reference-prototype
-        table on resume (external review 2026-10-21: "not just lambda/tau
-        presence — validate the table schema, the version, and the resume
-        boundary").
-
-        Checks (all fail-closed):
-          - version == checkpoint server_task_id: the task-entry sync ran
-            for the checkpointed task (a PR-2 checkpoint ALWAYS carries
-            version == task_id after the entry sync), so the table matches
-            the resume boundary — not a wrong prototype state;
-          - schema: sums/counts are dicts with identical int keys, counts
-            are positive integers, sums are 1-D float tensors of one
-            consistent width;
-          - no future classes: every table class belongs to some client's
-            class_mask for a task <= task_id (same invariant the live
-            a5_sync_ref_protos enforces);
-          - a synced version (>= 0) implies a non-empty table.
-        """
-        version = int(a5ps.get("version", -2))
-        task_id = int(task_id)
-        if version != task_id:
-            raise RuntimeError(
-                f"a5_proto_state version {version} != checkpoint task_id "
-                f"{task_id} — the table does not match the resume boundary "
-                f"(a PR-2 checkpoint carries version == task_id after the "
-                f"task-entry sync); refusing to resume from a wrong "
-                f"prototype state")
-        sums = a5ps.get("sums", {})
-        counts = a5ps.get("counts", {})
-        if not isinstance(sums, dict) or not isinstance(counts, dict):
-            raise RuntimeError(
-                "a5_proto_state corrupt: sums/counts must be dicts")
-        if set(sums) != set(counts):
-            raise RuntimeError(
-                "a5_proto_state corrupt: sums/counts key mismatch")
-        if version >= 0 and not sums:
-            raise RuntimeError(
-                "a5_proto_state corrupt: synced version "
-                f"{version} with an EMPTY table")
-        width = None
-        for c, s in sums.items():
-            if (not isinstance(s, torch.Tensor) or s.dim() != 1
-                    or not s.is_floating_point()):
-                raise RuntimeError(
-                    f"a5_proto_state corrupt: sums[{c}] is not a 1-D float "
-                    f"tensor")
-            # PR-3 increment (external review §3.2): NaN/Inf poison the
-            # table (prototypes = sums/counts) — reject fail-closed.
-            if not bool(torch.isfinite(s).all()):
-                raise RuntimeError(
-                    f"a5_proto_state corrupt: sums[{c}] contains NaN/Inf — "
-                    f"refusing to resume from a poisoned prototype table")
-            if width is None:
-                width = s.numel()
-            elif s.numel() != width:
-                raise RuntimeError(
-                    f"a5_proto_state corrupt: inconsistent sums widths "
-                    f"(class {c})")
-        for c, n in counts.items():
-            # PR-3 increment: counts must be true positive integers (bool
-            # is an int subclass — exclude it explicitly).
-            if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
-                raise RuntimeError(
-                    f"a5_proto_state corrupt: non-positive or non-integer "
-                    f"count for class {c}")
-        self.a5_proto_version = version
-        self.a5_proto_sums = {int(c): s.float() for c, s in sums.items()}
-        self.a5_proto_counts = {int(c): int(n) for c, n in counts.items()}
-        # no-future-class guard against the CURRENT partition's class masks
-        global_seen = set()
-        for k in range(self.client_num):
-            for t in range(task_id + 1):
-                global_seen.update(int(x) for x in self.class_mask[k][t])
-        future = [c for c in self.a5_proto_sums if c not in global_seen]
-        if future:
-            raise RuntimeError(
-                f"a5_proto_state leaked future classes {sorted(future)} — "
-                f"refusing to resume from a wrong prototype state")
-        self.a5_ref_protos = {
-            c: (self.a5_proto_sums[c] / self.a5_proto_counts[c]).float()
-            for c in self.a5_proto_sums}
-        for c in self.clients:
-            c.a5_ref_protos = self.a5_ref_protos
-            c.a5_proto_version = self.a5_proto_version
-        print(f"[a5-proto] resumed table: version="
-              f"{self.a5_proto_version}, classes="
-              f"{len(self.a5_ref_protos)}")
 
     def fedavg(self, sample_nums):
         training_num = 0
@@ -383,13 +142,6 @@ class Server_DF(object):
 
             if self.task_id != i//self.global_epoch:
                 self.task_id = i//self.global_epoch
-                # Phase 7 A5 PR-2A (P2 v1.2 §4 steps 1-3): all clients have
-                # entered the new task (update_data above) -> no-grad stats
-                # pass over each client's current-task inner-train -> exact
-                # server-side sum/count merge -> publish the versioned table.
-                # Runs for every fedta_a5 arm identically (budget-fair, §4).
-                if self.method == 'fedta_a5':
-                    self.a5_sync_ref_protos(self.task_id)
 
 
             print(f"--------round {i},task number {i//self.global_epoch}-----------")
@@ -420,14 +172,6 @@ class Server_DF(object):
                 self.kd_fusion_prompt(self.thisclients)
 
             self.fed_avg_head(self.thisclients)
-            # Phase 7 A5 PR-2C (P2 v1.2 §3): U-only sample-weighted FedAvg
-            # (exact average of the effective transforms; V untouched).
-            # PR-3's Local Adapter arm (--a5_u_agg local) disables ONLY this
-            # call — everything else (proto table, proto-CE, budget) stays
-            # identical (P2 v1.2 §6.2 mechanism contrast).
-            if (self.method == 'fedta_a5'
-                    and getattr(self.args, 'a5_u_agg', 'fedavg') == 'fedavg'):
-                self.a5_fedavg_U(self.thisclients)
 
             print('Server aggregation Compelte, results are ()：')
             # Phase 0: collect the (already existing) post-broadcast
@@ -936,24 +680,6 @@ class Server_DF(object):
         # loader inside Client_DF also checks this, fail-closed). Key is
         # absent in old checkpoints -> skipped there.
         "a4_lambda",
-        # Phase 7 A5: rank changes the shared projection space (V shape);
-        # the a5_state loader inside Client_DF also checks this, fail-closed.
-        # Key is absent in non-A5 checkpoints -> skipped there.
-        "a5_rank",
-        # Phase 7 A5 PR-2B: lambda/tau changes would silently change the
-        # proto-CE constraint mid-run (lambda 0 vs 0.5 = different arms).
-        # Keys are absent in non-A5 checkpoints -> skipped there.
-        # PR-3 (external review 2026-10-21): for a LEGACY PR-1-era A5
-        # checkpoint these keys are absent too — that case is no longer
-        # silently skipped but refused by the migration gate in
-        # load_checkpoint (only --allow_proto_migration gets through).
-        "a5_proto_lambda", "a5_proto_tau",
-        # Phase 7 A5 PR-3: the Local Adapter switch changes the mechanism
-        # (U not aggregated); a mid-run switch would silently change the
-        # experiment arm. The per-client a5_state loader double-checks the
-        # actual persisted value (absent key = pre-PR-3 = fedavg, which is
-        # incompatible with 'local', fail-closed there).
-        "a5_u_agg",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):
@@ -1007,35 +733,6 @@ class Server_DF(object):
 
             "server_prompt": module_state_or_none(self.prompt),
 
-            # Phase 7 A5 PR-2A: canonical reference-prototype state (exact
-            # sums/counts, not just mu, so a resume reconciles bit-exactly
-            # and never re-accumulates the current task). Key is ONLY added
-            # for fedta_a5 (schema untouched for every other method).
-            **({"a5_proto_state": {
-                    "version": self.a5_proto_version,
-                    "sums": ({c: s.clone() for c, s in
-                              self.a5_proto_sums.items()}
-                             if self.a5_proto_sums else {}),
-                    "counts": (dict(self.a5_proto_counts)
-                               if self.a5_proto_counts else {}),
-                }}
-               if self.method == 'fedta_a5' else {}),
-
-            # PR-3: experiment-arm identity derived from the ACTUAL runtime
-            # client state (not CLI strings), so aggregation can verify the
-            # arm from the checkpoint itself (external review 2026-10-22 §三).
-            # Key is ONLY added for fedta_a5 (schema untouched otherwise).
-            **({"a5_arm": self._a5_arm_descriptor()}
-               if self.method == 'fedta_a5' else {}),
-
-            # PR-3 increment: migration provenance marker — present ONLY
-            # on checkpoints written by a migrated (or migration-descendant)
-            # run. Identifies runs whose prototype history is incomplete;
-            # formal multi-seed experiments must exclude them.
-            **({"a5_proto_migration": dict(self._a5_migration_provenance)}
-               if (self.method == 'fedta_a5'
-                   and self._a5_migration_provenance is not None) else {}),
-
             "clients": [c.state_dict_for_checkpoint() for c in self.clients],
 
             "rng_state": rng_state_dict(),
@@ -1083,88 +780,6 @@ class Server_DF(object):
         checkpoint = load_checkpoint_file(ckpt_path)
 
         self.validate_checkpoint_args(checkpoint.get("args", {}))
-
-        # Phase 7 A5 PR-3 (external review CONDITIONAL PASS, 2026-10-21):
-        # legacy A5 checkpoint migration gate — fail-closed, BEFORE any
-        # state is loaded. A PR-1-era fedta_a5 checkpoint (no
-        # a5_proto_state, no a5_proto_lambda/tau in its args) must NOT
-        # silently resume into the PR-2 prototype-CE configuration: that is
-        # an unrecorded method change (lambda would silently adopt the
-        # current CLI default). Default = refuse; the ONLY way through is
-        # the explicit --allow_proto_migration declaration.
-        if self.method == 'fedta_a5':
-            ckpt_args = checkpoint.get("args", {}) or {}
-            has_hparams = ("a5_proto_lambda" in ckpt_args
-                           and "a5_proto_tau" in ckpt_args)
-            has_proto_state = isinstance(
-                checkpoint.get("a5_proto_state"), dict)
-            if not (has_proto_state and has_hparams):
-                if not getattr(self.args, 'allow_proto_migration', False):
-                    raise RuntimeError(
-                        "Legacy A5 checkpoint (pre-PR-2 prototype-CE) "
-                        "detected: a5_proto_state="
-                        f"{'present' if has_proto_state else 'MISSING'}, "
-                        "a5_proto_lambda/tau in checkpoint args="
-                        f"{'present' if has_hparams else 'MISSING'}. "
-                        "Resuming it into the PR-2 prototype-CE "
-                        "configuration is an unrecorded method change and "
-                        "is refused (fail-closed). If the migration is "
-                        "intentional, re-run with --allow_proto_migration: "
-                        "the reference-prototype table is then rebuilt "
-                        "from the next task boundary onward (historical-"
-                        "task prototypes are NOT reconstructed; no data "
-                        "replay).")
-                # Explicit migration: the resume MUST land on a task
-                # boundary, so the fresh table is published by the next
-                # task-entry sync BEFORE any training round of the new
-                # task (a mid-task landing would train the whole remaining
-                # task without the current task's classes in the table).
-                mig_start = int(checkpoint["completed_round"]) + 1
-                if mig_start % self.global_epoch != 0:
-                    raise RuntimeError(
-                        "Legacy A5 migration must resume at a TASK "
-                        f"BOUNDARY (next round {mig_start} is mid-task; "
-                        f"global_epoch={self.global_epoch}) — otherwise "
-                        "the rebuilt prototype table would miss the "
-                        "current task's classes for the whole task. "
-                        "Resume from a checkpoint saved at the end of a "
-                        "task instead.")
-                self._a5_proto_migration = True
-                self._a5_migration_provenance = {
-                    "migrated_from_round": int(checkpoint["completed_round"]),
-                    "migrated_at_task": int(checkpoint["server_task_id"]),
-                    "kept_carried_table": bool(has_proto_state),
-                }
-                if has_proto_state:
-                    print("[a5-proto] EXPLICIT MIGRATION: checkpoint "
-                          "carries a5_proto_state but not the lambda/tau "
-                          "hyper-parameters; the table will be validated "
-                          "strictly and restored, and lambda/tau are "
-                          "ADOPTED from the current command line.")
-                else:
-                    print("[a5-proto] EXPLICIT MIGRATION: no a5_proto_state "
-                          "in the checkpoint — the reference-prototype "
-                          "table restarts EMPTY and is rebuilt from the "
-                          "next task boundary onward (historical-task "
-                          "prototypes are NOT reconstructed).")
-
-        # PR-3 increment: chained-resume provenance. A checkpoint written
-        # by a MIGRATED run carries the a5_proto_migration marker even
-        # though it has the full PR-2 schema (rebuilt table + hparams);
-        # resuming from it keeps the run flagged as migration-descendant
-        # so the marker survives every subsequent save. This does NOT
-        # re-enable the fresh-table path — that stays gated on the
-        # explicit flag in THIS invocation.
-        if (self.method == 'fedta_a5'
-                and self._a5_migration_provenance is None):
-            inherited = checkpoint.get("a5_proto_migration")
-            if isinstance(inherited, dict) and inherited:
-                self._a5_migration_provenance = dict(inherited)
-                print("[a5-proto] WARNING: resuming a MIGRATED (or "
-                      "migration-descendant) run — its prototype history "
-                      "is incomplete (historical-task prototypes were NOT "
-                      "reconstructed); results must NOT be mixed into "
-                      "formal multi-seed experiments.")
 
         # Phase 0: the federated outer partition is regenerated from the
         # seed; verify it is bit-identical to the manifest stored in the
@@ -1224,33 +839,6 @@ class Server_DF(object):
         for client_state in checkpoint.get("clients", []):
             cid = client_state["id"]
             self.clients[cid].load_checkpoint_state(client_state)
-
-        # Phase 7 A5 PR-2A: restore the canonical reference-prototype table
-        # (exact sums/counts + version) and REPUBLISH to every client.
-        # PR-3 (external review 2026-10-21): strict schema / version /
-        # resume-boundary validation — not just "key present". A fresh
-        # EMPTY table is ONLY permitted on an explicit
-        # --allow_proto_migration resume (gated above, task boundary
-        # required); every other fedta_a5 resume without a valid
-        # a5_proto_state is refused (it would silently re-accumulate /
-        # continue from a wrong prototype state).
-        if self.method == 'fedta_a5':
-            a5ps = checkpoint.get("a5_proto_state")
-            if not isinstance(a5ps, dict):
-                if self._a5_proto_migration:
-                    # fresh table: keep __init__ defaults (version=-1,
-                    # sums/counts=None, ref_protos=None); the next
-                    # task-entry sync rebuilds and republishes it.
-                    print("[a5-proto] migrated with a FRESH empty table "
-                          f"(version={self.a5_proto_version})")
-                else:
-                    raise RuntimeError(
-                        "fedta_a5 resume requires a5_proto_state in the "
-                        "checkpoint — refusing to restart the reference-"
-                        "prototype table from scratch mid-run (fail-closed; "
-                        "re-run from scratch or use a fedta_a5 checkpoint)")
-            else:
-                self._a5_load_proto_state(a5ps, checkpoint["server_task_id"])
 
         # RNG state must be restored LAST: model creation and split rebuild
         # above must not consume the restored random stream.
@@ -1387,66 +975,6 @@ class Server_DF(object):
         return self.prompt
 
 
-
-    def a5_fedavg_U(self, chosen_clients):
-        """A5 PR-2C (P2 v1.2 §3): U-only sample-weighted FedAvg.
-
-            U^{r+1} = sum_k (n_k / sum_j n_j) U_k^{r+1}
-
-        With V fixed and shared this is the EXACT sample-weighted average
-        of the effective transforms (sum_k p_k (U_k V) = (sum_k p_k U_k) V,
-        §1 single-factor rationale). n_k = the client's current-task
-        inner-train size (the data it actually trained on this round).
-        V is NEVER touched; every client gets its own fresh leaf copy of
-        the averaged U (independent .grad accumulation; the Adam optimizer
-        is rebuilt inside train() each round, so no stale state).
-
-        Aggregation-identity guard (fail-closed, every round): on a fixed
-        probe batch the averaged effective residual must equal the weighted
-        average of the per-client effective residuals (float tolerance).
-
-        PR-3's Local Adapter arm disables ONLY this aggregation.
-        """
-        if self.method != 'fedta_a5':
-            raise RuntimeError(
-                f"a5_fedavg_U called for method {self.method!r}")
-        ns = [len(self.clients[k].traindata) for k in chosen_clients]
-        total = sum(ns)
-        if total <= 0:
-            raise RuntimeError(
-                "a5_fedavg_U: all chosen clients have empty traindata — "
-                "sample weights undefined (fail-closed)")
-        # weighted average of the client U's (on the first client's device)
-        dev = self.clients[chosen_clients[0]].a5_U.device
-        U_avg = None
-        for w, k in zip(ns, chosen_clients):
-            Uk = self.clients[k].a5_U.detach().to(dev)
-            term = Uk * (w / total)
-            U_avg = term if U_avg is None else U_avg + term
-
-        # aggregation-identity guard: (avg U) V z == sum_k p_k (U_k V z)
-        # on a deterministic probe (dedicated generator — no RNG leak)
-        gen = torch.Generator(device='cpu')
-        gen.manual_seed(977)
-        probe = torch.randn(4, 768, generator=gen).to(dev)
-        V = self.clients[chosen_clients[0]].a5_V.to(dev)
-        lhs = (probe @ V.t()) @ U_avg.t()
-        rhs = None
-        for w, k in zip(ns, chosen_clients):
-            Uk = self.clients[k].a5_U.detach().to(dev)
-            term = (probe @ V.t()) @ Uk.t() * (w / total)
-            rhs = term if rhs is None else rhs + term
-        if not torch.allclose(lhs, rhs, atol=1e-4):
-            raise RuntimeError(
-                "a5_fedavg_U: aggregation identity violated — averaged "
-                "effective residual != weighted average of client "
-                "effective residuals (fail-closed)")
-
-        # broadcast: each client gets its own independent leaf copy
-        for k in chosen_clients:
-            c = self.clients[k]
-            c.a5_U = U_avg.detach().to(c.a5_U.device).clone() \
-                .requires_grad_(True)
 
     def fed_avg_head(self, chosen_clients):
         heads = []

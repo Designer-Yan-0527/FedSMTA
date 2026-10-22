@@ -105,47 +105,6 @@ class Client_DF(object):
             self._a2_anchor_snapshot = None   # always None for A4 (anchors unconstrained)
             self._a2_task_id = None           # task the current protection belongs to
 
-        # Phase 7 A5 (--method fedta_a5, P2 v1.2 Route-Preserving Shared
-        # Semantic Adaptation): A2 protection inheritance + a shared-semantic
-        # residual Δθ(z_ref) = U·V·z_ref fused into the Chead feature half
-        # AFTER Tail_Anchor routing (routing always sees the original h_p).
-        # U [768, r] is trainable (zero-initialized: shared=on with U=0 is
-        # forward-identical to the A2 baseline); V [r, 768] is a FIXED shared
-        # random projection generated ONCE by the server (dedicated RNG
-        # stream; the baseline random streams are untouched). a2_arm='none'
-        # selects the Shared-only factorial arm (no A2 protection).
-        # Attributes are ONLY created for the A5 method; the frozen fedta
-        # baseline keeps its __init__ / checkpoint schema untouched.
-        if method == 'fedta_a5':
-            self.a2_arm = getattr(args, 'a2_arm', 'anchor')
-            self._a2_protected_slots = None   # LongTensor: protected slot ids
-            self._a2_key_snapshot = None      # frozen key rows (arm key/both)
-            self._a2_anchor_snapshot = None   # frozen anchor rows (arm anchor/both)
-            self._a2_task_id = None           # task the current protection belongs to
-            self.a5_rank = int(getattr(args, 'a5_rank', 8))
-            # injected by Server_DF.init_client() (single source for V);
-            # None also disables the residual for diagnostics-only clients
-            self.a5_U = None                  # [768, r] trainable, requires_grad
-            self.a5_V = None                  # [r, 768] fixed shared projection
-            # PR-2A: published global reference-prototype table (fixed z_ref
-            # space) + its version; injected by Server_DF.a5_sync_ref_protos
-            # at every task boundary (P2 v1.2 §4 steps 3-4). Every client
-            # receives the SAME dict object, so within a round the table is
-            # version-consistent by construction.
-            self.a5_ref_protos = None         # {class_id: mu_c [768]} or None
-            self.a5_proto_version = -1        # -1 = nothing published yet
-            # PR-2B: prototype-CE hyperparameters (P2 v1.2 frozen config:
-            # tau = 0.07 temperature on the normalized inner product,
-            # lambda = 0.5 loss weight; lambda == 0 is EXACTLY proto-CE
-            # OFF, both computationally and numerically)
-            self.a5_proto_lambda = float(getattr(args, 'a5_proto_lambda', 0.5))
-            self.a5_proto_tau = float(getattr(args, 'a5_proto_tau', 0.07))
-            # PR-3 (P2 v1.2 §6.2 Local Adapter contrast): U aggregation mode.
-            # 'fedavg' = PR-2C sample-weighted U-only FedAvg broadcast;
-            # 'local' = the broadcast is disabled, every client keeps its
-            # own U. Persisted in a5_state (fail-closed on resume).
-            self.a5_u_agg = str(getattr(args, 'a5_u_agg', 'fedavg'))
-
         # Phase 5 A3 (--method fedta_a3): functional routing-consistency state
         # (A3-KL v1). Attributes are ONLY created for the A3 method; the
         # frozen fedta baseline keeps its __init__ / checkpoint schema
@@ -202,15 +161,13 @@ class Client_DF(object):
             # only cifar100 / ImageNet-R are supported in this project
             self.get_data(task)
             self.task_id = task
-            # Phase 4 A2 / Phase 6 A4 / Phase 7 A5: entering a new task ->
-            # recompute the protected slot set + row snapshots from the
-            # CURRENT (post-previous-task) key / anchor state. No-op for
-            # task 0 (empty protection set) and for A5 arm 'none' (Shared-
-            # only factorial arm: no protection at all). A4 shares the A2
-            # mask/snapshot code (its a2_arm is fixed to 'key'); only the
-            # USE of the snapshot differs (soft direction loss vs post-step
-            # restore).
-            if self.method in ('fedta_a2', 'fedta_a4', 'fedta_a5'):
+            # Phase 4 A2 / Phase 6 A4: entering a new task -> recompute the
+            # protected slot set + row snapshots from the CURRENT
+            # (post-previous-task) key / anchor state. No-op for task 0
+            # (empty protection set). A4 shares the A2 mask/snapshot code
+            # (its a2_arm is fixed to 'key'); only the USE of the snapshot
+            # differs (soft direction loss vs post-step restore).
+            if self.method in ('fedta_a2', 'fedta_a4'):
                 self._a2_init_task_protection(args)
             # Phase 5 A3: entering a new task -> build the fixed public
             # surrogate reference bank and the previous-generation routing
@@ -234,14 +191,6 @@ class Client_DF(object):
         num_workers=0) + torch RNG state snapshot/restore.
         """
         self._a2_task_id = self.task_id
-        # Phase 7 A5 arm 'none' (Shared-only factorial arm): NO protection.
-        # Record the task ownership (so the checkpoint state and the resume
-        # validation stay well-defined) and return before the feature pass.
-        if getattr(self, 'a2_arm', None) == 'none':
-            self._a2_protected_slots = None
-            self._a2_key_snapshot = None
-            self._a2_anchor_snapshot = None
-            return
         completed = [t for t in range(self.task_id)
                      if t in self.data_split_indices]
         if not completed:
@@ -337,241 +286,6 @@ class Client_DF(object):
             self.model.key.data[self._a2_protected_slots] = self._a2_key_snapshot
         if self.a2_arm in ('anchor', 'both') and self._a2_anchor_snapshot is not None:
             self.model.anchor_pool.data[self._a2_protected_slots] = self._a2_anchor_snapshot
-
-    # ------------------------------------------------------------------
-    # Phase 7 A5 (fedta_a5, P2 v1.2): route-preserving shared residual
-    # ------------------------------------------------------------------
-
-    def a5_init_shared(self, V):
-        """A5: server-injected shared projection. V [r, 768] is the FIXED
-        shared random projection (single source: Server_DF.init_client()
-        generates it once on a dedicated RNG stream and broadcasts the same
-        tensor to every client); U [768, r] is the per-client trainable
-        factor, ZERO-initialized so shared=on with U=0 is forward-identical
-        to the corresponding A2 baseline (P2 v1.2 §1)."""
-        if self.method != 'fedta_a5':
-            raise RuntimeError(
-                f"client {self.id}: a5_init_shared called for method "
-                f"{self.method!r} (only fedta_a5 carries shared-adapter "
-                f"state)")
-        if V.shape != (self.a5_rank, 768):
-            raise RuntimeError(
-                f"client {self.id}: shared V must have shape "
-                f"({self.a5_rank}, 768), got {tuple(V.shape)}")
-        self.a5_V = V.detach().to(self.device).clone()
-        self.a5_V.requires_grad_(False)
-        self.a5_U = torch.zeros(768, self.a5_rank, device=self.device,
-                                requires_grad=True)
-
-    def _a5_residual(self, z_ref):
-        """A5: Δθ(z_ref) = U·V·z_ref, computed as (z V^T) U^T.
-
-        z_ref is the frozen backbone feature (a no_grad constant); the
-        result stays differentiable w.r.t. U ONLY (V is a fixed buffer).
-        Returns None for every non-A5 method (or before server injection)
-        so the official forward path is bit-identical there."""
-        if self.method != 'fedta_a5' or self.a5_U is None:
-            return None
-        z = z_ref.detach().to(self.a5_U.device)
-        return (z @ self.a5_V.t()) @ self.a5_U.t()
-
-    def _a5_proto_ce(self, cls_features, target):
-        """A5 PR-2B (P2 v1.2 §5): prototype-CE on the shared transformation
-        W = I + U V in the FIXED z_ref space:
-
-            L_proto = CE( cos(W z, W mu_c) / tau , y )
-
-        over the published global seen-class table (a5_ref_protos).
-        Gradient ownership: z_ref is a frozen-backbone constant, mu_c is a
-        fixed statistic, V is fixed — the ONLY trainable tensor in this
-        graph is U, reached through BOTH sides (W z and W mu). Chead,
-        Tail_Anchor, prompts and the official loss are untouched.
-
-        Fail-closed: every batch label must be a table class (the boundary
-        sync publishes the current task's classes BEFORE any training
-        round); a missing U/V or a missing table is a wiring error, not a
-        runtime state to tolerate.
-        """
-        if self.method != 'fedta_a5':
-            raise RuntimeError(
-                f"client {self.id}: _a5_proto_ce called for method "
-                f"{self.method!r} (A5 only)")
-        if self.a5_U is None or self.a5_V is None:
-            raise RuntimeError(
-                f"client {self.id}: _a5_proto_ce before a5_init_shared "
-                f"— U/V must be injected by Server_DF.init_client()")
-        if not self.a5_ref_protos:
-            raise RuntimeError(
-                f"client {self.id}: _a5_proto_ce with empty reference-"
-                f"prototype table — the task-boundary sync must publish "
-                f"before any training round")
-        classes = sorted(self.a5_ref_protos.keys())
-        cls_index = {c: i for i, c in enumerate(classes)}
-        y = []
-        for t in target:
-            t = int(t)
-            if t not in cls_index:
-                raise RuntimeError(
-                    f"client {self.id}: batch label {t} not in the "
-                    f"published table ({len(classes)} classes) — current-"
-                    f"task classes must be synced at the boundary")
-            y.append(cls_index[t])
-        y = torch.tensor(y, dtype=torch.long, device=self.device)
-        mu = torch.stack([self.a5_ref_protos[c] for c in classes]
-                         ).to(self.device)              # [C, 768] constant
-        # W z = z + U(V z); z is a no_grad constant, gradient reaches U
-        z = cls_features.detach().to(self.a5_U.device)
-        Wz = z + (z @ self.a5_V.t()) @ self.a5_U.t()
-        # W mu = mu + U(V mu); mu constant, gradient reaches U
-        Wmu = mu + (mu @ self.a5_V.t()) @ self.a5_U.t()
-        logits_proto = (F.normalize(Wz, dim=1)
-                        @ F.normalize(Wmu, dim=1).t()) / self.a5_proto_tau
-        return F.cross_entropy(logits_proto, y)
-
-    def _a5_state_for_checkpoint(self):
-        """Serialize A5 shared-adapter state; always a dict for fedta_a5,
-        never called for other methods (checkpoint schema untouched)."""
-        if self.method != 'fedta_a5':
-            return None
-        return {
-            "rank": self.a5_rank,
-            "a2_arm": self.a2_arm,
-            "u_agg": self.a5_u_agg,
-            "U": (None if self.a5_U is None
-                  else self.a5_U.detach().cpu()),
-            "V": (None if self.a5_V is None
-                  else self.a5_V.detach().cpu()),
-        }
-
-    def _a5_load_checkpoint_state(self, state):
-        """Restore A5 shared-adapter state, FAIL-CLOSED.
-
-        A fedta_a5 resume from a checkpoint without a5_state would silently
-        restart U from zero mid-run (wrong trajectory); a V mismatch would
-        silently project into a different fixed space; an arm mismatch
-        changes the factorial arm semantics. All three are refused."""
-        if self.method != 'fedta_a5':
-            return
-        a5 = state.get("a5_state")
-        if not a5:
-            raise RuntimeError(
-                f"client {self.id}: fedta_a5 resume requires a5_state in "
-                f"the checkpoint, got "
-                f"{'missing key' if 'a5_state' not in state else 'None/empty'}"
-                f" — refusing to silently restart the shared adapter from "
-                f"zero (fail-closed; re-run from scratch or use a "
-                f"fedta_a5 checkpoint)")
-        if int(a5.get("rank", -1)) != self.a5_rank:
-            raise RuntimeError(
-                f"client {self.id}: A5 rank mismatch on resume "
-                f"(checkpoint={a5.get('rank')}, current={self.a5_rank})")
-        if a5.get("a2_arm") != self.a2_arm:
-            raise RuntimeError(
-                f"client {self.id}: A5 a2_arm mismatch on resume "
-                f"(checkpoint={a5.get('a2_arm')}, current={self.a2_arm})")
-        # PR-3 Local Adapter switch: a u_agg mismatch would silently change
-        # the mechanism contrast mid-run. Key is absent in pre-PR-3 A5
-        # checkpoints — those were trained with the (then only) fedavg mode,
-        # so an absent key is compatible with 'fedavg' but NEVER with
-        # 'local' (a Local Adapter run must start from scratch or from a
-        # local-arm checkpoint; fail-closed).
-        ckpt_u_agg = a5.get("u_agg", "fedavg")
-        if ckpt_u_agg != self.a5_u_agg:
-            raise RuntimeError(
-                f"client {self.id}: A5 u_agg mismatch on resume "
-                f"(checkpoint={ckpt_u_agg!r}"
-                f"{' (implicit: pre-PR-3 checkpoints always FedAvg U)' if 'u_agg' not in a5 else ''}, "
-                f"current={self.a5_u_agg!r}) — the U aggregation mode is "
-                f"part of the experiment arm and cannot change mid-run "
-                f"(fail-closed)")
-        U = a5.get("U")
-        V = a5.get("V")
-        if U is None or V is None:
-            raise RuntimeError(
-                f"client {self.id}: fedta_a5 resume requires both U and V "
-                f"in a5_state (got U={'None' if U is None else 'ok'}, "
-                f"V={'None' if V is None else 'ok'})")
-        # V is regenerated deterministically by the server from the seed;
-        # it must be bit-identical, otherwise the projection space differs.
-        if (self.a5_V is None
-                or not torch.equal(self.a5_V, V.to(self.a5_V.device))):
-            raise RuntimeError(
-                f"client {self.id}: shared V mismatch on resume — the "
-                f"server-regenerated projection does not match the "
-                f"checkpoint (check seed / a5_rank)")
-        self.a5_U = U.to(self.device).clone().requires_grad_(True)
-
-    def a5_compute_proto_stats(self):
-        """A5 PR-2A (P2 v1.2 §4 step 2): no-grad class-level sum/count of
-        the FIXED z_ref feature (frozen original_model pre_logits) over the
-        CURRENT task's inner-train split (data_split_indices[task]["train"]).
-
-        z_ref needs no prompts and no adapter, so the statistics live in a
-        space that never changes when the adapter updates (§3: the table is
-        merged once per task boundary and never recomputed). RNG-neutral:
-        the extra DataLoader traversal snapshots/restores ALL RNG streams
-        exactly like _a2_init_task_protection, so the FedTA/A2 baseline
-        batch streams are untouched.
-
-        Returns {class_id: (sum [768] float32 cpu, count int)} for the
-        classes actually present in this client's current-task inner-train.
-        """
-        if self.method != 'fedta_a5':
-            raise RuntimeError(
-                f"client {self.id}: a5_compute_proto_stats called for method "
-                f"{self.method!r} (only fedta_a5 computes reference stats)")
-        t = self.task_id
-        if t not in self.data_split_indices:
-            raise RuntimeError(
-                f"client {self.id}: task {t} inner split missing — "
-                f"a5_compute_proto_stats must run after update_data() "
-                f"entered the task")
-        rng_state = {
-            "torch_cpu": torch.get_rng_state(),
-            "torch_cuda_all": (torch.cuda.get_rng_state_all()
-                               if torch.cuda.is_available() else None),
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-        }
-        orig_was_training = self.original_model.training
-        try:
-            self.original_model.eval()
-            dataset = Subset(self.train_data[t],
-                             self.data_split_indices[t]["train"])
-            loader = DataLoader(dataset, batch_size=16, num_workers=0,
-                                shuffle=False)
-            # dense per-class accumulation (exact; no floating-point order
-            # ambiguity across batch grouping: index_add on the class dim).
-            # z_ref dim is FROZEN at 768 by P2 v1.2 (V is [r, 768], U is
-            # [768, r]) — any other backbone dim is refused, NOT adapted to
-            # (same fail-closed discipline as a5_init_shared's V check).
-            sums = torch.zeros(self.nb_classes, 768)
-            counts = torch.zeros(self.nb_classes, dtype=torch.long)
-            for input, target in loader:
-                input = input.to(self.device, non_blocking=True)
-                target = target.to(self.device)
-                with torch.no_grad():
-                    z = self.original_model(input)['pre_logits']
-                if z.shape[1] != 768:
-                    raise RuntimeError(
-                        f"client {self.id}: a5 proto stats require the "
-                        f"frozen 768-dim z_ref space (P2 v1.2), got "
-                        f"{z.shape[1]} — refusing to adapt")
-                cls = target.long().cpu()   # sums/counts accumulate on CPU
-                sums.index_add_(0, cls, z.float().cpu())
-                counts.index_add_(0, cls,
-                                  torch.ones_like(cls))
-            present = counts.nonzero().reshape(-1)
-            return {int(c): (sums[c].clone(), int(counts[c]))
-                    for c in present}
-        finally:
-            # restore ALL RNG streams + module mode (bit-neutral pass)
-            torch.set_rng_state(rng_state["torch_cpu"])
-            if rng_state["torch_cuda_all"] is not None:
-                torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
-            random.setstate(rng_state["python"])
-            np.random.set_state(rng_state["numpy"])
-            self.original_model.train(orig_was_training)
 
     def _a4_dir_loss(self):
         """A4: normalized-direction preservation loss on the protected key
@@ -829,15 +543,7 @@ class Client_DF(object):
                 output = self.original_model(input)
                 cls_features = output['pre_logits']
                 output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True)
-        # Phase 7 A5: route-preserving shared residual on the frozen z_ref
-        # (cls_features). Routing inside Tail_Anchor always uses the ORIGINAL
-        # prompt feature; the residual only enriches the Chead feature half.
-        # cls_features is a no_grad constant; Δθ(z_ref) stays differentiable
-        # w.r.t. U (P2 v1.2 gradient-ownership table: native CE/InfoNCE
-        # gradients reach U). None for every non-A5 method -> bit-identical
-        # official path.
-        residual = self._a5_residual(cls_features)
-        pre, output_mixed, pull_off2 = self.model(output['feat'].to(self.device), target.to(self.device), residual=residual)
+        pre, output_mixed, pull_off2 = self.model(output['feat'].to(self.device), target.to(self.device))
         logits = pre
         # NCE loss
         if self.global_protos is None:
@@ -900,23 +606,12 @@ class Client_DF(object):
             loss = loss + self.a4_lambda * loss_dir
             extra, extra_kind = float(loss_dir.detach()), 'dir'
 
-        # Phase 7 A5 PR-2B (fedta_a5): prototype-CE regularizer (P2 v1.2
-        # §5) — gradient reaches U ONLY (both W z and W mu sides); the
-        # official loss, Chead, Tail_Anchor and prompts are untouched.
-        # lambda == 0 skips the computation entirely => EXACTLY the
-        # Shared CE-only arm (identical to PR-1 behavior + PR-2A sync).
-        if self.method == 'fedta_a5' and self.a5_proto_lambda != 0:
-            loss_proto = self._a5_proto_ce(cls_features, target)
-            loss = loss + self.a5_proto_lambda * loss_proto
-            extra, extra_kind = float(loss_proto.detach()), 'proto'
-
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        # Phase 4 A2 / Phase 7 A5 (A2 inheritance): restore protected
-        # key/anchor rows after the Tail_Anchor step. No-op for the frozen
-        # fedta baseline and for the A5 'none' arm (empty protection set).
-        if self.method in ('fedta_a2', 'fedta_a5'):
+        # Phase 4 A2: restore protected key/anchor rows after the
+        # Tail_Anchor step. No-op for the frozen fedta baseline.
+        if self.method == 'fedta_a2':
             self._a2_post_step_restore()
         return base_f, extra, extra_kind
 
@@ -975,21 +670,7 @@ class Client_DF(object):
         # self.evaluate_only_prompts(0,args.nb_classes)
         # self.evaluate_only_prompts(self.task_id,args.nb_classes)
 
-        # Phase 7 A5: per the P2 v1.2 gradient-ownership table, the shared
-        # adapter U participates in the STAGE-2 optimizer (native CE /
-        # InfoNCE gradients reach U through the fused feature). Stage 1
-        # (prompt optimizer above) is untouched; every non-A5 method keeps
-        # the exact official optimizer construction.
-        if self.method == 'fedta_a5':
-            if self.a5_U is None:
-                raise RuntimeError(
-                    f"client {self.id}: fedta_a5 requires the shared V/U to "
-                    f"be injected by Server_DF.init_client() before train()")
-            optimizer = torch.optim.Adam(
-                list(self.model.parameters()) + [self.a5_U],
-                lr=self.lr, weight_decay=1e-03)
-        else:
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-03)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-03)
         # Phase 5 A3 (fedta_a3): per-train()-call reference-batch cursor. It
         # restarts at 0 every round (checkpoints are round-boundary state), so
         # a resumed run reproduces the exact reference-batch sequence of an
@@ -1019,17 +700,11 @@ class Client_DF(object):
                             // self.a3_ref_batch_size)
         a3_epoch_acc = None
         a4_epoch_acc = None
-        # Phase 7 A5: per-epoch proto-CE logging accumulator (mirrors the
-        # A3/A4 discipline; every batch of a fedta_a5 round contributes)
-        a5_epoch_acc = None
         for epoch in tqdm(range(self.local_epoch)):
             if a3_active:
                 a3_epoch_acc = {"base": [], "kl": [], "lam_kl": []}
             if a4_active:
                 a4_epoch_acc = {"base": [], "dir": [], "lam_dir": []}
-            if (self.method == 'fedta_a5'
-                    and self.a5_proto_lambda != 0):
-                a5_epoch_acc = {"base": [], "proto": [], "lam_proto": []}
             for iteration, (input, target) in enumerate(train_loader):
                 input, target = Variable(input, requires_grad=False).to(self.device, non_blocking=True), target.long().to(
                     self.device, non_blocking=True)
@@ -1052,11 +727,6 @@ class Client_DF(object):
                     a4_epoch_acc["dir"].append(extra_f)
                     a4_epoch_acc["lam_dir"].append(
                         float(self.a4_lambda) * extra_f)
-                if a5_epoch_acc is not None and extra_kind == 'proto':
-                    a5_epoch_acc["base"].append(base_f)
-                    a5_epoch_acc["proto"].append(extra_f)
-                    a5_epoch_acc["lam_proto"].append(
-                        float(self.a5_proto_lambda) * extra_f)
 
             # Phase 5 A3: per-local-epoch logging (means over this epoch's
             # constrained steps; teacher top1 confidence is a fixed property
@@ -1080,18 +750,6 @@ class Client_DF(object):
                       f'base_loss={m_base:.4f} dir_loss={m_dir:.4f} '
                       f'lam*dir={m_ldir:.3e} '
                       f'n_protected={self._a2_protected_slots.numel()}')
-
-            # Phase 7 A5: per-local-epoch proto-CE logging (means over this
-            # epoch's batches), mirroring the A3/A4 discipline
-            if a5_epoch_acc is not None and a5_epoch_acc["proto"]:
-                m_base = sum(a5_epoch_acc["base"]) / len(a5_epoch_acc["base"])
-                m_proto = sum(a5_epoch_acc["proto"]) / len(a5_epoch_acc["proto"])
-                m_lproto = sum(a5_epoch_acc["lam_proto"]) / len(a5_epoch_acc["lam_proto"])
-                print(f'[A5] client {self.id} task {self.task_id} epoch {epoch}: '
-                      f'base_loss={m_base:.4f} proto_ce={m_proto:.4f} '
-                      f'lam*proto={m_lproto:.3e} '
-                      f'proto_version={self.a5_proto_version} '
-                      f'n_table={len(self.a5_ref_protos)}')
 
 
         target_list = []
@@ -1244,12 +902,9 @@ class Client_DF(object):
             with torch.no_grad():
                 if self.original_model is not None:
                     output = self.original_model(input)
-                    z_ref = output['pre_logits'].requires_grad_(False)
-                    output = self.vit(input, task_id=self.task_id, cls_features=z_ref, train=True)
-                    # Phase 7 A5: shared residual on the frozen z_ref (None
-                    # for non-A5 methods -> official path bit-identical)
-                    residual = self._a5_residual(z_ref)
-                    pre, output_mixed, _ = self.model(output['feat'].to(self.device), target.to(self.device), residual=residual)
+                    output = output['pre_logits'].requires_grad_(False)
+                    output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
+                    pre, output_mixed, _ = self.model(output['feat'].to(self.device), target.to(self.device))
             logits = pre
 
             # logits = output['logits']
@@ -1300,12 +955,9 @@ class Client_DF(object):
             with torch.no_grad():
                 if self.original_model is not None:
                     output = self.original_model(input)
-                    z_ref = output['pre_logits'].requires_grad_(False)
-                    output = self.vit(input, task_id=self.task_id, cls_features=z_ref, train=True)
-                    # Phase 7 A5: shared residual on the frozen z_ref (None
-                    # for non-A5 methods -> official path bit-identical)
-                    residual = self._a5_residual(z_ref)
-                    pre, output_mixed, _ = self.model(output['feat'].to(self.device), target.to(self.device), residual=residual)
+                    output = output['pre_logits'].requires_grad_(False)
+                    output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
+                    pre, output_mixed, _ = self.model(output['feat'].to(self.device), target.to(self.device))
             logits = pre
 
             # logits = output['logits']
@@ -1387,23 +1039,17 @@ class Client_DF(object):
             "data_split_indices": self.data_split_indices,
         }
 
-        # Phase 4 A2 protection state. Key is ONLY added for fedta_a2 /
-        # fedta_a5 (A2 inheritance) so the frozen fedta baseline keeps a
-        # bit-identical checkpoint schema. (Required so a mid-task resume
-        # restores the task-start snapshot instead of recomputing it from
-        # the already-drifted state.)
-        if self.method in ('fedta_a2', 'fedta_a5'):
+        # Phase 4 A2 protection state. Key is ONLY added for fedta_a2 so the
+        # frozen fedta baseline keeps a bit-identical checkpoint schema.
+        # (Required so a mid-task resume restores the task-start snapshot
+        # instead of recomputing it from the already-drifted state.)
+        if self.method == 'fedta_a2':
             state["a2_state"] = self._a2_state_for_checkpoint()
         # Phase 6 A4: same discipline (mid-task resume must restore the
         # task-start snapshot instead of recomputing it from the
         # already-drifted state).
         elif self.method == 'fedta_a4':
             state["a4_state"] = self._a4_state_for_checkpoint()
-
-        # Phase 7 A5 shared-adapter state (U / V / rank / arm). Key is ONLY
-        # added for fedta_a5 (schema untouched for every other method).
-        if self.method == 'fedta_a5':
-            state["a5_state"] = self._a5_state_for_checkpoint()
 
         # Phase 5 A3 routing-consistency state. Key is ONLY added for
         # fedta_a3 so the frozen fedta baseline keeps a bit-identical
@@ -1441,10 +1087,9 @@ class Client_DF(object):
         }
 
     def _a2_state_for_checkpoint(self):
-        """Serialize A2 protection state; always a dict for fedta_a2 /
-        fedta_a5 (A2 inheritance), never called for the fedta baseline
-        (schema untouched)."""
-        if self.method not in ('fedta_a2', 'fedta_a5'):
+        """Serialize A2 protection state; always a dict for fedta_a2,
+        never called for the fedta baseline (schema untouched)."""
+        if self.method != 'fedta_a2':
             return None
         return {
             "a2_arm": self.a2_arm,
@@ -1460,13 +1105,12 @@ class Client_DF(object):
     def _a2_load_checkpoint_state(self, state):
         """Restore A2 protection state, FAIL-CLOSED.
 
-        A fedta_a2 / fedta_a5 resume from a checkpoint without a2_state
-        would silently continue as an unprotected A2 (wrong arm semantics,
-        wrong science). Same failure class as the Phase-0 missing-manifest
-        false-PASS: the state MUST exist and be internally consistent, or
-        we refuse.
+        A fedta_a2 resume from a checkpoint without a2_state would silently
+        continue as an unprotected A2 (wrong arm semantics, wrong science).
+        Same failure class as the Phase-0 missing-manifest false-PASS: the
+        state MUST exist and be internally consistent, or we refuse.
         """
-        if self.method not in ('fedta_a2', 'fedta_a5'):
+        if self.method != 'fedta_a2':
             return
         a2 = state.get("a2_state")
         if not a2:
@@ -1704,12 +1348,9 @@ class Client_DF(object):
         # rebuild all seen-task test loaders + current traindata
         self.rebuild_data_from_indices()
 
-        # Phase 4 A2 / Phase 7 A5: restore protection snapshot AFTER task_id
-        # is restored, so update_data() does not recompute it mid-task; A5
-        # additionally restores the shared adapter (U) and validates the
-        # server-regenerated V, fail-closed.
+        # Phase 4 A2: restore protection snapshot AFTER task_id is restored,
+        # so update_data() does not recompute it mid-task.
         self._a2_load_checkpoint_state(state)
-        self._a5_load_checkpoint_state(state)
 
         # Phase 6 A4: restore the task-start key snapshot AFTER task_id is
         # restored, so update_data() does not recompute it mid-task.

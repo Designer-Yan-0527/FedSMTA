@@ -30,13 +30,7 @@ class Tail_Anchor(nn.Module):
         return x * x_inv_norm
 
     # x是预训练给的768维
-    # A5 (fedta_a5, P2 v1.2): optional `residual` is the route-preserving
-    # shared-semantic residual Δθ(z_ref). Routing (top-1 key selection) and
-    # the pull-off term ALWAYS use the ORIGINAL x; the residual is fused into
-    # the feature half of the Chead input ONLY (after routing, before the
-    # head). residual=None (every non-A5 method) leaves the computation
-    # bit-identical to the original FedTA forward.
-    def forward(self,x,class_mask,residual=None):
+    def forward(self,x,class_mask):
         # 先找key
         # x_embed_norm 就是key
         x_embed_norm = self.l2_normalize(x, dim=1)  # B, C
@@ -45,6 +39,7 @@ class Tail_Anchor(nn.Module):
 
         tem_key = tem_key.squeeze(0)
         # print(x_embed_norm.shape)
+
         key_norm = self.l2_normalize(tem_key, dim=1)  # Pool_size, C    先是随机的
 
         similarity = torch.matmul(x_embed_norm, key_norm.t().to('cuda'))  # B, Pool_size
@@ -53,17 +48,12 @@ class Tail_Anchor(nn.Module):
         # print(q,index)
 
 
-
         anchor = self.anchor_pool[index]
         # print(anchor.shape)
 
         anchor = anchor.reshape(-1,768)
         # print(x.shape)
         # print(anchor.shape)
-        # A5: fuse the shared residual into the feature half AFTER routing.
-        # The anchor half and the routing above are untouched.
-        if residual is not None:
-            x = x + residual
         x1 = torch.stack((x,anchor),dim=1).view(-1,768*2)
         x = self.head(x1)
 
