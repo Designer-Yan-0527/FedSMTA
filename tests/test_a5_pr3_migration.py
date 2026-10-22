@@ -43,6 +43,10 @@ Cases:
       M9d chained resume from a migrated run's checkpoint INHERITS the
           marker (no flag needed — it is provenance, not permission) and
           the training trajectory is unchanged (table bit-identical).
+      M9e PR-2 checkpoint + CLI lambda/tau MISMATCH + flag -> REFUSED by
+          RESUME_MUST_MATCH (the flag authorizes legacy migration only;
+          it must never bypass config-consistency checks or silently
+          override checkpoint values).
 
 Isolation: RunManager infers run_dir from an explicit --resume path
 (ckpt.parent.parent), so every synthesized checkpoint lives in its own
@@ -348,6 +352,18 @@ def main():
     assert m9a_diff <= 1e-6, f"M9a: sums max_diff {m9a_diff} > 1e-6"
     print(f"[PASS] M9a: PR-2 + flag == no-op (lambda/tau from checkpoint, "
           f"table bit-identical, max_diff={m9a_diff})")
+
+    # M9e (reviewer-requested negative): the flag must NOT bypass the
+    # RESUME_MUST_MATCH consistency check. validate_checkpoint_args runs
+    # BEFORE the migration gate, so a PR-2 checkpoint resumed with a
+    # DIFFERENT CLI lambda is rejected even under --allow_proto_migration
+    # (checkpoint values are never silently overridden by CLI values).
+    run_main(base + a5_resume + ["--resume", str(pr2_flag),
+                                 "--max_rounds", str(total),
+                                 "--a5_proto_lambda", "0.25",
+                                 "--allow_proto_migration"],
+             expect_fail=True, expect_msg="Checkpoint mismatch",
+             label="M9e: flag cannot bypass lambda/tau mismatch rejection")
 
     # M9b: NaN-poisoned table is rejected fail-closed.
     import torch
