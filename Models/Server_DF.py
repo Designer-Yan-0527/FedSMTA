@@ -73,6 +73,15 @@ class Server_DF(object):
         # load_checkpoint).
         self._a5_proto_migration = False
 
+        # Phase 7 A5 PR-3 increment (external review 2026-10-21, §2.2):
+        # migration PROVENANCE. Once a run starts from (or descends from)
+        # an explicit legacy-A5 migration, EVERY checkpoint it writes
+        # carries the `a5_proto_migration` marker, so migrated runs can
+        # never be confused with from-scratch PR-2 runs (their prototype
+        # history is incomplete: historical-task prototypes are NOT
+        # reconstructed). None = not a migrated run (or descendant).
+        self._a5_migration_provenance = None
+
         # Phase 0: round-boundary checkpoint / resume state
         self.run_manager = run_manager
         # Phase 0: observer instrumentation switch (tests/test_observer_
@@ -245,6 +254,12 @@ class Server_DF(object):
                 raise RuntimeError(
                     f"a5_proto_state corrupt: sums[{c}] is not a 1-D float "
                     f"tensor")
+            # PR-3 increment (external review §3.2): NaN/Inf poison the
+            # table (prototypes = sums/counts) — reject fail-closed.
+            if not bool(torch.isfinite(s).all()):
+                raise RuntimeError(
+                    f"a5_proto_state corrupt: sums[{c}] contains NaN/Inf — "
+                    f"refusing to resume from a poisoned prototype table")
             if width is None:
                 width = s.numel()
             elif s.numel() != width:
@@ -252,10 +267,12 @@ class Server_DF(object):
                     f"a5_proto_state corrupt: inconsistent sums widths "
                     f"(class {c})")
         for c, n in counts.items():
-            if int(n) <= 0:
+            # PR-3 increment: counts must be true positive integers (bool
+            # is an int subclass — exclude it explicitly).
+            if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
                 raise RuntimeError(
-                    f"a5_proto_state corrupt: non-positive count for class "
-                    f"{c}")
+                    f"a5_proto_state corrupt: non-positive or non-integer "
+                    f"count for class {c}")
         self.a5_proto_version = version
         self.a5_proto_sums = {int(c): s.float() for c, s in sums.items()}
         self.a5_proto_counts = {int(c): int(n) for c, n in counts.items()}
@@ -965,6 +982,14 @@ class Server_DF(object):
                 }}
                if self.method == 'fedta_a5' else {}),
 
+            # PR-3 increment: migration provenance marker — present ONLY
+            # on checkpoints written by a migrated (or migration-descendant)
+            # run. Identifies runs whose prototype history is incomplete;
+            # formal multi-seed experiments must exclude them.
+            **({"a5_proto_migration": dict(self._a5_migration_provenance)}
+               if (self.method == 'fedta_a5'
+                   and self._a5_migration_provenance is not None) else {}),
+
             "clients": [c.state_dict_for_checkpoint() for c in self.clients],
 
             "rng_state": rng_state_dict(),
@@ -1059,6 +1084,11 @@ class Server_DF(object):
                         "Resume from a checkpoint saved at the end of a "
                         "task instead.")
                 self._a5_proto_migration = True
+                self._a5_migration_provenance = {
+                    "migrated_from_round": int(checkpoint["completed_round"]),
+                    "migrated_at_task": int(checkpoint["server_task_id"]),
+                    "kept_carried_table": bool(has_proto_state),
+                }
                 if has_proto_state:
                     print("[a5-proto] EXPLICIT MIGRATION: checkpoint "
                           "carries a5_proto_state but not the lambda/tau "
@@ -1071,6 +1101,24 @@ class Server_DF(object):
                           "table restarts EMPTY and is rebuilt from the "
                           "next task boundary onward (historical-task "
                           "prototypes are NOT reconstructed).")
+
+        # PR-3 increment: chained-resume provenance. A checkpoint written
+        # by a MIGRATED run carries the a5_proto_migration marker even
+        # though it has the full PR-2 schema (rebuilt table + hparams);
+        # resuming from it keeps the run flagged as migration-descendant
+        # so the marker survives every subsequent save. This does NOT
+        # re-enable the fresh-table path — that stays gated on the
+        # explicit flag in THIS invocation.
+        if (self.method == 'fedta_a5'
+                and self._a5_migration_provenance is None):
+            inherited = checkpoint.get("a5_proto_migration")
+            if isinstance(inherited, dict) and inherited:
+                self._a5_migration_provenance = dict(inherited)
+                print("[a5-proto] WARNING: resuming a MIGRATED (or "
+                      "migration-descendant) run — its prototype history "
+                      "is incomplete (historical-task prototypes were NOT "
+                      "reconstructed); results must NOT be mixed into "
+                      "formal multi-seed experiments.")
 
         # Phase 0: the federated outer partition is regenerated from the
         # seed; verify it is bit-identical to the manifest stored in the

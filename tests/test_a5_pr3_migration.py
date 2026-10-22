@@ -33,6 +33,16 @@ Cases:
       -> SUCCEEDS and the table is RESTORED (final keys == uninterrupted
       run); corrupt version is refused both under migration (M8b) and on
       the normal path (M8c).
+  M9  PR-3 increment (external review follow-up):
+      M9a PR-2 checkpoint resumed WITH --allow_proto_migration is a
+          NO-OP: lambda/tau unchanged (from the checkpoint, not the CLI),
+          final table bit-identical to the uninterrupted run.
+      M9b NaN-poisoned a5_proto_state -> REFUSED (fail-closed).
+      M9c every checkpoint written by a MIGRATED run carries the
+          a5_proto_migration provenance marker (checked on M5/M8 outputs).
+      M9d chained resume from a migrated run's checkpoint INHERITS the
+          marker (no flag needed — it is provenance, not permission) and
+          the training trajectory is unchanged (table bit-identical).
 
 Isolation: RunManager infers run_dir from an explicit --resume path
 (ckpt.parent.parent), so every synthesized checkpoint lives in its own
@@ -308,9 +318,99 @@ def main():
     print(f"[PASS] M8: hybrid migration restored the carried table "
           f"({len(m8_keys)} classes == uninterrupted run)")
 
+    # ---- M9: PR-3 increment (provenance marker + poison rejection) ------
+    # M9a: the flag must be a NO-OP on a full PR-2 checkpoint: lambda/tau
+    # come from the checkpoint (RESUME_MUST_MATCH), the table is restored
+    # and the final state is bit-identical to the uninterrupted run.
+    pr2_flag = synth / "pr2_flag" / "checkpoints" / "ckpt.pth"
+    pr2_flag.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(boundary, pr2_flag)
+    run_main(base + a5_resume + ["--resume", str(pr2_flag),
+                                 "--max_rounds", str(total),
+                                 "--allow_proto_migration"],
+             label="M9a: PR-2 resume WITH flag (must be a no-op)")
+    ck_m9a = torch_load_compat(synth / "pr2_flag" / "checkpoints"
+                               / "task_01_end.pth")
+    m9a_state = ck_m9a["a5_proto_state"]
+    assert float(ck_m9a["args"]["a5_proto_lambda"]) == \
+        float(ck_a1["args"]["a5_proto_lambda"]), \
+        "M9a: flag must not change lambda on a PR-2 checkpoint"
+    assert float(ck_m9a["args"]["a5_proto_tau"]) == \
+        float(ck_a1["args"]["a5_proto_tau"]), \
+        "M9a: flag must not change tau on a PR-2 checkpoint"
+    assert "a5_proto_migration" not in ck_m9a, \
+        "M9a: a non-migrated run must NOT carry the migration marker"
+    assert set(m9a_state["sums"]) == set(a1_state["sums"]) \
+        and m9a_state["counts"] == a1_state["counts"]
+    m9a_diff = max(
+        float((m9a_state["sums"][c] - a1_state["sums"][c]).abs().max())
+        for c in a1_state["sums"])
+    assert m9a_diff <= 1e-6, f"M9a: sums max_diff {m9a_diff} > 1e-6"
+    print(f"[PASS] M9a: PR-2 + flag == no-op (lambda/tau from checkpoint, "
+          f"table bit-identical, max_diff={m9a_diff})")
+
+    # M9b: NaN-poisoned table is rejected fail-closed.
+    import torch
+    nan_ckpt = synth / "nan_table" / "checkpoints" / "ckpt.pth"
+    nan_ckpt.parent.mkdir(parents=True, exist_ok=True)
+    poisoned = torch_load_compat(boundary)
+    first_class = sorted(poisoned["a5_proto_state"]["sums"])[0]
+    poisoned["a5_proto_state"]["sums"][first_class][0] = float("nan")
+    torch.save(poisoned, nan_ckpt)
+    run_main(base + a5_resume + ["--resume", str(nan_ckpt),
+                                 "--max_rounds", str(total)],
+             expect_fail=True, expect_msg="NaN/Inf",
+             label="M9b: NaN-poisoned prototype table refused")
+
+    # M9c: migrated runs stamp EVERY checkpoint with the provenance marker.
+    for name, ck in (("M5", ck_m5), ("M8", ck_m8)):
+        marker = ck.get("a5_proto_migration")
+        assert isinstance(marker, dict) and marker, \
+            f"M9c: migrated run's checkpoint ({name}) must carry the " \
+            f"a5_proto_migration provenance marker"
+        assert marker["migrated_from_round"] == ge - 1 \
+            and marker["migrated_at_task"] == 0, \
+            f"M9c: {name} provenance fields wrong: {marker}"
+    assert "a5_proto_migration" not in ck_a1, \
+        "M9c: the uninterrupted run must NOT carry the marker"
+    print("[PASS] M9c: migrated checkpoints carry the provenance marker "
+          "(fresh-table M5 and hybrid M8); non-migrated runs do not")
+
+    # M9d: chained resume from a MIGRATED run's checkpoint inherits the
+    # marker WITHOUT the flag (provenance, not permission) and the
+    # trajectory is unchanged. M5's mid-task round checkpoint (round 2 of
+    # task 1, saved AFTER the migration + first task-entry sync) has the
+    # full PR-2 schema, so a plain resume is legal; redoing its last
+    # round must reproduce M5's final table bit-exactly.
+    m5_round2 = synth / "legacy_full" / "checkpoints" / "round_0002.pth"
+    assert m5_round2.is_file(), f"M9d: missing {m5_round2}"
+    m5_round2_copy = synth / "m9_inherit" / "checkpoints" / "ckpt.pth"
+    m5_round2_copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(m5_round2, m5_round2_copy)
+    run_main(base + a5_resume + ["--resume", str(m5_round2_copy),
+                                 "--max_rounds", str(total),
+                                 "--a5_proto_lambda", "0.25",
+                                 "--a5_proto_tau", "0.11"],
+             label="M9d: chained resume of migrated run (no flag)")
+    ck_m9d = torch_load_compat(synth / "m9_inherit" / "checkpoints"
+                               / "task_01_end.pth")
+    assert isinstance(ck_m9d.get("a5_proto_migration"), dict), \
+        "M9d: chained resume must INHERIT the migration marker"
+    m9d_state = ck_m9d["a5_proto_state"]
+    assert set(m9d_state["sums"]) == set(m5_state["sums"]) \
+        and m9d_state["counts"] == m5_state["counts"], \
+        "M9d: inherited-marker resume changed the table keys/counts"
+    m9d_diff = max(
+        float((m9d_state["sums"][c] - m5_state["sums"][c]).abs().max())
+        for c in m5_state["sums"])
+    assert m9d_diff == 0.0, \
+        f"M9d: trajectory changed under inheritance (max_diff={m9d_diff})"
+    print(f"[PASS] M9d: marker inherited without flag; trajectory "
+          f"unchanged (sums max_diff={m9d_diff} vs M5)")
+
     print("\nRESULT: PASS (migration guard: default refusal + explicit "
           "migration + schema/version/boundary validation + FedTA/A2 and "
-          "PR-2 resume regressions)")
+          "PR-2 resume regressions + provenance marker + poison rejection)")
 
 
 if __name__ == "__main__":
