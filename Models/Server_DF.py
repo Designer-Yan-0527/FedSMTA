@@ -165,7 +165,16 @@ class Server_DF(object):
             if i % self.global_epoch != self.global_epoch - 1:
                 self.kd_fusion_prompt(self.thisclients)
 
-            self.fed_avg_head(self.thisclients)
+            # HS-N fix switch (default OFF = official behavior, bit-identical):
+            # skip fed_avg_head entirely. The paper (arXiv 2412.18355 Fig. 3 /
+            # Sec. 4.1) defines no head aggregation, the averaged global_head
+            # is only consumed by dead code (evaluate_on_global_testset, zero
+            # call sites), and because all clients share one ViT object the
+            # "average" is a mathematical identity — its only live effect is
+            # the x2^(N-1)/round in-place aliasing corruption of vit.head
+            # (INR_PHASE1_HEAD_DIVERGENCE.md Sec. 4.5).
+            if not getattr(self.args, 'skip_fed_avg_head', False):
+                self.fed_avg_head(self.thisclients)
 
             print('Server aggregation Compelte, results are ()：')
             # Phase 0: collect the (already existing) post-broadcast
@@ -663,6 +672,11 @@ class Server_DF(object):
         "client_num", "task_num", "global_epoch", "local_epoch",
         "lr", "batch_size", "nb_classes", "private_class_num",
         "seed", "threshold", "surrogate_num",
+        # HS-N: resuming across ON/OFF would silently diverge (the
+        # x2^(N-1)/round corruption changes the phase-1 trajectory);
+        # old checkpoints without this key are unaffected (two-sided
+        # membership check below)
+        "skip_fed_avg_head",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):

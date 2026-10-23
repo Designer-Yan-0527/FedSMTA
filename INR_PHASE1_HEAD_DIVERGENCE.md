@@ -97,6 +97,24 @@ i=4→16h。**每轮聚合后活 head 整体 ×16 = 2^(N-1)**；`/5` 只作用�
 Gate 0A 官方 parity（D=0，含 head 状态，5 轮后 head 已 ×16^5）只能在该
 bug 同样存在于官方仓库时通过 → 官方 FedTA 自带此 bug。
 
+**论文规范核对（2026-10-23，arXiv 2412.18355v2 / CVPR 2025 FedTA）**：
+论文中 head 不参与聚合，`fed_avg_head` 是论文中不存在的操作：
+- Fig. 3 上传箭头仅两个：Knowledge Base（input enhancement 参数）与
+  Local Prototypes；MLP Head 留在本地，无 upload 箭头。Introduction 同述：
+  "the server will separately process the parameters added during input
+  enhancement ... and the local prototype"
+- §4.1 定义 scaffold head 为 per-client（"Each client has a classification
+  head used for training input enhancement parameters, H_e^i"）——代码的
+  共享 vit.head 亦偏离论文（该偏离归 HS-S）
+- Table 1 将 head 聚合表述为 FedViT 的特征（"only the classification head
+  is involved in training and aggregation"），非 FedTA 的设计
+- 代码侧：global_head 唯一消费点 `evaluate_on_global_testset` 全仓库零调用
+  （死代码）→ `fed_avg_head` 的唯一净效应 = ×16/轮污染；且因 5 客户端共享
+  同一 ViT 对象，其"平均"在数学上恒等（5 个相同张量求平均 = 自身）
+- 修复形式推论：跳过 fed_avg_head（论文忠实）与修别名（保留调用）对训练
+  轨迹逐位等价（正确平均 = 恒等）；HS-S 的 per-client scaffold head
+  方向与论文本意重合
+
 **动力学平衡（解释 CIFAR 有界 vs INR 失控）：**
 - 每轮 ×16 重标定 vs phase-1 wd-only Adam 侵蚀（~lr/步）形成平衡：
   无 CE 信号的行停在 ~1e-2（中位行实测 8.6e-3）
@@ -108,10 +126,14 @@ bug 同样存在于官方仓库时通过 → 官方 FedTA 自带此 bug。
 - c0-c3（两数据集）：CE 建立量（~lr×步数 ≈ 5）< 后续 4 个客户端的
   侵蚀容量（~4×lr×步数 ≈ 6.4）→ 每轮被完全抹平 → 均匀输出
 
-**伴生发现**：`fed_avg_prompt`（L946-954）有相同的别名模式，会把
-clients[0].prompts 原地改成 Σp（5 份之和），但随后 broadcast
-（get_global_proto_and_head L406 `self.prompts = prompt`）以均值覆盖
-全部客户端 → 瞬态无害（修复设计时需一并评估）。
+**伴生发现（2026-10-23 修正：fed_avg_prompt 为死代码）**：
+`fed_avg_prompt`（L937-958）有相同的别名模式，但全仓库**零调用**——
+prompt 的实际聚合路径是 `kd_fusion_prompt`（SIKF 蒸馏，L166，与论文
+§4.3 一致，任务末轮跳过），此前的"瞬态无害"表述不再需要。`fedavg`
+（L83-99）同样零调用，且其 i=0 分支为 `* w`（乘法生成新张量），
+**写法本身无别名问题**——代码库中存在正确模板但未被采用。
+实际运行的聚合面 = BGPS（论文 §4.4）+ SIKF（论文 §4.3）+
+`fed_avg_head`（论文中不存在）——唯一偏离论文的聚合恰好是有害的那个。
 
 ## 5. 对已有结论的影响
 
@@ -190,10 +212,13 @@ instrumented 重跑不再必要（§4.5 四重验证已闭环）。
 
 - **A2-HS（Head Stabilization）**：修复脚手架头系统。根因定案后
   拆分为两个正交子问题（对应 GPT 的 HS-S / HS-N）：
-  - HS-N（数值）：消除 fed_avg_head 别名累加（×16/轮）——最小干预
-    是对 state_dict 逐客户端 deepcopy 后再求和，或等价地修复别名
+  - HS-N（数值）：**已实现**——`--skip_fed_avg_head` 开关（2026-10-23，
+    方案 A：跳过 fed_avg_head 调用，论文忠实语义；默认 OFF = 官方行为
+    逐位一致，orthogonal to --method）。修别名版本（方案 B）与 A 训练
+    逐位等价，未采用（保留无意义死计算路径）
   - HS-S（结构）：共享 head 串行训练的客户端顺序干扰（最后训练者
     唯一存活）——候选 per-client scaffold head 或激活行独立更新
+    （与论文 §4.1 per-client H_e^i 本意重合）
   两者都必须走新 method 开关：该 bug 是官方基线行为，直接修复会
   改变所有既有结果的归因口径（fedta 与 a2 的全部数据都在此行为下取得）
 - **A2-JE（Joint/deployed-space optimization）**：让真实 Chead 决策

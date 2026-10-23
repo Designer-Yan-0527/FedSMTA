@@ -57,6 +57,7 @@ python main.py datasets_delay \
 | `--surrogate_num` | 20 | 每类代理样本数（仅 cifar100 生效） |
 | `--seed` | 42 | 随机种子 |
 | `--num_workers` / `--device` | 2 / cuda | 加载进程 / 设备 |
+| `--skip_fed_avg_head` | off | **HS-N 修复开关**：跳过 fed_avg_head（论文无 head 聚合，该调用唯一活效应 = ×2^(N-1)/轮别名污染，详见 INR_PHASE1_HEAD_DIVERGENCE.md §4.5）。默认 off = 官方行为逐位一致；与 `--method` 正交，可叠加 fedta / fedta_a2 |
 
 ## 5. 运行管理参数（Phase 0 工程，不影响算法）
 
@@ -268,6 +269,7 @@ python tests/test_observer_invariance.py \
 ## 14. 硬约束（长期有效）
 
 - 不得改动 FedTA loss / optimizer / BGPS / SIKF / FedAvg head / Tail Anchor 结构 / prompt 逻辑 / 联邦划分
+  （例外：`--skip_fed_avg_head` 开关——默认关闭时官方路径逐位不变，开启 = HS-N 论文语义修复，GPT 裁决批准走开关不直接改基线）
 - 活跃路线见 FEDSMTA_ROADMAP.md（A2 接口保护 + A5 共享语义接口 + 外部对比实验）；完整约束清单见 Roadmap §9
 
 ## 16. Phase 4 修复实验（A2 训练臂 + A1 快照评估）

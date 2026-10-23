@@ -114,6 +114,13 @@ def get_args_parser(subparsers):
                                  'anchor rows; both = freeze both. Implemented as post-step '
                                  'restore (= freeze + weight-decay exemption), leaving the '
                                  'official FedTA optimizer untouched.')
+    subparsers.add_argument('--skip_fed_avg_head', action='store_true',
+                            help='HS-N fix (orthogonal to --method, default OFF = official '
+                                 'behavior): skip the fed_avg_head call entirely. The FedTA '
+                                 'paper (arXiv 2412.18355, Fig. 3 / Sec. 4.1) defines no head '
+                                 'aggregation; fed_avg_head\'s only live effect is the '
+                                 'x2^(N-1)/round in-place aliasing corruption of the shared '
+                                 'vit.head (INR_PHASE1_HEAD_DIVERGENCE.md Sec. 4.5).')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
     subparsers.add_argument('--client_num', default=5, type=int,
