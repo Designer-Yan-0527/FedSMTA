@@ -78,12 +78,6 @@ class Server_DF(object):
             self.clients.append(Client_DF(i,self.origin_model,self.model_name,self.global_epoch,self.client_data[i],
                                           self.local_epoch,self.batch_size,self.lr,self.device,self.method,self.class_mask[i],self.args,self.model
                                        ))
-        # Phase 5 A3 (fedta_a3): clients need read access to the public
-        # surrogate pool to build their fixed reference banks. Attribute is
-        # ONLY set for fedta_a3; the frozen fedta baseline is untouched.
-        if self.method == 'fedta_a3':
-            for c in self.clients:
-                c.surrogate_data = self.surrogate_data
         print("Initialization completes")
 
     def fedavg(self, sample_nums):
@@ -669,17 +663,6 @@ class Server_DF(object):
         "client_num", "task_num", "global_epoch", "local_epoch",
         "lr", "batch_size", "nb_classes", "private_class_num",
         "seed", "threshold", "surrogate_num",
-        # Phase 5 A3: a fedta_a3 checkpoint resumed with different A3
-        # hyper-parameters would silently change the constraint (the a3_state
-        # loader inside Client_DF also checks these, fail-closed). Keys are
-        # absent in old baseline checkpoints -> skipped there.
-        "a3_lambda", "a3_tau", "a3_n_ref",
-        "a3_ref_batch_size", "a3_compat_every",
-        # Phase 6 A4: a fedta_a4 checkpoint resumed with a different
-        # a4_lambda would silently change the constraint (the a4_state
-        # loader inside Client_DF also checks this, fail-closed). Key is
-        # absent in old checkpoints -> skipped there.
-        "a4_lambda",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):

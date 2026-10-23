@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 
 from pathlib import Path
@@ -152,53 +151,11 @@ def build_server(args, run_manager=None):
     return myServer
 
 
-def validate_method_args(args):
-    """Phase 5 A3 / Phase 6 A4: fail-fast config validation (method
-    isolation).
-
-    A3 (fedta_a3) and A4 (fedta_a4) are mutually exclusive with A2
-    (fedta_a2) by construction: a single --method choice. A3 never freezes
-    key/anchor rows and does not use the A2 protection-set mask; A4 reuses
-    the A2 protection-set mask and snapshot code but replaces the hard
-    post-step restore with a soft direction loss (key rows only, anchors
-    fully FedTA-trained). The frozen fedta baseline accepts no A3/A4
-    arguments.
-    """
-    if args.method == 'fedta_a4':
-        if getattr(args, 'a4_lambda', None) is None:
-            raise ValueError(
-                "invalid fedta_a4 configuration: --a4_lambda is REQUIRED "
-                "(no working default; set it from "
-                "diagnostics/a4_lambda_probe.py, not by guess)")
-        if not (float(args.a4_lambda) > 0) or not math.isfinite(float(args.a4_lambda)):
-            raise ValueError(
-                "invalid fedta_a4 configuration: --a4_lambda must be a "
-                "finite value > 0")
-        return
-    if args.method != 'fedta_a3':
-        return
-    problems = []
-    if not (float(args.a3_lambda) > 0):
-        problems.append("--a3_lambda must be > 0")
-    if not (float(args.a3_tau) > 0):
-        problems.append("--a3_tau must be > 0")
-    if int(args.a3_n_ref) <= 0:
-        problems.append("--a3_n_ref must be > 0")
-    if int(args.a3_ref_batch_size) <= 0:
-        problems.append("--a3_ref_batch_size must be > 0")
-    if int(args.a3_compat_every) < 1:
-        problems.append("--a3_compat_every must be >= 1")
-    if problems:
-        raise ValueError(
-            f"invalid fedta_a3 configuration: " + "; ".join(problems))
-
-
 def main(args):
     # Phase 0: run directory / tee logging / resume target resolution.
     # Must happen before any training output so everything is logged.
     # (RunManager is RNG-neutral, so its position does not affect the
     # partition RNG stream.)
-    validate_method_args(args)
     run_manager = RunManager(args)
 
     myServer = build_server(args, run_manager=run_manager)

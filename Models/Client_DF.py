@@ -4,13 +4,11 @@ import random
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from timm.optim import create_optimizer
 from torch import nn
 from torch.autograd import Variable
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from tqdm import tqdm
-from PIL import Image
 
 from runtime_utils import module_state_or_none, clone_prompt_template
 
@@ -77,52 +75,6 @@ class Client_DF(object):
             self._a2_anchor_snapshot = None   # frozen anchor rows (arm anchor/both)
             self._a2_task_id = None           # task the current protection belongs to
 
-        # Phase 6 A4 (--method fedta_a4): selective soft key preservation.
-        # Reuses the A2 protection-set infrastructure VERBATIM (identical
-        # emergent-support slot computation, identical task-start key-row
-        # snapshot) but replaces A2's post-step hard restore with a
-        # normalized-direction loss on the protected key rows (see
-        # _a4_dir_loss). Anchor rows are NEVER constrained (fully
-        # FedTA-trained). Attributes are ONLY created for the A4 method;
-        # the frozen fedta baseline keeps its __init__ / checkpoint schema
-        # untouched. A4 is mutually exclusive with A2/A3 by construction
-        # (single --method choice).
-        if method == 'fedta_a4':
-            self.a2_arm = 'key'   # reuse the A2 snapshot code path (key rows only)
-            # fail-closed: NO working default lambda (main.py validates it
-            # first; this is the belt-and-suspenders path for direct
-            # build_server() callers, e.g. diagnostics)
-            _a4_lam = getattr(args, 'a4_lambda', None)
-            if _a4_lam is None:
-                raise RuntimeError(
-                    f"client {self.id}: fedta_a4 requires an explicit "
-                    f"a4_lambda (calibrated by diagnostics/"
-                    f"a4_lambda_probe.py); refusing to run with an "
-                    f"arbitrary default")
-            self.a4_lambda = float(_a4_lam)
-            self._a2_protected_slots = None   # LongTensor: protected slot ids
-            self._a2_key_snapshot = None      # task-start key rows (A4 anchor: detached)
-            self._a2_anchor_snapshot = None   # always None for A4 (anchors unconstrained)
-            self._a2_task_id = None           # task the current protection belongs to
-
-        # Phase 5 A3 (--method fedta_a3): functional routing-consistency state
-        # (A3-KL v1). Attributes are ONLY created for the A3 method; the
-        # frozen fedta baseline keeps its __init__ / checkpoint schema
-        # untouched. A3 is mutually exclusive with A2 by construction (single
-        # --method choice) and never freezes key/anchor rows.
-        if method == 'fedta_a3':
-            self.a3_lambda = float(getattr(args, 'a3_lambda', 3e-7))
-            self.a3_tau = float(getattr(args, 'a3_tau', 60.0))
-            self.a3_n_ref = int(getattr(args, 'a3_n_ref', 256))
-            self.a3_ref_batch_size = int(getattr(args, 'a3_ref_batch_size', 16))
-            self.a3_compat_every = max(1, int(getattr(args, 'a3_compat_every', 1)))
-            # public surrogate pool handle; injected by Server_DF.init_client()
-            self.surrogate_data = None
-            self._a3_task_id = None            # task the current bank belongs to
-            self._a3_ref_raw = None            # raw indices into surrogate_data.data
-            self._a3_teacher_probs = None      # CPU float32 [n_ref, pool_size]
-            self._a3_teacher_top1 = None       # teacher top1 confidence (float)
-
         self.head = Chead(args.nb_classes)
 
 
@@ -161,20 +113,11 @@ class Client_DF(object):
             # only cifar100 / ImageNet-R are supported in this project
             self.get_data(task)
             self.task_id = task
-            # Phase 4 A2 / Phase 6 A4: entering a new task -> recompute the
-            # protected slot set + row snapshots from the CURRENT
-            # (post-previous-task) key / anchor state. No-op for task 0
-            # (empty protection set). A4 shares the A2 mask/snapshot code
-            # (its a2_arm is fixed to 'key'); only the USE of the snapshot
-            # differs (soft direction loss vs post-step restore).
-            if self.method in ('fedta_a2', 'fedta_a4'):
+            # Phase 4 A2: entering a new task -> recompute the protected
+            # slot set + row snapshots from the CURRENT (post-previous-task)
+            # key / anchor state. No-op for task 0 (empty protection set).
+            if self.method == 'fedta_a2':
                 self._a2_init_task_protection(args)
-            # Phase 5 A3: entering a new task -> build the fixed public
-            # surrogate reference bank and the previous-generation routing
-            # teacher (single snapshot BEFORE any local optimization of this
-            # task). No-op / inactive for task 0 (no previous interface).
-            if self.method == 'fedta_a3':
-                self._a3_init_task_bank(args)
 
     def _a2_init_task_protection(self, args):
         """A2: compute the protected slot set and row snapshots at task start.
@@ -287,257 +230,11 @@ class Client_DF(object):
         if self.a2_arm in ('anchor', 'both') and self._a2_anchor_snapshot is not None:
             self.model.anchor_pool.data[self._a2_protected_slots] = self._a2_anchor_snapshot
 
-    def _a4_dir_loss(self):
-        """A4: normalized-direction preservation loss on the protected key
-        rows. Only called when method == 'fedta_a4' with an active
-        protection set.
-
-          L_dir = mean_{i in P} || norm(k_i) - sg(norm(k_i^old)) ||_2^2
-                = mean_{i in P} 2 * (1 - cos(k_i, k_i^old))
-
-        Design (pre-registered):
-          * normalization REUSES Tail_Anchor.l2_normalize (same epsilon
-            floor as the actual routing geometry — never F.normalize);
-          * the task-start snapshot is a detached buffer (no gradient);
-          * gradient flows only into the protected key rows' directions;
-            the radial (norm) component of the base gradient is left
-            unconstrained by the regularizer (it is routing-irrelevant);
-          * anchor rows never appear in the loss (fully FedTA-trained).
-
-        Numerical note: dL_dir/dk passes through the l2-normalization
-        Jacobian ~ 1/||k||, so the gradient scale can be large even for a
-        tiny loss — a4_lambda must be calibrated with the tangential
-        gradient-ratio probe (diagnostics/a4_lambda_probe.py), not from
-        loss magnitudes.
-        """
-        slots = self._a2_protected_slots
-        key = self.model.key.reshape(-1, self.model.key_size)[slots]
-        k_hat = self.model.l2_normalize(key, dim=1)
-        k_old = self._a2_key_snapshot.to(key.dtype)
-        k_old_hat = self.model.l2_normalize(k_old, dim=1)
-        return ((k_hat - k_old_hat) ** 2).sum(dim=1).mean()
-
-    # ------------------------------------------------------------------
-    # Phase 5 A3 (--method fedta_a3): functional routing consistency.
-    # Only called when method == 'fedta_a3'; the frozen fedta baseline
-    # never enters any of these paths.
-    # ------------------------------------------------------------------
-
-    # per-(client, task) sampling seed, identical to
-    # diagnostics/a3_offline_calibration.py
-    A3_SEED_BASE = 9700
-
-    def _a3_fetch_ref_images(self, raw_indices):
-        """Deterministically materialize reference images from the immutable
-        surrogate arrays. Replicates iCIFAR100c.getTrainItem exactly
-        (Image.fromarray(...).convert('RGB') + the deterministic
-        Resize+ToTensor train transform), but indexes the RAW
-        surrogate_data.data / .targets arrays instead of the mutable
-        TrainData buffer — Server.kd_fusion_prompt() calls
-        getTrainData(current classes) every round and would silently
-        re-order the pool index space. Storing raw indices keeps the
-        bank stable across rounds and across resume."""
-        surro = self.surrogate_data
-        xs = [surro.trans(Image.fromarray(surro.data[i]).convert('RGB'))
-              for i in raw_indices]
-        return torch.stack(xs)
-
-    def _a3_init_task_bank(self, args):
-        """A3: build the fixed public surrogate reference bank + the
-        previous-generation routing teacher at task start.
-
-        Called ONCE per task from update_data(), i.e. BEFORE any local
-        optimization of the new task (train() is only invoked after
-        update_data in Server_DF.train_clients). At that moment:
-
-          * self.prompts  = the last broadcast prompt of the PREVIOUS task
-            (get_global_proto_and_head*() stores the server-fused prompt at
-            the end of every round and nothing overwrites it before the next
-            round's update_data) -> the previous-task-end teacher prompt;
-          * self.model.key = the client's own key at the end of the previous
-            task (the key is never aggregated; BGPS/SIKF/fed_avg_head do not
-            touch it) -> the previous-task-end teacher key.
-
-        A2's protection-set mask is deliberately NOT used: offline
-        calibration measured 99.5% (ImageNet-R) / 98.5% (CIFAR-100)
-        protected coverage on the surrogate pool with protected KL ~= full
-        KL, so the full-pool constraint is numerically equivalent while
-        avoiding any replay of historical private train samples.
-
-        RNG-neutral: the reference sampling uses an isolated torch.Generator
-        and the teacher feature pass snapshots/restores ALL RNG streams and
-        module modes (same discipline as _a2_init_task_protection).
-        """
-        self._a3_task_id = self.task_id
-        if self.task_id == 0:
-            # task 0: no previous-generation interface exists; A3 inactive
-            self._a3_ref_raw = None
-            self._a3_teacher_probs = None
-            self._a3_teacher_top1 = None
-            print(f'[A3] client {self.id} task 0: A3 inactive '
-                  f'(no previous-generation interface)')
-            return
-        if self.prompts is None:
-            raise RuntimeError(
-                f'[A3] client {self.id} task {self.task_id}: expected the '
-                f'previous-task-end broadcast prompt as teacher prompt, got '
-                f'None — FedTA broadcast lifecycle broken?')
-        if self.surrogate_data is None:
-            raise RuntimeError(
-                f'[A3] client {self.id}: surrogate_data not injected '
-                f'(Server_DF.init_client must set it for fedta_a3)')
-
-        # RNG-neutral: snapshot ALL RNG streams the feature pass could touch
-        rng_state = {
-            "torch_cpu": torch.get_rng_state(),
-            "torch_cuda_all": (torch.cuda.get_rng_state_all()
-                               if torch.cuda.is_available() else None),
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-        }
-        vit_was_training = self.vit.training
-        orig_was_training = self.original_model.training
-        try:
-            self.original_model.eval()
-            self.vit.eval()
-            self.model.to(self.device)
-            self.vit.to(self.device)
-            # teacher prompt = previous-task-end broadcast prompt
-            self.vit.load_prompts(self.prompts)
-
-            # ---- fixed public reference bank ----
-            # canonical pool ordering == surro.getTrainData(sorted(all
-            # classes)) (what a3_offline_calibration uses), but computed from
-            # the IMMUTABLE underlying arrays; kd_fusion_prompt's later
-            # getTrainData calls therefore cannot shift the index space.
-            surro = self.surrogate_data
-            targets = np.array(surro.targets)
-            classes = sorted({int(t) for t in surro.targets})
-            pool_raw = np.concatenate(
-                [np.where(targets == c)[0] for c in classes])
-            n_pool = int(pool_raw.shape[0])
-            n_ref = min(self.a3_n_ref, n_pool)
-
-            # per-(client, task) seeded sampling, same convention as the
-            # offline diagnostic: 9700 + 100*client_id + task_id
-            gen = torch.Generator()
-            gen.manual_seed(self.A3_SEED_BASE + 100 * self.id + self.task_id)
-            perm = torch.randperm(n_pool, generator=gen)[:n_ref]
-            ref_raw = [int(pool_raw[i]) for i in perm.tolist()]
-
-            # fixed batch grouping: consecutive chunks of ref_batch_size,
-            # never re-shuffled, so teacher and student forward IDENTICAL
-            # batch compositions (FedTA has batchwise prompt behavior)
-            bs = self.a3_ref_batch_size
-
-            # ---- teacher key = previous-task-end key, frozen constant ----
-            old_key = self.model.key.detach().clone()
-
-            # ---- teacher forward over the fixed batches (no grad) ----
-            feats = []
-            for b in range(0, n_ref, bs):
-                x = self._a3_fetch_ref_images(ref_raw[b:b + bs]).to(
-                    self.device, non_blocking=True)
-                with torch.no_grad():
-                    output = self.original_model(x)
-                    cls_features = output['pre_logits']
-                    output = self.vit(x, task_id=self.task_id,
-                                      cls_features=cls_features, train=True)
-                feats.append(output['feat'].to(self.device))
-            feat_old = torch.cat(feats, dim=0)
-
-            # routing exactly as Tail_Anchor.forward: l2-normalized feature
-            # vs l2-normalized key rows (official normalization rule, key
-            # norm floor untouched)
-            x_embed_norm = self.model.l2_normalize(feat_old, dim=1)
-            key = old_key.reshape(-1, self.model.key_size)
-            key_norm = self.model.l2_normalize(key, dim=1)
-            sim_old = torch.matmul(
-                x_embed_norm, key_norm.t().to(x_embed_norm.device))
-            r_old = torch.softmax(self.a3_tau * sim_old, dim=1)
-
-            self._a3_ref_raw = ref_raw
-            self._a3_teacher_probs = r_old.detach().to('cpu', torch.float32)
-            self._a3_teacher_top1 = float(
-                r_old.max(dim=1).values.mean().item())
-
-            print(f'[A3] client {self.id} task={self.task_id} '
-                  f'tau={self.a3_tau:g} lambda={self.a3_lambda:g} '
-                  f'n_ref={n_ref}')
-            print(f'[A3] client {self.id}: teacher routing bank ready '
-                  f'(pool={n_pool}, batches of {bs}, teacher top1 '
-                  f'confidence={self._a3_teacher_top1:.4f})')
-            print('[A3] feature gradient detached: True')
-        finally:
-            # restore ALL RNG streams and module modes (train() never sets
-            # vit.train(); leaving eval() on would silently change training;
-            # original_model is shared across clients, so restored exactly as
-            # found). vit prompt weights are NOT restored here: train() begins
-            # by load_prompts(self.prompts), i.e. the same teacher prompt.
-            self.vit.train(vit_was_training)
-            self.original_model.train(orig_was_training)
-            torch.set_rng_state(rng_state["torch_cpu"])
-            if rng_state["torch_cuda_all"] is not None:
-                torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
-            random.setstate(rng_state["python"])
-            np.random.set_state(rng_state["numpy"])
-
-    def _a3_compat_loss(self, batch_idx):
-        """A3 compatibility term for one fixed reference batch:
-        KL(R_old || R_new) with
-          R_old = softmax(tau * sim(z_old, K_old))   [cached teacher targets]
-          R_new = softmax(tau * sim(sg(z_new), K_new))
-        Gradient path: loss -> log_r_new -> sim_new -> key_norm (l2_normalize
-        of self.model.key: the ONLY trainable tensor in the graph) ;
-        z_new is computed under torch.no_grad() AND .detach()-ed, so no
-        gradient reaches prompts / ViT / anchor / head. The teacher probs are
-        a detached CPU buffer. F.kl_div(log_r_new, r_old, 'batchmean') is
-        KL(R_old || R_new) in the PyTorch convention."""
-        bs = self.a3_ref_batch_size
-        raw = self._a3_ref_raw[batch_idx * bs:(batch_idx + 1) * bs]
-        x = self._a3_fetch_ref_images(raw).to(self.device, non_blocking=True)
-        # student features under the CURRENT in-memory prompts (phase-2 of
-        # train() runs right after phase-1 optimized them); batch composition
-        # identical to the teacher pass of the same batch_idx
-        with torch.no_grad():
-            output = self.original_model(x)
-            cls_features = output['pre_logits']
-            output = self.vit(x, task_id=self.task_id,
-                              cls_features=cls_features, train=True)
-        feat_new = output['feat'].to(self.device).detach()  # sg(z_new)
-
-        # routing exactly as Tail_Anchor.forward (official normalization)
-        x_embed_norm = self.model.l2_normalize(feat_new, dim=1)
-        key = self.model.key.reshape(-1, self.model.key_size)
-        key_norm = self.model.l2_normalize(key, dim=1)  # differentiable w.r.t. key ONLY
-        sim_new = torch.matmul(
-            x_embed_norm, key_norm.t().to(x_embed_norm.device))
-        log_r_new = F.log_softmax(self.a3_tau * sim_new, dim=1)
-
-        teacher = self._a3_teacher_probs[
-            batch_idx * bs:(batch_idx + 1) * bs].to(self.device)
-        return F.kl_div(log_r_new, teacher, reduction='batchmean')
-
-
     def _phase2_train_step(self, input, target, round, args, criterion,
-                           optimizer, a3_active=False, a3_step=0,
-                           a3_n_batches=0):
+                           optimizer):
         """OFFICIAL phase-2 per-batch update, extracted verbatim from
         train(): forward (no_grad original_model + vit) -> base loss ->
-        method regularizer (A3 KL / A4 direction) -> zero_grad/backward/
-        step -> A2 post-step restore.
-
-        Extracted (not copied) so that diagnostics/a4_gate_tests.py S6/S8
-        exercise THE ACTUAL production step — including any post-step
-        logic that may live here in the future — instead of a gate-side
-        re-implementation that could drift from train().
-
-        Returns (base_loss, extra_loss, extra_kind) as detached floats;
-        base_loss is the OFFICIAL loss BEFORE the method regularizer;
-        extra_kind is None / 'kl' / 'dir'. The A3/A4 per-epoch logging
-        accumulators stay in train(); the a3_step cursor is owned by the
-        caller (it advances every batch whether or not the KL was
-        applied this step)."""
+        zero_grad/backward/step -> A2 post-step restore."""
         with torch.no_grad():
             if self.original_model is not None:
                 output = self.original_model(input)
@@ -577,35 +274,6 @@ class Client_DF(object):
             print(loss_InfoNCE)
             print(criterion(logits, target))
 
-        base_f = float(loss.detach())
-        extra, extra_kind = None, None
-        # Phase 5 A3 (fedta_a3): add the routing-consistency KL
-        # KL(R_old || R_new) on one fixed public reference batch to
-        # the OFFICIAL phase-2 loss. The official loss / optimizer /
-        # weight decay are untouched; only the key receives
-        # compatibility gradient (features detached inside).
-        if a3_active and a3_step % self.a3_compat_every == 0:
-            batch_idx = a3_step % a3_n_batches
-            loss_kl = self._a3_compat_loss(batch_idx)
-            loss = loss + self.a3_lambda * loss_kl
-            extra, extra_kind = float(loss_kl.detach()), 'kl'
-
-        # Phase 6 A4 (fedta_a4): add the normalized-direction
-        # preservation term on the protected key rows to the OFFICIAL
-        # phase-2 loss. The official loss / optimizer / weight decay are
-        # untouched; the anchor rows never appear in the regularizer
-        # (fully FedTA-trained), and the radial (norm) direction of the
-        # protected key rows is left free (routing uses normalized keys
-        # only). Same predicate as train()'s a4_active.
-        a4_active = (self.method == 'fedta_a4'
-                     and self._a2_protected_slots is not None
-                     and self._a2_key_snapshot is not None
-                     and self._a2_task_id == self.task_id)
-        if a4_active:
-            loss_dir = self._a4_dir_loss()
-            loss = loss + self.a4_lambda * loss_dir
-            extra, extra_kind = float(loss_dir.detach()), 'dir'
-
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -613,7 +281,6 @@ class Client_DF(object):
         # Tail_Anchor step. No-op for the frozen fedta baseline.
         if self.method == 'fedta_a2':
             self._a2_post_step_restore()
-        return base_f, extra, extra_kind
 
 
     def train(self, round, args):
@@ -671,85 +338,15 @@ class Client_DF(object):
         # self.evaluate_only_prompts(self.task_id,args.nb_classes)
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-03)
-        # Phase 5 A3 (fedta_a3): per-train()-call reference-batch cursor. It
-        # restarts at 0 every round (checkpoints are round-boundary state), so
-        # a resumed run reproduces the exact reference-batch sequence of an
-        # uninterrupted run without persisting the cursor. Inactive for the
-        # frozen fedta baseline.
-        a3_step = 0
-        # safe default: only consumed inside _phase2_train_step when
-        # a3_active (the fedta_a3 branch overwrites it right below);
-        # the hoisting of a3_n_batches into an unconditional call
-        # argument made the old lazy initialization an
-        # UnboundLocalError for every non-A3 method
-        a3_n_batches = 0
-        a3_active = (self.method == 'fedta_a3'
-                     and self._a3_teacher_probs is not None
-                     and self._a3_task_id == self.task_id)
-        # Phase 6 A4 (fedta_a4): the direction regularizer is active from
-        # task 1 onward whenever the protection set exists and belongs to
-        # the current task (task 0 has an empty protection set, exactly
-        # like A2). Inactive for every other method.
-        a4_active = (self.method == 'fedta_a4'
-                     and self._a2_protected_slots is not None
-                     and self._a2_key_snapshot is not None
-                     and self._a2_task_id == self.task_id)
-        if a3_active:
-            a3_n_batches = ((len(self._a3_ref_raw)
-                             + self.a3_ref_batch_size - 1)
-                            // self.a3_ref_batch_size)
-        a3_epoch_acc = None
-        a4_epoch_acc = None
         for epoch in tqdm(range(self.local_epoch)):
-            if a3_active:
-                a3_epoch_acc = {"base": [], "kl": [], "lam_kl": []}
-            if a4_active:
-                a4_epoch_acc = {"base": [], "dir": [], "lam_dir": []}
             for iteration, (input, target) in enumerate(train_loader):
                 input, target = Variable(input, requires_grad=False).to(self.device, non_blocking=True), target.long().to(
                     self.device, non_blocking=True)
 
                 # OFFICIAL phase-2 single-batch update (forward -> base
-                # loss -> A3/A4 regularizer -> optimizer step -> A2
-                # post-step restore), shared verbatim with the A4 gate
-                base_f, extra_f, extra_kind = self._phase2_train_step(
-                    input, target, round, args, criterion, optimizer,
-                    a3_active=a3_active, a3_step=a3_step,
-                    a3_n_batches=a3_n_batches)
-                a3_step += 1
-                if a3_epoch_acc is not None and extra_kind == 'kl':
-                    a3_epoch_acc["base"].append(base_f)
-                    a3_epoch_acc["kl"].append(extra_f)
-                    a3_epoch_acc["lam_kl"].append(
-                        float(self.a3_lambda) * extra_f)
-                if a4_epoch_acc is not None and extra_kind == 'dir':
-                    a4_epoch_acc["base"].append(base_f)
-                    a4_epoch_acc["dir"].append(extra_f)
-                    a4_epoch_acc["lam_dir"].append(
-                        float(self.a4_lambda) * extra_f)
-
-            # Phase 5 A3: per-local-epoch logging (means over this epoch's
-            # constrained steps; teacher top1 confidence is a fixed property
-            # of the cached teacher targets)
-            if a3_epoch_acc is not None and a3_epoch_acc["kl"]:
-                m_base = sum(a3_epoch_acc["base"]) / len(a3_epoch_acc["base"])
-                m_kl = sum(a3_epoch_acc["kl"]) / len(a3_epoch_acc["kl"])
-                m_lkl = sum(a3_epoch_acc["lam_kl"]) / len(a3_epoch_acc["lam_kl"])
-                print(f'[A3] client {self.id} task {self.task_id} epoch {epoch}: '
-                      f'base_loss={m_base:.4f} compat_kl={m_kl:.4f} '
-                      f'lam*kl={m_lkl:.3e} '
-                      f'teacher_top1={self._a3_teacher_top1:.4f}')
-
-            # Phase 6 A4: per-local-epoch logging (means over this epoch's
-            # constrained steps), mirroring the A3 discipline
-            if a4_epoch_acc is not None and a4_epoch_acc["dir"]:
-                m_base = sum(a4_epoch_acc["base"]) / len(a4_epoch_acc["base"])
-                m_dir = sum(a4_epoch_acc["dir"]) / len(a4_epoch_acc["dir"])
-                m_ldir = sum(a4_epoch_acc["lam_dir"]) / len(a4_epoch_acc["lam_dir"])
-                print(f'[A4] client {self.id} task {self.task_id} epoch {epoch}: '
-                      f'base_loss={m_base:.4f} dir_loss={m_dir:.4f} '
-                      f'lam*dir={m_ldir:.3e} '
-                      f'n_protected={self._a2_protected_slots.numel()}')
+                # loss -> optimizer step -> A2 post-step restore)
+                self._phase2_train_step(input, target, round, args,
+                                        criterion, optimizer)
 
 
         target_list = []
@@ -1045,46 +642,8 @@ class Client_DF(object):
         # instead of recomputing it from the already-drifted state.)
         if self.method == 'fedta_a2':
             state["a2_state"] = self._a2_state_for_checkpoint()
-        # Phase 6 A4: same discipline (mid-task resume must restore the
-        # task-start snapshot instead of recomputing it from the
-        # already-drifted state).
-        elif self.method == 'fedta_a4':
-            state["a4_state"] = self._a4_state_for_checkpoint()
-
-        # Phase 5 A3 routing-consistency state. Key is ONLY added for
-        # fedta_a3 so the frozen fedta baseline keeps a bit-identical
-        # checkpoint schema. (Required so a mid-task resume restores the
-        # task-start teacher targets + reference bank instead of
-        # re-sampling another bank.)
-        if self.method == 'fedta_a3':
-            state["a3_state"] = self._a3_state_for_checkpoint()
 
         return state
-
-    def _a3_state_for_checkpoint(self):
-        """Serialize A3 routing-consistency state; always a dict for
-        fedta_a3, never called for the fedta baseline (schema untouched).
-
-        Contents: the task the bank belongs to, the raw surrogate reference
-        indices (== the fixed batch grouping, consecutive chunks of
-        ref_batch_size), the cached teacher routing probabilities, the
-        teacher top1 confidence, and the hyper-parameters for fail-closed
-        resume validation."""
-        if self.method != 'fedta_a3':
-            return None
-        return {
-            "task_id": self._a3_task_id,
-            "ref_raw_indices": (None if self._a3_ref_raw is None
-                                else list(self._a3_ref_raw)),
-            "teacher_probs": (None if self._a3_teacher_probs is None
-                              else self._a3_teacher_probs.detach().cpu()),
-            "teacher_top1": self._a3_teacher_top1,
-            "tau": self.a3_tau,
-            "lambda": self.a3_lambda,
-            "n_ref": self.a3_n_ref,
-            "ref_batch_size": self.a3_ref_batch_size,
-            "compat_every": self.a3_compat_every,
-        }
 
     def _a2_state_for_checkpoint(self):
         """Serialize A2 protection state; always a dict for fedta_a2,
@@ -1158,153 +717,6 @@ class Client_DF(object):
         self._a2_anchor_snapshot = (None if anchor_snap is None
                                     else anchor_snap.to(self.device))
 
-    def _a4_state_for_checkpoint(self):
-        """Serialize A4 soft-preservation state; always a dict for
-        fedta_a4, never called for the other methods (schema untouched).
-
-        Contents: an explicit method marker (so an A2 a2_state can never be
-        mistaken for an a4_state), the calibrated lambda (fail-closed
-        resume validation), the task the snapshot belongs to, and the
-        protected slot ids + task-start key rows."""
-        if self.method != 'fedta_a4':
-            return None
-        return {
-            "method": "fedta_a4",
-            "a4_lambda": self.a4_lambda,
-            "task_id": self._a2_task_id,
-            "protected_slots": (None if self._a2_protected_slots is None
-                                else self._a2_protected_slots.cpu().tolist()),
-            "key_snapshot": (None if self._a2_key_snapshot is None
-                             else self._a2_key_snapshot.detach().cpu()),
-        }
-
-    def _a4_load_checkpoint_state(self, state):
-        """Restore A4 soft-preservation state, FAIL-CLOSED.
-
-        A fedta_a4 resume from a checkpoint without a4_state (or with a
-        state written by another method) would silently continue without
-        the direction constraint or with a wrong snapshot. Same failure
-        class as the A2/A3 discipline: the state MUST exist and be
-        internally consistent, or we refuse.
-        """
-        if self.method != 'fedta_a4':
-            return
-        a4 = state.get("a4_state")
-        if not a4:
-            raise RuntimeError(
-                f"client {self.id}: fedta_a4 resume requires a4_state in "
-                f"the checkpoint, got "
-                f"{'missing key' if 'a4_state' not in state else 'None/empty'}"
-                f" — refusing to silently continue without the direction "
-                f"constraint (fail-closed; re-run from scratch or use a "
-                f"fedta_a4 checkpoint)")
-        if a4.get("method") != 'fedta_a4':
-            raise RuntimeError(
-                f"client {self.id}: a4_state method marker mismatch "
-                f"(checkpoint={a4.get('method')!r}) — corrupted or "
-                f"wrong-method checkpoint; refusing to continue")
-        # fail-closed hyper-parameter consistency (exact match: identical
-        # CLI parse -> identical float)
-        if float(a4.get("a4_lambda", -1.0)) != self.a4_lambda:
-            raise RuntimeError(
-                f"client {self.id}: A4 lambda mismatch on resume "
-                f"(checkpoint={a4.get('a4_lambda')}, "
-                f"current={self.a4_lambda})")
-        if a4.get("task_id") != state.get("task_id"):
-            raise RuntimeError(
-                f"client {self.id}: A4 protection task_id "
-                f"({a4.get('task_id')}) != checkpoint task_id "
-                f"({state.get('task_id')}); corrupted a4_state")
-        self._a2_task_id = a4.get("task_id")
-        slots = a4.get("protected_slots")
-        self._a2_protected_slots = (None if slots is None
-                                    else torch.tensor(slots, dtype=torch.long,
-                                                      device=self.device))
-        key_snap = a4.get("key_snapshot")
-        if slots is not None:
-            n = len(slots)
-            if key_snap is None or key_snap.shape[0] != n:
-                raise RuntimeError(
-                    f"client {self.id}: fedta_a4 requires a key_snapshot "
-                    f"with {n} rows, got "
-                    f"{'None' if key_snap is None else key_snap.shape[0]}")
-        self._a2_key_snapshot = (None if key_snap is None
-                                 else key_snap.to(self.device))
-        self._a2_anchor_snapshot = None  # A4 never constrains anchors
-
-    def _a3_load_checkpoint_state(self, state):
-        """Restore A3 routing-consistency state, FAIL-CLOSED.
-
-        A fedta_a3 resume from a checkpoint without a3_state would silently
-        continue without the constraint (or re-sample another reference
-        bank), both wrong. The state MUST exist and be internally consistent,
-        or we refuse. Same failure class as the A2 discipline.
-
-        Task-boundary resume (checkpoint = last round of task t, next round
-        enters task t+1) is handled by update_data(): the restored bank of
-        task t is overwritten by a DETERMINISTIC rebuild at the t+1 transition
-        (same seed, same previous-task-end prompt/key from the checkpoint),
-        so no re-sampling can occur there either.
-        """
-        if self.method != 'fedta_a3':
-            return
-        a3 = state.get("a3_state")
-        ckpt_task = state.get("task_id")
-        if not a3:
-            raise RuntimeError(
-                f"client {self.id}: fedta_a3 resume requires a3_state in the "
-                f"checkpoint, got "
-                f"{'missing key' if 'a3_state' not in state else 'None/empty'}"
-                f" — refusing to silently continue without the routing "
-                f"constraint or with a re-sampled reference bank (fail-closed;"
-                f" re-run from scratch or use a fedta_a3 checkpoint)")
-        if a3.get("task_id") != ckpt_task:
-            raise RuntimeError(
-                f"client {self.id}: A3 bank task_id ({a3.get('task_id')}) != "
-                f"checkpoint task_id ({ckpt_task}); corrupted a3_state")
-        # fail-closed hyper-parameter consistency (exact match: identical
-        # CLI parse -> identical float)
-        for key, cur in (("tau", self.a3_tau),
-                         ("lambda", self.a3_lambda),
-                         ("n_ref", self.a3_n_ref),
-                         ("ref_batch_size", self.a3_ref_batch_size),
-                         ("compat_every", self.a3_compat_every)):
-            if a3.get(key) != cur:
-                raise RuntimeError(
-                    f"client {self.id}: A3 {key} mismatch on resume "
-                    f"(checkpoint={a3.get(key)}, current={cur})")
-        if ckpt_task == 0:
-            # task 0: bank must be empty by design (A3 inactive)
-            if (a3.get("ref_raw_indices") is not None
-                    or a3.get("teacher_probs") is not None):
-                raise RuntimeError(
-                    f"client {self.id}: task-0 a3_state must carry an empty "
-                    f"bank, got non-None indices/probs; corrupted a3_state")
-            self._a3_task_id = 0
-            self._a3_ref_raw = None
-            self._a3_teacher_probs = None
-            self._a3_teacher_top1 = None
-            return
-        idx = a3.get("ref_raw_indices")
-        probs = a3.get("teacher_probs")
-        if not idx or probs is None or probs.dim() != 2 \
-                or probs.shape[0] != len(idx):
-            raise RuntimeError(
-                f"client {self.id}: a3_state bank corrupted "
-                f"(indices={0 if not idx else len(idx)}, "
-                f"probs={None if probs is None else tuple(probs.shape)})")
-        if probs.shape[1] != self.model.key.reshape(-1, self.model.key_size).shape[0]:
-            raise RuntimeError(
-                f"client {self.id}: a3_state teacher_probs width "
-                f"{probs.shape[1]} != key pool size")
-        self._a3_task_id = ckpt_task
-        self._a3_ref_raw = [int(i) for i in idx]
-        self._a3_teacher_probs = probs.to('cpu', torch.float32)
-        self._a3_teacher_top1 = a3.get("teacher_top1")
-        print(f'[A3] client {self.id}: restored reference bank for task '
-              f'{ckpt_task} from checkpoint (n_ref={len(self._a3_ref_raw)}, '
-              f'teacher targets bit-identical, indices unchanged)')
-
     def load_checkpoint_state(self, state):
         if state["id"] != self.id:
             raise ValueError(
@@ -1351,14 +763,6 @@ class Client_DF(object):
         # Phase 4 A2: restore protection snapshot AFTER task_id is restored,
         # so update_data() does not recompute it mid-task.
         self._a2_load_checkpoint_state(state)
-
-        # Phase 6 A4: restore the task-start key snapshot AFTER task_id is
-        # restored, so update_data() does not recompute it mid-task.
-        self._a4_load_checkpoint_state(state)
-
-        # Phase 5 A3: restore the reference bank + teacher targets AFTER
-        # task_id is restored, so update_data() does not rebuild it mid-task.
-        self._a3_load_checkpoint_state(state)
 
     def rebuild_data_from_indices(self):
         """Rebuild test_loader[0..task_id] and the current traindata from the
