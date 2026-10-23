@@ -1,8 +1,9 @@
 # INR Phase-1 Scaffold Head 数值发散（独立 P0 机制问题）
 
-状态: 已证实（checkpoint 证据），病因未定（round 粒度证据缺失，见 §6）
+状态: **根因已定位**（fed_avg_head 原地别名累加，见 §4.5；2026-10-23 定案）
 首次发现: 2026-10-23，A2-JE 梯度一致性探针（commit a420d90）结果追查
-影响范围: ImageNet-R 全部 run（fedta 基线与 fedta_a2，逐位相同）；CIFAR-100 不受影响
+影响范围: ImageNet-R 全部 run（fedta 基线与 fedta_a2，逐位相同）；CIFAR-100
+全部 run 同样触发（有界不发散）；官方 FedTA 代码自带（初始提交 d4756ae 未改）
 基线约束: FedTA/A2 冻结不动；任何修复走新 method 开关（见 §8）
 
 ## 1. 现象
@@ -52,12 +53,65 @@ phase-1 的 CE 对 logits 做 task mask（`index_fill(-inf)` 于非当前类）�
 | c0-c3 | ≈ ln(8) = 2.0794（8 类均匀） | 0.001-0.02 | 类内 logits≈0，G1 近噪声 |
 | c4 | 1200-3200 | 24000-44000 | 类内 logits 达 1.6e4，高置信全错 |
 
-机制候选（未单独证实）：任务末 head = 本轮最后训练的客户端（c4）
-phase-1 留下的状态；c0-c3 的类内行在后续 4 客户端 × 30 epoch 的
-weight decay 下衰减归零。"×10^6/task" 的确切来源（逐轮稳定倍增 vs
-跨 task 跳变）未知——见 §6 限制。
-
+机制（§4.5 根因定案后的完整链条，§7 CIFAR 证据支持）：任务末 head =
+本轮最后训练的客户端（c4）phase-1 留下的状态；c0-c3 的类内行在同一轮内
+被后续 4 个客户端的 phase-1（wd-only Adam，每步 ~lr 侵蚀）抹回
+~1e-3 平衡态，×16 轮末重标定后停留 ~1e-2 → logits≈0 → 均匀输出。
 对照：G4（部署 Chead CE 对 prompt 的梯度）全部客户端量级健康（0.26-5.7）。
+
+## 4.5 根因（已证实）：fed_avg_head 原地别名累加
+
+`Server_DF.fed_avg_head`（[Server_DF.py L962-982](Models/Server_DF.py)，
+初始提交 d4756ae 原文，fork 未改）：
+
+```python
+heads = []
+for i in chosen_clients:
+    heads.append(self.clients[i].vit.head)   # 5 个引用指向同一共享对象
+result_head = deepcopy(heads[0].state_dict())
+for k in result_head.keys():
+    for i in range(len(heads)):
+        local_model_params = heads[i].state_dict()   # 返回活引用
+        if i == 0:
+            result_head[k] = local_model_params[k]   # 覆盖 deepcopy，绑到活张量
+        else:
+            result_head[k] += local_model_params[k]  # 原地累加同一个张量!
+    result_head[k] = result_head[k] / len(chosen_clients)  # 非原地，生成新张量
+```
+
+因为 5 个客户端共享同一个 ViT 对象（init_client L78-79 传同一 `self.model`），
+`state_dict()` 返回的都是同一批活张量：i=1 时 h+=h→2h，i=2→4h，i=3→8h，
+i=4→16h。**每轮聚合后活 head 整体 ×16 = 2^(N-1)**；`/5` 只作用于新张量，
+故 global_head = 16h/5 = 3.2h。
+
+**四重独立验证：**
+1. 纯 torch 最小复现（5 个引用同一 Linear，逐行复刻上述代码）：
+   活 head=16.0，global_head=3.20，比值 5.000
+2. 全部 checkpoint 实测 server_head/global_head 最大行比值 = **5.000**
+   （INR fedta / INR fedta_a2 / CIFAR a2_key，全部 task_end）
+3. 逐任务倍率精确 = 2^20 = 1.05e6（= 16^5，5 轮/任务）：
+   6.65e4→6.98e10→7.32e16→7.67e22→8.04e28，每步比值 1.048-1.050e6
+4. 初始规模吻合：Linear 初始化 |W|max≈0.06 × 16^5 ≈ 6.3e4 ≈ T0 实测 6.65e4
+
+**出处**：`git log -L` 确认该函数自初始提交（官方 FedTA 导入）未改动；
+Gate 0A 官方 parity（D=0，含 head 状态，5 轮后 head 已 ×16^5）只能在该
+bug 同样存在于官方仓库时通过 → 官方 FedTA 自带此 bug。
+
+**动力学平衡（解释 CIFAR 有界 vs INR 失控）：**
+- 每轮 ×16 重标定 vs phase-1 wd-only Adam 侵蚀（~lr/步）形成平衡：
+  无 CE 信号的行停在 ~1e-2（中位行实测 8.6e-3）
+- c4（每轮最后训练）：其 8 行在保存前刚被 CE 重建，唯一存活者
+- CIFAR：c4 的 CE 快速拟合（CE 0.28-0.95）→ 自身 phase 后期 wd 主导
+  侵蚀 → 与 ×16 平衡 → 停在 ~46（log10=1.66，跨任务稳定）
+- INR：c4 的 CE 永不拟合（T4 CE≈2900，高置信全错）→ CE 步进持续
+  累积 → ×16 逐轮复合 → 失控至 1e28+
+- c0-c3（两数据集）：CE 建立量（~lr×步数 ≈ 5）< 后续 4 个客户端的
+  侵蚀容量（~4×lr×步数 ≈ 6.4）→ 每轮被完全抹平 → 均匀输出
+
+**伴生发现**：`fed_avg_prompt`（L946-954）有相同的别名模式，会把
+clients[0].prompts 原地改成 Σp（5 份之和），但随后 broadcast
+（get_global_proto_and_head L406 `self.prompts = prompt`）以均值覆盖
+全部客户端 → 瞬态无害（修复设计时需一并评估）。
 
 ## 5. 对已有结论的影响
 
@@ -77,18 +131,18 @@ c4 的 G1 被爆炸 head 主导。原始 JE 前提在 INR 上无法干净检验�
 可恢复空间；当前证据提示 FedTA 的两阶段目标设计与 INR-specific
 phase-1 head 病态都可能贡献这一差距，尚不能完全归因于端到端目标函数。**
 
-## 6. Round-trajectory audit 的证据限制
+## 6. Round-trajectory audit：已被 §4.5 根因定案取代（原证据限制记录）
 
 本 run 只有 task_end 级 checkpoint（5 个）+ latest（=task_04_end），
-**没有逐轮 checkpoint**；train.log 与 round_metrics.jsonl 也不含
-head 范数。因此以下问题现有证据无法回答：
+无逐轮 checkpoint。原计划回答的三个问题现状：
 
-1. 发散从 T0 第几个 round 开始
-2. client 0→4 顺序效应（C0 rows↑ → C1 训练后 C0 rows↓ → … → C4 存活）是否存在
-3. ×10^6/task 来自逐轮稳定倍增还是跨 task 跳变
+1. 发散从何时开始 → **已回答**：从第 1 轮聚合起（×16/轮是构造性的，
+   初始 |W|max≈0.06 × 16^5 ≈ T0 实测 6.65e4）
+2. client 顺序效应是否存在 → **已回答**：是（§4 动力学 + §7 CIFAR
+   行为证据；c4 唯一存活 = 最后训练 + 保存前 CE 重建）
+3. ×10^6/task 的来源 → **已回答**：2^20 = 16^5，逐轮 ×2^(N-1) 精确复合
 
-如需 round 粒度证据，需 instrumented 重跑（仅加 head-norm 日志，
-不改训练逻辑），须另行评审批准。
+instrumented 重跑不再必要（§4.5 四重验证已闭环）。
 
 ## 7. CIFAR-100 对照 JE probe 结果（2026-10-23，已完成）
 
@@ -106,18 +160,20 @@ head 范数。因此以下问题现有证据无法回答：
 
 *号为 G1 近零（均匀退化），其 cos 为噪声，不具解读价值。
 
-### 7.1 跨数据集的结构性发现（比 INR 爆炸更根本）
+### 7.1 跨数据集的结构性发现（根因定案前记录，机制解释见 §4.5）
 
-**ln(8) 均匀退化不是 INR 特有，而是共享 head 串行训练的结构性质**：
-CIFAR（head 完全健康）上同样出现——c4（本轮最后训练的客户端）
-head 行拟合良好（CE 0.28/0.95），而部分其他客户端（T0 的 c1/c2，
-T4 的 c2/c3）类内行被后续客户端 × 30 epoch weight decay 抹平到
-均匀输出（CE 精确 = ln(8)，G1→0）。
+**ln(8) 均匀退化不是 INR 特有**：CIFAR（head 有界、无发散）上同样出现
+——c4（本轮最后训练的客户端）head 行拟合良好（CE 0.28/0.95），而部分
+其他客户端（T0 的 c1/c2，T4 的 c2/c3）类内行 CE 精确 = ln(8)（G1→0）。
+注意：CIFAR 并非"无 bug"——×16/轮同样活跃（ratio=5.000 实测），
+只是 CE-拟合动力学与重标定达到有界平衡（§4.5）。
 
-即脚手架系统有两层缺陷：
+结构性两层缺陷（现均可归因到 §4.5 根因 + 共享 head 串行训练）：
 1. **结构性（两数据集共有）**：单个共享 head 串行服务 5 个客户端的
-   不相交 8 类 mask，非最后训练的客户端行被 weight decay 抹平
-2. **INR 特有**：在此结构上权重再指数爆炸（×10^6/task）
+   不相交 8 类 mask，非最后训练的客户端行被同一轮内后续 phase 的
+   wd 侵蚀抹平（建立量 < 侵蚀容量）
+2. **数值性（INR 放大）**：fed_avg_head ×16/轮重标定在 CE 不拟合
+   条件下复合失控（×2^20/任务）
 
 ### 7.2 机制鉴别结论（对 GPT 裁决表）
 
@@ -132,12 +188,21 @@ T4 的 c2/c3）类内行被后续客户端 × 30 epoch weight decay 抹平到
 
 ## 8. 后续候选（严格分离，禁止合并归因）
 
-- **A2-HS（Head Stabilization）**：仅修 phase-1 脚手架头数值稳定性，
-  保留两阶段范式。回答：phase-1 目标恢复健康后，当前任务 CA 能否提升。
+- **A2-HS（Head Stabilization）**：修复脚手架头系统。根因定案后
+  拆分为两个正交子问题（对应 GPT 的 HS-S / HS-N）：
+  - HS-N（数值）：消除 fed_avg_head 别名累加（×16/轮）——最小干预
+    是对 state_dict 逐客户端 deepcopy 后再求和，或等价地修复别名
+  - HS-S（结构）：共享 head 串行训练的客户端顺序干扰（最后训练者
+    唯一存活）——候选 per-client scaffold head 或激活行独立更新
+  两者都必须走新 method 开关：该 bug 是官方基线行为，直接修复会
+  改变所有既有结果的归因口径（fedta 与 a2 的全部数据都在此行为下取得）
 - **A2-JE（Joint/deployed-space optimization）**：让真实 Chead 决策
   反向塑形 prompt。回答：即使脚手架健康，直接绑定部署边界是否仍更好。
+  注意 §4.5 定案后，JE 的动机更强：phase-1 在两数据集上对 4/5 客户端
+  的 prompt 仅有噪声级 CE 信号（均匀头），prompt 实际由 reduce_sim
+  和 SGD 噪声主导；唯一有效信号（c4）在 INR 上还是病态的。
 
-两者实现前必须先完成 §6/§7 的病因与机制鉴别。JE 设计问题清单
+两者实现前必须完成 GPT 裁定的机制鉴别与设计评审。JE 设计问题清单
 （不写死实现）：替换还是联合 phase-1 CE；更新哪些参数块；
 G4/G1 的 100-1000× 尺度差处理；InfoNCE/pull_off2 是否反传 prompt；
 30+30 epoch 等预算口径；scaffold head 去留；CIFAR/INR 同一冻结方案。
