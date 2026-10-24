@@ -55,6 +55,25 @@ class MetricsRecorder(object):
         self.metrics_dir.mkdir(parents=True, exist_ok=True)
         self.records_path = self.metrics_dir / "records.jsonl"
         self.records = []
+        # Resume-safe: records.jsonl is the append-only source of truth.
+        # Load any existing records on init so that a resumed run
+        # (--resume auto after e.g. an OOM kill) flushes the FULL matrix
+        # (pre-interruption rows + new rows) instead of truncating the
+        # rewritten CSVs to only the post-resume rows. Mirrors the
+        # main-line RunManager.load_accuracy_records() semantics.
+        # record() appends only NEW rows to records.jsonl, so reloading
+        # never duplicates anything.
+        if self.records_path.is_file():
+            with open(self.records_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        self.records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        # torn tail line from a mid-write crash; drop it
+                        continue
 
         meta = dict(meta or {})
         meta.update({
