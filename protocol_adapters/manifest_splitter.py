@@ -224,6 +224,50 @@ def patch_client_train_nb_classes_bug():
     Client_DF.train = mod.train
 
 
+def patch_init_local_prompt_pool_size():
+    """Official-repo bug fix #4 (NOT a protocol change): VisionTransformer.
+    init_local_prompt constructs the per-class Local_Prompt pool with a
+    hardcoded pool_size=100 (a CIFAR-100 leftover), while Client_DF.train's
+    local-prompt phase feeds GLOBAL class labels as the pool index
+    (class_id=target -> prompt_mask -> Local_Prompt.forward's
+    `self.prompt[:, :, idx]`). Labels >= 100 (ImageNet-R: 0..199) index out
+    of bounds -> CUDA device-side assert (`index out of bounds`) on the
+    very first local-prompt batch (the global-prompt phase, which does not
+    pass class_id, completes normally).
+
+    Fix: replace the hardcoded 100 with self.num_classes (the head width,
+    the exact range the class labels span). At nb_classes=100 (cifar100)
+    this is a bit-identical no-op; at nb_classes=200 (ImageNet-R) it
+    finishes the route the official repo left unfinished — same family as
+    the 'imagenetr' Client_DF identifiers and the np.arange(200) local
+    mask in Client_DF.train (CIFAR/INR leftovers in opposite directions).
+
+    The OTHER pool_size=100 in VisionTransformer.__init__ (delay branch)
+    is deliberately NOT touched: that module is dead code for this route —
+    main.py/_main_inr call model.init_local_prompt() right after
+    construction, which REPLACES it (and patching it would perturb the
+    official RNG stream for zero runtime effect)."""
+    import inspect
+    import textwrap
+    from Models.vision_transformer import VisionTransformer
+
+    src = textwrap.dedent(inspect.getsource(
+        VisionTransformer.init_local_prompt))
+    bad = "pool_size=100,"
+    good = "pool_size=self.num_classes,"
+    if bad not in src:
+        raise RuntimeError(
+            "FedMGP VisionTransformer.init_local_prompt no longer contains "
+            f"the hardcoded {bad!r}; re-audit the official repo before "
+            "patching")
+    fixed = src.replace(bad, good)
+
+    mod = sys.modules[VisionTransformer.__module__]
+    exec(compile(fixed, "<VisionTransformer.init_local_prompt pool_size "
+                 "bugfix>", "exec"), vars(mod))
+    VisionTransformer.init_local_prompt = mod.init_local_prompt
+
+
 def patch_customed_subset_pil():
     """Official-repo bug fix #2 (NOT a protocol change): FedMGP's
     CustomedSubset.__getitem__ has the PIL conversion commented out

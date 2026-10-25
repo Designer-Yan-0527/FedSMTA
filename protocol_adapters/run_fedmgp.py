@@ -437,6 +437,7 @@ def main():
         manifest_splitter.patch_spliter()
         manifest_splitter.patch_client_get_data()
         manifest_splitter.patch_client_train_nb_classes_bug()
+        manifest_splitter.patch_init_local_prompt_pool_size()
         manifest_splitter.patch_client_train_update_data()
         manifest_splitter.patch_customed_subset_pil()
         print("[protocol-adapter] applied: manifest spliter injection, inner "
@@ -446,7 +447,10 @@ def main():
               "commented out in the official repo; restored), bug fix 3 "
               "(local-prompt phase hardcodes np.arange(200) -> CUDA assert on "
               "100-class logits; replaced with args.nb_classes, matching the "
-              "global phase of the same method)")
+              "global phase of the same method), bug fix 4 (init_local_prompt "
+              "hardcodes pool_size=100 while class labels index the pool; "
+              "replaced with self.num_classes — bit-identical at cifar100's "
+              "nb_classes=100)")
         inr_spliter = None
     elif dataset == "ImageNet-R":
         # INR route: the official repo has no INR spliter/config/main
@@ -459,6 +463,7 @@ def main():
         inr_spliter = manifest_splitter.patch_imagenet_r_spliter()
         manifest_splitter.patch_client_get_data()
         manifest_splitter.patch_client_train_nb_classes_bug()
+        manifest_splitter.patch_init_local_prompt_pool_size()
         manifest_splitter.patch_client_train_update_data()
         manifest_splitter.patch_server_init_client_imagenetr()
         print("[protocol-adapter] applied (ImageNet-R): manifest "
@@ -466,7 +471,11 @@ def main():
               "fix 1 (Server never calls Client_DF.update_data; "
               "FedTA-lineage semantics restored), bug fix 3 "
               "(np.arange(200) -> args.nb_classes; a no-op at the INR "
-              "nb_classes=200, kept for one shared code path), INR route "
+              "nb_classes=200, kept for one shared code path), bug fix 4 "
+              "(init_local_prompt hardcodes pool_size=100 but INR class "
+              "labels 100..199 index the per-class pool -> CUDA assert on "
+              "the first local-prompt batch; replaced with self.num_classes"
+              " — the INR crash of 2026-10-25), INR route "
               "fix (Server_DF.init_client misses the 'imagenetr' branch "
               "that Client_DF/update_data already recognize; restored); "
               "surrogate wrapper = main-repo iCIFAR100c (FedMGP's own is "
