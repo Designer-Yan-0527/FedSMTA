@@ -12,7 +12,8 @@ Frozen design (external-baseline fairness policy):
 All adapter code lives in the main repo (external_baselines/ is
 gitignored); no file inside external_baselines/FedMGP is ever edited.
 
-Three injection points:
+Three injection points (cifar100; the ImageNet-R section at the bottom
+mirrors them on the main-repo lineage ImagenetR_spliter):
 
   1. cifar100_Data_Spliter.random_split()     -> outer split from manifest
   2. cifar100_Data_Spliter.process_testdata() -> surrogate / test pool
@@ -36,6 +37,7 @@ data partitions are pinned.
 """
 
 import json
+import sys
 
 _MANIFEST = None
 _CTX = {"ctx": None}
@@ -271,3 +273,238 @@ def apply_all(manifest_path, fedmgp_root):
     patch_spliter()
     patch_client_get_data()
     return manifest(), fedmgp_main
+
+
+# ==========================================================================
+# ImageNet-R section (manifest dataset == 'ImageNet-R')
+#
+# FedMGP's official repo never shipped an ImageNet-R route: main.py routes
+# only cifar100 / 5datasets / office-home, config/ has no INR entry, and
+# data/ has no INR spliter — although Models/Client_DF.py already
+# recognizes the internal name 'imagenetr' (class_mask handling + update_
+# data), i.e. the route was intended but never finished. What the official
+# repo DOES have is a dead-code Imagenet_R class in data/continual_
+# datasets.py whose constructor is broken (checks the extracted FOLDER
+# with os.path.isfile -> always False -> RuntimeError / re-download) and
+# whose ImageFolder-based enumeration is not the one the frozen manifest
+# refers to.
+#
+# Protocol therefore mandates: the manifest indices enumerate the MAIN
+# repo's data/continual_datasets.py Imagenet_R (sorted folder/file order,
+# numpy data; that is the class the reference run and
+# diagnostics/export_split_manifest.py used), and the client subsets use
+# the main repo's data/imagenet_r_subset_spliter.py CustomedSubset
+# semantics. Both modules are loaded via importlib under alias names so
+# the FedMGP checkout itself stays byte-identical (their internal
+# `from data... import` lines would otherwise resolve to FedMGP's own
+# package inside the chdir'ed run context). `from utils import
+# build_transform` inside those modules DOES resolve to FedMGP's utils in
+# the run context — which is the method-native choice (FedMGP's own
+# augmentation), exactly the policy the cifar100 path already follows.
+# ==========================================================================
+
+_MAINREPO_CACHE = {}
+_CACHED_INR_CLASS = []
+
+
+def _load_mainrepo_module(alias, relpath):
+    """importlib-load a main-repo module under a private alias name.
+
+    Used only for main-repo modules that must be imported INSIDE the
+    FedMGP-chdir'ed process: a plain `from data.x import y` there would
+    resolve to FedMGP's own (dead-code / different) module of the same
+    name. Modules loaded here must not import other main-repo modules
+    through the `data`/`utils` names unless that resolution is intended
+    (for utils it IS intended: method-native FedMGP transforms)."""
+    import importlib.util
+    from pathlib import Path
+
+    if alias in _MAINREPO_CACHE:
+        return _MAINREPO_CACHE[alias]
+    path = Path(__file__).resolve().parent.parent / relpath
+    spec = importlib.util.spec_from_file_location(alias, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = mod
+    spec.loader.exec_module(mod)
+    _MAINREPO_CACHE[alias] = mod
+    return mod
+
+
+def mainrepo_imagenet_r_class():
+    """The main repo's Imagenet_R dataset class (numpy data, sorted
+    enumeration, fixed tar-check) — the enumeration the manifest indices
+    refer to. data/continual_datasets.py is standalone-importable (no
+    main-repo-relative imports), so the alias load is exact."""
+    return _load_mainrepo_module(
+        "fedsmta_data_continual_datasets",
+        "data/continual_datasets.py").Imagenet_R
+
+
+_INR_INSTANCES = {}
+
+
+def imagenet_r_instance(train, root="./local_datasets"):
+    """Cached constructor over the main repo's Imagenet_R: loading the
+    24k/6k images takes minutes, and the adapter route + the gate need
+    the SAME deterministic enumeration several times; cache one instance
+    per (root, train)."""
+    key = (str(root), bool(train))
+    if key not in _INR_INSTANCES:
+        _INR_INSTANCES[key] = mainrepo_imagenet_r_class()(
+            root=root, train=train, download=False)
+    return _INR_INSTANCES[key]
+
+
+def _cached_imagenet_r_class():
+    """A subclass of the main repo's Imagenet_R whose construction
+    resolves to the shared imagenet_r_instance() cache (one 24k/6k image
+    load per (root, train) per process — native regeneration, adapter
+    injection and seals all enumerate the identical object)."""
+    base = mainrepo_imagenet_r_class()
+    if _CACHED_INR_CLASS and _CACHED_INR_CLASS[0].__bases__[0] is base:
+        return _CACHED_INR_CLASS[0]
+
+    class _CachedImagenetR(base):
+        def __new__(cls, root, train=True, **kwargs):
+            return imagenet_r_instance(train, root=root)
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    _CACHED_INR_CLASS.append(_CachedImagenetR)
+    return _CachedImagenetR
+
+
+def load_mainrepo_imagenet_r_spliter_module():
+    """Alias-load the main repo's data/imagenet_r_subset_spliter.py and
+    rebind its module-level Imagenet_R to the main repo's class (its own
+    `from data.continual_datasets import Imagenet_R` resolves to
+    FedMGP's dead-code class inside the run context). Returns the module;
+    ImagenetR_spliter.random_split / process_testdata are replaced by
+    patch_imagenet_r_spliter() afterwards."""
+    mod = _load_mainrepo_module(
+        "fedsmta_imagenet_r_subset_spliter",
+        "data/imagenet_r_subset_spliter.py")
+    mod.Imagenet_R = _cached_imagenet_r_class()
+    return mod
+
+
+def patch_imagenet_r_spliter():
+    """INR counterpart of patch_spliter(): replace the (main-repo lineage)
+    ImagenetR_spliter's random_split / process_testdata with manifest-
+    driven versions, so FedMGP's INR route loads exactly the frozen
+    client/task/class/sample assignment. Subsets are built with the main
+    repo's CustomedSubset semantics over the main repo's Imagenet_R
+    enumeration, with FedMGP's own build_transform (method-native, same
+    policy as the cifar100 path). Returns the patched class."""
+    from utils import build_transform
+
+    mod = load_mainrepo_imagenet_r_spliter_module()
+    ImagenetR_spliter = mod.ImagenetR_spliter
+    CustomedSubset = mod.CustomedSubset
+
+    m = manifest()
+    p = m["protocol"]
+
+    def random_split_from_manifest(self):
+        if (self.client_num, self.task_num, self.private_class_num) != \
+                (p["client_num"], p["task_num"], p["private_class_num"]):
+            raise ValueError(
+                "protocol mismatch: spliter was built with "
+                f"({self.client_num}, {self.task_num}, "
+                f"{self.private_class_num}) but the manifest froze "
+                f"({p['client_num']}, {p['task_num']}, "
+                f"{p['private_class_num']})")
+        trans = build_transform(True, self.input_size)
+        trainset = imagenet_r_instance(True, root=getattr(
+            self, "data_path", "./local_datasets"))
+        client_subset, client_mask = [], []
+        for i in range(p["client_num"]):
+            per_subset, per_mask = [], []
+            for t in range(p["task_num"]):
+                entry = m["outer"][str(i)][str(t)]
+                per_subset.append(CustomedSubset(
+                    trainset, list(entry["raw_indices"]), trans, None))
+                per_mask.append(list(entry["class_mask"]))
+            client_subset.append(per_subset)
+            client_mask.append(per_mask)
+        return client_subset, client_mask
+
+    def process_testdata_from_manifest(self, surrogate_num):
+        if int(surrogate_num) != int(p["surrogate_num"]):
+            raise ValueError(
+                f"protocol mismatch: surrogate_num={surrogate_num} but the "
+                f"manifest froze {p['surrogate_num']}")
+        trans = build_transform(False, self.input_size)
+        testset = imagenet_r_instance(False, root=getattr(
+            self, "data_path", "./local_datasets"))
+        surro = CustomedSubset(testset, list(m["surrogate"]["indices"]),
+                               trans, None)
+        pool = CustomedSubset(testset, list(m["test_pool"]["indices"]),
+                              trans, None)
+        return surro, pool
+
+    ImagenetR_spliter.random_split = random_split_from_manifest
+    ImagenetR_spliter.process_testdata = process_testdata_from_manifest
+    return ImagenetR_spliter
+
+
+def patch_server_init_client_imagenetr():
+    """Official-repo INR blocker (NOT a protocol change): Server_DF.
+    init_client builds real clients only for data_name in
+    ('cifar100', '5datasets'); 'imagenetr' — which Client_DF.__init__ and
+    Client_DF.update_data DO recognize (FedMGP's own INR identifiers) —
+    falls into the office-home branch and passes subset=None /
+    class_mask=None, so every INR run would crash at the first get_data.
+    The official route was clearly intended (Client_DF side is done);
+    this patch restores the one missing dataset name in the condition.
+    Nothing else in init_client's body changes."""
+    import inspect
+    import textwrap
+    from Models.Server_DF import Server_DF
+
+    src = textwrap.dedent(inspect.getsource(Server_DF.init_client))
+    bad = ("if self.args.data_name == 'cifar100' or "
+           "self.args.data_name == '5datasets':")
+    good = ("if self.args.data_name == 'cifar100' or "
+            "self.args.data_name == '5datasets' or "
+            "self.args.data_name == 'imagenetr':")
+    if bad not in src:
+        raise RuntimeError(
+            "FedMGP Server_DF.init_client no longer contains the "
+            f"cifar/5datasets-only condition {bad!r}; re-audit the "
+            "official repo before patching")
+    if "imagenetr" in src:
+        raise RuntimeError(
+            "FedMGP Server_DF.init_client already knows 'imagenetr'; "
+            "re-audit the official repo before patching")
+    fixed = src.replace(bad, good)
+
+    mod = sys.modules[Server_DF.__module__]
+    exec(compile(fixed, "<Server_DF.init_client imagenetr route fix>",
+                 "exec"), vars(mod))
+    Server_DF.init_client = mod.init_client
+    return Server_DF
+
+
+def load_mainrepo_icifar100c():
+    """The main repo's INR-capable iCIFAR100c — the surrogate-data
+    wrapper FedMGP's Server_DF.filter / kd_fusion_* drive
+    (getTrainData(classes) + (index, x, y) items).
+
+    FedMGP's OWN data/iCIFAR100c.py is CIFAR-only and crashes on INR:
+    `self.data[boolean mask]` where self.data is a plain python list of
+    ragged numpy images (TypeError). The main repo's copy is the same
+    FedTA-lineage class with exactly the INR fixes the reference run
+    needed (np.array(...) with dtype=object fallback for ragged images,
+    np.array(self.targets) instead of np.ndarray(...),
+    Image.fromarray(...).convert('RGB')). Semantics (full-test-set
+    unwrap via subset.dataset, per-class boolean selection, train
+    transform, (index, img, target) items) are identical to FedMGP's own
+    wrapper on cifar100, so the method's surrogate behavior is unchanged.
+
+    Its `from utils import build_transform` resolves to FedMGP's utils
+    inside the run context — i.e. FedMGP's own (method-native)
+    transform, same policy as the cifar100 path."""
+    return _load_mainrepo_module(
+        "fedsmta_data_icifar100c", "data/iCIFAR100c.py").iCIFAR100c
