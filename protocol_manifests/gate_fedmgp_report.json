@@ -1,6 +1,6 @@
 {
   "test": "fedmgp_protocol_equivalence_gate",
-  "generated_at": "2026-10-18 18:05:11",
+  "generated_at": "2026-10-25 10:33:06",
   "manifest": "/root/autodl-tmp/users/ych/FedSMTA/protocol_manifests/cifar100_c5t5p15s20_seed42.json",
   "fedmgp_root": "/root/autodl-tmp/users/ych/FedSMTA/external_baselines/FedMGP",
   "result": "PASS",
