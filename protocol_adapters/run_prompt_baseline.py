@@ -6,9 +6,14 @@ official standalone implementations (L2P: google-research flax repo under
 external_baselines/L2P; DualPrompt: JH-LEE-KR timm repo under
 external_baselines/DualPrompt). Following the constructed-baseline policy
 of the frozen protocol family, this adapter FEDERATES them: the prompt
-MODEL STRUCTURE is taken from the official CIFAR-100 configs verbatim,
-while the entire training / aggregation / evaluation protocol is the
-frozen one shared by run_fl_baseline.py and run_fedmgp.py.
+MODEL STRUCTURE is taken from the official CIFAR-100 / ImageNet-R configs
+verbatim, while the entire training / aggregation / evaluation protocol
+is the frozen one shared by run_fl_baseline.py and run_fedmgp.py.
+
+Supported manifests: dataset 'cifar100' (nb_classes=100, e.g.
+protocol_manifests/cifar100_c5t5p15s20_seed42.json) and 'ImageNet-R'
+(nb_classes=200, protocol_manifests/inr_c5t5p40s5_seed42.json; same
+seed42 protocol shape, 5 clients x 5 tasks, input_size=224).
 
 Model construction:
 
@@ -23,6 +28,17 @@ Model construction:
              is key-matching at BOTH train and eval time, which is exactly
              the forward(x) prompt_mask=None default path.
              head_type='token' (see "Deviations" below).
+             ImageNet-R structure: NO official L2P INR config exists
+             (external_baselines/L2P/configs/ ships no imr_l2p.py -- its
+             only INR entry, imr_dualprompt.py, is a DualPrompt config;
+             the JH-LEE-KR DualPrompt repo ships train_imr_dualprompt.sh
+             only, no train_imr_l2p.sh), so the INR prompt-pool values
+             follow the JH-LEE-KR INR convention (DualPrompt
+             configs/imr_dualprompt.py prompt_pool_param): pool_size=10,
+             length=20, top_k=1, batchwise_prompt=False; the L2P-method
+             semantics use_prompt_mask=False (task-agnostic key-matching)
+             and the frozen-family head_type='token' are kept (see
+             "Deviations" below).
   feddualp : the main-line class has no G-prompt/E-prompt dual-pool
              support (no prefix tuning, no per-layer G/E split, no
              PreT_Attention), so the adapter borrows the OFFICIAL
@@ -42,6 +58,17 @@ Model construction:
              dedicated E-prompt slot t*top_k (use_prompt_mask path),
              boundary eval is task-agnostic key-matching (forward(x)
              without task_id / train flag).
+             ImageNet-R structure hyperparameters
+             (external_baselines/DualPrompt/configs/imr_dualprompt.py,
+             the config train_imr_dualprompt.sh runs): IDENTICAL to the
+             CIFAR-100 structure except E-prompt --length 20 (CIFAR: 5)
+             and --batchwise_prompt False (CIFAR: True) -- a genuine
+             dataset difference in the official config itself; G-prompt
+             length 5 / layers [0, 1], E-prompt layers [2, 3, 4],
+             pool_size=10, top_k=1, use_prompt_mask=True are shared.
+             The config's TRAINING values (batch 24 / epochs 50 / lr
+             0.005) are NOT taken: the frozen protocol schedule is used,
+             exactly as on cifar100.
 
   Both models are built by the SAME
   create_model('vit_base_patch16_224', pretrained=True,
@@ -64,6 +91,13 @@ Frozen-protocol口径 (identical to run_fl_baseline.py):
     + inner 70/30 per (client, task)). Local training uses the inner
     TRAIN split of the CURRENT task (federated sequential task stream,
     no replay, no old-task data); the inner TEST split is the eval pool;
+    cifar100 -> torchvision CIFAR100 + data/cifar100_subset_spliter
+    CustomedSubset; ImageNet-R -> the main repo's data/
+    continual_datasets.Imagenet_R (the exact enumeration the manifest
+    indices refer to) + data/imagenet_r_subset_spliter
+    CustomedSubset, both under the main repo's build_transform(True,
+    224) -- byte-identical to run_fl_baseline.build_client_data's two
+    branches (protocol equivalence: same manifest, same preprocessing);
   - one task = global_epoch rounds (default 5); every round every client
     starts from the current global weights and trains local_epoch epochs
     (default 30); Adam(lr, weight_decay=1e-3), CrossEntropyLoss, local
@@ -110,15 +144,31 @@ Deviations to be aware of:
     (5 tasks), so with the official DualPrompt pool_size=10 / top_k=1
     only E-prompt slots 0..4 receive task-masked training while slots
     5..9 stay at init (they remain key-matching candidates at eval).
-    The official structure is kept verbatim on the 5-task stream.
+    The official structure is kept verbatim on the 5-task stream. The
+    official ImageNet-R runs are ALSO 10-task (imr_dualprompt.py
+    num_tasks=10, 20 classes/task), so the same slot remark applies to
+    the INR c5t5 manifest identically.
   - the L2P / DualPrompt pull_constraint key-alignment term
-    (loss - pull_coeff * reduce_sim, coeff 1.0 in both official CIFAR-100
-    configs) is kept: it is part of the METHOD objective, not of the
-    training schedule.
-
-ImageNet-R manifests are rejected by an explicit assert for now (the
-nb_classes=200 fixed-head route is a follow-up); this first version is
-cifar100-only.
+    (loss - pull_coeff * reduce_sim, coeff 1.0 in every official config
+    used -- cifar100_l2p / cifar100_dualprompt / imr_dualprompt) is
+    kept: it is part of the METHOD objective, not of the training
+    schedule.
+  - ImageNet-R data route: the main repo's Imagenet_R /
+    CustomedSubset / build_transform(True, 224) (deterministic
+    Resize-only + ToTensor, the FedTA-lineage convention shared by
+    run_fl_baseline and run_fedmgp), NOT the official DualPrompt /
+    L2P train augmentation RandomResizedCrop(224, scale=(0.05, 1)) +
+    RandomHorizontalFlip -- the same frozen-protocol policy the cifar100
+    row already follows (difference (c): preprocessing belongs to the
+    frozen protocol, not to the method).
+  - fedl2p ImageNet-R structure has NO official source (see Model
+    construction): the prompt-pool values are the JH-LEE-KR INR
+    convention (pool 10 / length 20 / top_k 1 / batchwise False), with
+    the L2P-method use_prompt_mask=False and the frozen-family
+    head_type='token' kept (deliberate, flagged).
+  - feddualp ImageNet-R structure differs from its CIFAR-100 values in
+    exactly the two places the official imr_dualprompt.py does: E-prompt
+    length 20 (CIFAR 5) and batchwise_prompt=False (CIFAR True).
 
 Usage (from the FedSMTA repo root):
 
@@ -127,6 +177,10 @@ Usage (from the FedSMTA repo root):
       --method {fedl2p|feddualp} \
       [--lr 0.001] [--local_epoch 30] [--global_epoch 5] \
       [--max_tasks 0] [--save_ckpt] [--resume auto] [--device cuda]
+
+  python protocol_adapters/run_prompt_baseline.py \
+      --manifest protocol_manifests/inr_c5t5p40s5_seed42.json \
+      --method {fedl2p|feddualp} [same flags]
 """
 
 import argparse
@@ -154,7 +208,7 @@ from utils import build_transform  # noqa: E402
 
 LOCAL_BATCH = 16  # repo-hardcoded local batch (official FedTA behavior)
 WEIGHT_DECAY = 1e-03  # Client_DF.train convention
-PULL_COEFF = 1.0  # official pull_constraint_coeff (both CIFAR-100 configs)
+PULL_COEFF = 1.0  # official pull_constraint_coeff (cifar100 AND imr configs)
 FROZEN_PROBE_KEY = "patch_embed.proj.weight"  # exists in both model classes
 
 # Prompt STRUCTURE hyperparameters (the only thing taken from the official
@@ -172,6 +226,29 @@ L2P_STRUCTURE = dict(
     batchwise_prompt=True,      # prompt_pool_param.batchwise_prompt
     use_prompt_mask=False,      # prompt_pool_param.use_prompt_mask
     head_type="token",          # frozen-family head convention (see docstring)
+)
+L2P_STRUCTURE_INR = dict(
+    # source: NO official L2P ImageNet-R config exists (external_baselines/
+    # L2P/configs/ has no imr_l2p.py; the JH-LEE-KR DualPrompt repo ships
+    # train_imr_dualprompt.sh only, no train_imr_l2p.sh). Prompt-pool values
+    # follow the JH-LEE-KR INR convention for the L2P-style prompt pool
+    # (external_baselines/DualPrompt/configs/imr_dualprompt.py):
+    # pool_size=10 (--size), prompt_length=20 (--length; CIFAR: 10),
+    # top_k=1 (--top_k; CIFAR: 4), batchwise_prompt=False (CIFAR: True).
+    # use_prompt_mask=False (L2P is task-agnostic: key-matching at train
+    # AND eval) and head_type='token' (frozen-family convention) are kept
+    # from the cifar100 row -- see the docstring deviation table.
+    prompt_pool=True,
+    pool_size=10,
+    prompt_length=20,
+    top_k=1,
+    embedding_key="cls",
+    prompt_key=True,
+    prompt_init="uniform",
+    prompt_key_init="uniform",
+    batchwise_prompt=False,
+    use_prompt_mask=False,
+    head_type="token",
 )
 DUALPROMPT_STRUCTURE = dict(
     # source: external_baselines/DualPrompt/configs/cifar100_dualprompt.py
@@ -195,7 +272,42 @@ DUALPROMPT_STRUCTURE = dict(
     use_prefix_tune_for_e_prompt=True,       # --use_prefix_tune_for_e_prompt
     same_key_value=False,                    # --same_key_value
 )
-STRUCTURES = {"fedl2p": L2P_STRUCTURE, "feddualp": DUALPROMPT_STRUCTURE}
+DUALPROMPT_STRUCTURE_INR = dict(
+    # source: external_baselines/DualPrompt/configs/imr_dualprompt.py (the
+    # config train_imr_dualprompt.sh runs). Identical to the CIFAR-100
+    # structure EXCEPT --length 20 (CIFAR: 5) and --batchwise_prompt False
+    # (CIFAR: True) -- genuine dataset differences in the official config
+    # itself. The config's TRAINING values (batch 24 / epochs 50 / lr
+    # 0.005) are NOT taken: the frozen protocol schedule is used.
+    prompt_pool=True,           # --prompt_pool
+    pool_size=10,               # --size
+    prompt_length=20,           # --length (INR: 20)
+    top_k=1,                    # --top_k
+    embedding_key="cls",        # --embedding_key
+    prompt_key=True,            # --prompt_key
+    prompt_init="uniform",      # official main.py maps initializer->prompt_init
+    prompt_key_init="uniform",  # --prompt_key_init
+    batchwise_prompt=False,     # --batchwise_prompt (INR: False)
+    use_prompt_mask=True,       # --use_prompt_mask (official DualPrompt)
+    head_type="token",          # --head_type
+    use_g_prompt=True,                       # --use_g_prompt
+    g_prompt_length=5,                       # --g_prompt_length
+    g_prompt_layer_idx=[0, 1],               # --g_prompt_layer_idx
+    use_prefix_tune_for_g_prompt=True,       # --use_prefix_tune_for_g_prompt
+    use_e_prompt=True,                       # --use_e_prompt
+    e_prompt_layer_idx=[2, 3, 4],            # --e_prompt_layer_idx
+    use_prefix_tune_for_e_prompt=True,       # --use_prefix_tune_for_e_prompt
+    same_key_value=False,                    # --same_key_value
+)
+# keyed on (method, manifest dataset); the cifar100 entries are the SAME
+# dicts as before this adapter learned ImageNet-R (byte-identical values,
+# already run under seed42 -- do not touch).
+STRUCTURES = {
+    ("fedl2p", "cifar100"): L2P_STRUCTURE,
+    ("fedl2p", "ImageNet-R"): L2P_STRUCTURE_INR,
+    ("feddualp", "cifar100"): DUALPROMPT_STRUCTURE,
+    ("feddualp", "ImageNet-R"): DUALPROMPT_STRUCTURE_INR,
+}
 
 # Everything outside these prefixes is frozen (requires_grad=False):
 # fedl2p   -> Global_Prompt module 'prompt' + fixed head
@@ -217,20 +329,36 @@ def build_client_data(manifest, data_path):
     inner test loaders in Client_DF.get_data are random_split out of the
     train-transformed outer subset, and build_transform(True, 224) is
     deterministic: Resize only). Identical to run_fl_baseline.
-    build_client_data, cifar100-only."""
+    build_client_data (both branches, cifar100 and ImageNet-R)."""
     name = manifest["dataset"]
     p = manifest["protocol"]
-    if name != "cifar100":
-        raise ValueError(f"unsupported manifest dataset {name!r} (this "
-                         "adapter is cifar100-only in its first version)")
     trans = build_transform(True, p["input_size"])
 
-    from torchvision.datasets import CIFAR100
-    from data.cifar100_subset_spliter import CustomedSubset
+    if name == "cifar100":
+        from torchvision.datasets import CIFAR100
+        from data.cifar100_subset_spliter import CustomedSubset
 
-    def wrap(idxs):
-        base = CIFAR100(root=data_path, train=True, download=False)
-        return CustomedSubset(base, list(idxs), trans)
+        def wrap(idxs):
+            base = CIFAR100(root=data_path, train=True, download=False)
+            return CustomedSubset(base, list(idxs), trans)
+    elif name == "ImageNet-R":
+        from data.continual_datasets import Imagenet_R
+        from data.imagenet_r_subset_spliter import CustomedSubset
+
+        # ONE full Imagenet_R construction per process (the exact
+        # enumeration the manifest indices refer to: main-repo class,
+        # sorted folder/file order, numpy data -- loads the 24k train
+        # images into RAM once, which takes minutes); every (client,
+        # task) subset wraps this shared base, exactly like
+        # run_fl_baseline's INR branch. INR class labels are 0..199 and
+        # the head is nb_classes=200 wide, so no label remap is needed.
+        base = Imagenet_R(root=data_path, train=True, download=False)
+
+        def wrap(idxs):
+            return CustomedSubset(base, list(idxs), trans, None)
+    else:
+        raise ValueError(f"unsupported manifest dataset {name!r} "
+                         "(expected 'cifar100' or 'ImageNet-R')")
 
     data = []
     for cid in range(p["client_num"]):
@@ -282,7 +410,7 @@ def setup_model_registry(method):
     return "external_baselines/DualPrompt/vision_transformer.py"
 
 
-def build_models(method, nb_classes, device):
+def build_models(structure, nb_classes, device):
     """Returns (original_model, model), both pretrained from the offline
     pretrain_model/ViT-B_16.npz exactly like run_fl_baseline.build_model.
 
@@ -291,7 +419,11 @@ def build_models(method, nb_classes, device):
 
     model: the method's prompt model, built from whichever
     vit_base_patch16_224 registration setup_model_registry(method)
-    installed, with the official CIFAR-100 structure hyperparameters."""
+    installed, with the official structure hyperparameters of the
+    manifest's dataset (structure = STRUCTURES[(method, dataset)]).
+    Both model classes are num_classes-parameterized
+    (nn.Linear(embed_dim, num_classes) heads, absent from the npz), so
+    the fixed head is 100 wide on cifar100 and 200 wide on ImageNet-R."""
     base_cfg = create_model("vit_base_patch16_224").default_cfg
 
     def cfg():
@@ -315,7 +447,7 @@ def build_models(method, nb_classes, device):
         pretrained=True,
         pretrained_cfg=cfg(),
         num_classes=nb_classes,
-        **STRUCTURES[method],
+        **structure,
     )
     model.to(device)
     return original_model, model
@@ -511,7 +643,7 @@ def main():
     cli.add_argument("--resume", default="",
                      help="'' = fresh; 'auto' = run_dir/checkpoints/latest.pth")
     cli.add_argument("--run_name", default="",
-                     help="'' = {method}_cifar (e.g. fedl2p_cifar)")
+                     help="'' = {method}_cifar / {method}_inr by dataset")
     args = cli.parse_args()
 
     with open(args.manifest, "r", encoding="utf-8") as f:
@@ -521,25 +653,77 @@ def main():
     p = manifest["protocol"]
     seed = int(manifest["seed"])
     dataset = manifest["dataset"]
-    if dataset != "cifar100":
+    if dataset not in ("cifar100", "ImageNet-R"):
         raise SystemExit(
             f"{args.manifest}: dataset {dataset!r} is not supported by "
-            "this first version (cifar100-only; the ImageNet-R "
-            "nb_classes=200 fixed-head route is a follow-up)")
+            "this adapter (expected 'cifar100' or 'ImageNet-R')")
     client_num, task_num = p["client_num"], p["task_num"]
     nb_classes = p["nb_classes"]
-    assert nb_classes == 100, \
-        f"cifar100 manifest must have nb_classes=100, got {nb_classes}"
+    expected_nb_classes = 100 if dataset == "cifar100" else 200
+    assert nb_classes == expected_nb_classes, (
+        f"{dataset} manifest must have nb_classes={expected_nb_classes}, "
+        f"got {nb_classes}")
     device = torch.device(args.device)
-    run_name = args.run_name or f"{args.method}_cifar"
+    run_name = args.run_name or (
+        f"{args.method}_cifar" if dataset == "cifar100"
+        else f"{args.method}_inr")
 
     torch.backends.cudnn.benchmark = True  # official behavior (non-det.)
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-    structure = STRUCTURES[args.method]
+    structure = STRUCTURES[(args.method, dataset)]
     model_source = setup_model_registry(args.method)
+
+    if args.method == "fedl2p":
+        structure_source = (
+            "external_baselines/L2P/configs/cifar100_l2p.py"
+            if dataset == "cifar100" else
+            "no official L2P ImageNet-R config exists (external_baselines/"
+            "L2P/configs/ ships no imr_l2p; the JH-LEE-KR DualPrompt repo "
+            "ships no train_imr_l2p.sh); INR prompt-pool values = the "
+            "JH-LEE-KR INR convention (external_baselines/DualPrompt/"
+            "configs/imr_dualprompt.py: pool 10 / length 20 / top_k 1 / "
+            "batchwise False), with use_prompt_mask=False (L2P task-"
+            "agnostic semantics) and head_type='token' (frozen-family "
+            "convention) kept")
+    else:
+        structure_source = (
+            "external_baselines/DualPrompt/configs/cifar100_dualprompt.py"
+            if dataset == "cifar100" else
+            "external_baselines/DualPrompt/configs/imr_dualprompt.py "
+            "(the config train_imr_dualprompt.sh runs)")
+
+    diffs_vs_official = [
+        "(a) federated sequential task stream, not single-machine",
+        "(b) prompt pool(s) and head FedAvg'd after every round "
+        "with no protection mechanism",
+        "(c) training schedule is the frozen main-line protocol; "
+        "only prompt structure hyperparameters are official",
+        "(d) no train-time class-mask on the logits (official "
+        "L2P/DualPrompt mask to the current task at train time)",
+        "fedl2p head_type='token' (official cifar100_l2p.py uses "
+        "vit_classifier='prompt')",
+        "official 10-task streams (CIFAR-100 and ImageNet-R) vs frozen "
+        "5-task manifest: with pool_size=10/top_k=1 only E-prompt slots "
+        "0..4 receive task-masked training (feddualp)",
+    ]
+    if dataset == "ImageNet-R":
+        diffs_vs_official += [
+            "ImageNet-R data route = run_fl_baseline's INR branch "
+            "(main-repo Imagenet_R + CustomedSubset + build_transform("
+            "True, 224) Resize-only), NOT the official "
+            "RandomResizedCrop/flip train augmentation (same frozen-"
+            "protocol policy as the cifar100 row)",
+            "fedl2p INR structure has no official config: prompt-pool "
+            "values = JH-LEE-KR INR convention (pool 10 / length 20 / "
+            "top_k 1 / batchwise False), use_prompt_mask=False + "
+            "head_type='token' kept",
+            "feddualp INR structure per imr_dualprompt.py: E-prompt "
+            "length 20 and batchwise_prompt=False (CIFAR values: 5 / "
+            "True)",
+        ]
 
     recorder = metrics_recorder.MetricsRecorder(
         out_root=REPO_ROOT / args.output_dir, dataset=dataset,
@@ -557,11 +741,7 @@ def main():
                             "averaging a key-based prompt pool)",
             "model_source": model_source,
             "prompt_structure": dict(structure),
-            "structure_source": (
-                "external_baselines/L2P/configs/cifar100_l2p.py"
-                if args.method == "fedl2p" else
-                "external_baselines/DualPrompt/configs/"
-                "cifar100_dualprompt.py"),
+            "structure_source": structure_source,
             "trainable_parameters": list(TRAINABLE_PREFIXES[args.method]),
             "key_features": "frozen pretrained ViT-B/16 (original_model, "
                             "never aggregated) pre_logits as the 'cls' "
@@ -570,8 +750,8 @@ def main():
             "local_optimizer": f"Adam(lr={args.lr}, "
                                f"weight_decay={WEIGHT_DECAY})",
             "local_loss": f"CrossEntropy - {PULL_COEFF} * reduce_sim "
-                          "(official pull_constraint, coeff 1.0 in both "
-                          "official CIFAR-100 configs)",
+                          "(official pull_constraint; coeff 1.0 in every "
+                          "official config used: cifar100 and imr)",
             "local_batch": LOCAL_BATCH,
             "local_epoch": args.local_epoch,
             "global_epoch": args.global_epoch,
@@ -579,20 +759,7 @@ def main():
                            "state_dict; keys bit-identical across clients "
                            "(the frozen backbone) are copied bit-exactly "
                            "(= the weighted average of identical values)",
-            "differences_vs_official": [
-                "(a) federated sequential task stream, not single-machine",
-                "(b) prompt pool(s) and head FedAvg'd after every round "
-                "with no protection mechanism",
-                "(c) training schedule is the frozen main-line protocol; "
-                "only prompt structure hyperparameters are official",
-                "(d) no train-time class-mask on the logits (official "
-                "L2P/DualPrompt mask to the current task at train time)",
-                "fedl2p head_type='token' (official cifar100_l2p.py uses "
-                "vit_classifier='prompt')",
-                "official 10-task CIFAR-100 vs frozen 5-task manifest: "
-                "with pool_size=10/top_k=1 only E-prompt slots 0..4 "
-                "receive task-masked training (feddualp)",
-            ],
+            "differences_vs_official": diffs_vs_official,
             "eval_pool": "per-(client, task) inner TEST split of the "
                          "manifest, logits masked to the (client, task) "
                          "class_mask, task-agnostic key-matching prompt "
@@ -617,7 +784,7 @@ def main():
     print("=" * 70)
 
     data = build_client_data(manifest, args.data_path)
-    original_model, model = build_models(args.method, nb_classes, device)
+    original_model, model = build_models(structure, nb_classes, device)
     freeze_and_audit(model, args.method)
 
     # resume state: (task, round_in_task) at round boundaries
