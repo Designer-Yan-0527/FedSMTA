@@ -316,7 +316,9 @@ def main():
                                        "(1.0 = same mixture for all samples; "
                                        "null = undefined, <2 samples)",
             "key_effective_rank": "participation ratio of centered "
-                                  "normalized key matrix (100 = healthy)",
+                                  "normalized key matrix (theoretical max "
+                                  "is pool_size-1 after centering; "
+                                  ">50 = gate-healthy)",
         },
         "caliber_notes": "distribution-level check: manifest-rebuilt outer "
                          "client-task partition with freshly sampled random "
