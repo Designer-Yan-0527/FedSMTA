@@ -401,11 +401,11 @@ done
 ## 20. A2-R 路由修复消融（`--route_fix`，2×2 矩阵新增两臂）
 
 > 诊断结论：官方 FedTA 的 Global_Prompt 路由结构性死锁——top-k 硬选择不可导 + uniform 初始化 + pull 只拉选中槽 → 全样本 100% 命中单槽（keyH≈0.004 bits），prompt 池退化为固定 bias。微训练探针 `diagnostics/probe_route_fix.py`（已验证）判决 R1+R2 使路由 **5/5 客户端复活（keyH +3~4 bits）且准确率守住**。
-> **2026-10-27 修订（全轨迹判决）**：首版全池软 pull（`reduce_sim = top_k·Σ(w·sim)/B`）是冷启动 key 塌缩驱动源——首臂 round-0 即塌缩（key 有效秩 87.8→6.5、mean|cos| 0.03→0.49），塌缩吸引子闭合，实验臂已停止并删除。修订为 **A 方案 pull 解耦**：pull 槽位选择逐字复刻官方路径（detach 的 sim 做 top-k + batchwise 批内多数投票），pull 梯度仅经未 detach 的被选中相似度回传；CE 路径保持全池软路由。纯 torch 自检 4/4 PASS（pull 梯度仅选中槽 / CE 梯度 100 槽全达 / gather 版与官方公式逐位等价 / CE−0.1×pull 形态下 pull 梯度隔离）。τ 保持 0.1，R3' 暂不加入，一次只检验一个机制。
-> 配套只读门控：`diagnostics/route_weight_stats.py`（round checkpoint → 路由熵 / 最大权重 / top-1 使用 / 样本间 w 余弦 + key 有效秩）；样本间 w 余弦 > 0.9 判塌缩，< 0.5 且使用熵 > 3 bits 判判别性路由。
+> **2026-10-27 修订（全轨迹判决）**：首臂 round-0 key 塌缩（有效秩 87.8→6.5、mean|cos| 0.03→0.49），首版全池软 pull（`reduce_sim = top_k·Σ(w·sim)/B`）与塌缩同时出现，判定为**强候选驱动机制**（w 近均匀时把全部 key 拉向特征均值方向，FedAvg 抵消各客户端判别分量后仅存共性方向；是否为唯一根因待 A 方案真实训练对照验证）。修订为 **A 方案 pull 解耦**：pull 槽位选择逐字复刻官方路径（detach 的 sim 做 top-k + batchwise 批内多数投票），pull 梯度仅经未 detach 的被选中相似度回传；CE 路径保持全池软路由。纯 torch 自检 4/4 PASS（pull 梯度仅选中槽 / CE 梯度 100 槽全达 / gather 版与官方公式**数学值与梯度等价**（浮点累加顺序不同，逐位等价需容差测试验证）/ CE−0.1×pull 形态下 pull 梯度隔离）。τ 保持 0.1，R3' 暂不加入，一次只检验一个机制。
+> 配套只读门控：`diagnostics/route_weight_stats.py`（round checkpoint → 路由熵 / 最大权重 / top-1 使用 / 样本间 w 余弦 + key 有效秩）。**门控判据（全局聚合与每客户端聚合须同时满足，防全局指标掩盖单客户端塌缩）**：样本间 w 余弦 < 0.5 + 使用熵 > 3 bits + key 有效秩 > 50（key 池全局共享，有效秩只判全局一次）；任一全局/客户端聚合余弦 > 0.9 判 DEGENERATE；client-task 级余弦 > 0.9 仅作信息性提示（小样本噪声，不翻门控）。**退出码：0=PASS / 1=FAIL 或 DEGENERATE / 2=NOT_APPLICABLE**；`route_fix=False` 的 checkpoint 判 NOT_APPLICABLE（官方硬路由不消费 softmax 权重，其 PASS 无放行资格，仅作管线冒烟）。脚本为**分布级健康检查**（manifest 重建外层划分 + 新采样随机变换，非训练前向逐样本复现）；仅支持 `embedding_key='cls'`（校验不满足即报错）。
 > R1 = prompt_key 正交球面初始化（独立 RNG 流，seed=`--seed`，零全局流扰动）；R2 = 可导软路由 `w = softmax(sim/τ)` 全池加权混合（τ=`--route_tau` 默认 0.1），**token 数保持 length×top_k 不变**（pos_embed / 官方聚合 / head_type='prompt' 消费者不受影响）；训练与推理同款全软。默认 off = 官方行为逐位一致；开启 run 无需与基线逐位对齐（RNG 消耗变化属方案的一部分）。
 > 2×2 矩阵（route_fix × A2）：已有两臂 = 官方基线（fedta）与 A2 key+HSN 宿主形态（`cifar_a2_key_hsn`）；本节补齐两个新增臂。与 `--skip_fed_avg_head` / `--a2_arm` 正交（A2 在 Client post-step restore 操作 Tail_Anchor key/anchor_pool，路由在前向 Global_Prompt，无相互作用）。
-> **新流程**：第一臂 round-0 checkpoint 落地后先跑 route_weight_stats 门控，PASS 才继续完整轨迹（判据：样本间 w 余弦 < 0.5 + 使用熵 > 3 bits + key 有效秩 > 50）。
+> **新流程**：第一臂 round-0 checkpoint 落地后先跑 route_weight_stats 门控，PASS（退出码 0）才继续完整轨迹（判据：样本间 w 余弦 < 0.5 + 使用熵 > 3 bits + key 有效秩 > 50，且全局聚合与每个客户端聚合须同时满足）。
 
 ```bash
 # 20.1 新增臂 1：route_fix 单独（官方基线协议 + --route_fix，CIFAR-100 seed42 全轨迹）
@@ -414,13 +414,20 @@ python main.py datasets_delay \
     --route_fix --route_tau 0.1 \
     --seed 42 --global_epoch 5 --threshold 0.25 \
     --run_name cifar_route_fix \
-    --data-path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+    --data-path <DATA_PATH>
 
 # 20.1a 只读路由门控（round-0 checkpoint 落地后、放行完整轨迹前）：
 python diagnostics/route_weight_stats.py \
     --run_dir output/cifar100/fedta/cifar_route_fix/seed_42 \
     --round 0 --device cuda \
-    --data_path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+    --data_path <DATA_PATH>
+
+# 20.1b 诊断脚本管线冒烟（用未删除的 route_fix=False 基线 checkpoint；
+#      预期 verdict=NOT_APPLICABLE、退出码 2，仅验证加载/重建/特征提取链路）
+python diagnostics/route_weight_stats.py \
+    --run_dir output/cifar100/fedta/cifar_hsn/seed_42 \
+    --round 0 --device cuda \
+    --data_path <DATA_PATH>
 
 # 20.2 新增臂 2：route_fix × A2 组合（与已跑 a2_key_hsn 宿主形态全同 + --route_fix；20.1 门控 PASS 后再启动）
 python main.py datasets_delay \
@@ -429,7 +436,7 @@ python main.py datasets_delay \
     --route_fix --route_tau 0.1 \
     --seed 42 --global_epoch 5 --threshold 0.25 \
     --run_name cifar_a2_key_hsn_routefix \
-    --data-path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+    --data-path <DATA_PATH>
 ```
 
 - 判读（预注册）：route_fix 臂 train_log/checkpoint 侧 keyH 相对基线复活（探针阈值 ΔkeyH > 0.5 bits）、准确率不劣于 −2pp；组合臂与 20.1 分离 A2 接口保护与路由修复的各自贡献

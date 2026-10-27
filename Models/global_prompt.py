@@ -146,17 +146,20 @@ class Global_Prompt(nn.Module):
                 out['similarity'] = similarity
                 out['soft_weights'] = w
                 # A 方案 pull 解耦（2026-10-27 全轨迹判决后修订）：
-                # 旧版全池软 pull（reduce_sim = top_k·Σ(w·sim)/B）是冷启动
-                # key 塌缩的驱动源——w 近均匀时 pull 把全部 key 拉向特征
-                # 均值方向，FedAvg 抵消各客户端判别分量后仅存共性方向
-                # （实测 round-0 有效秩 87.8 → 6.5，key 塌缩吸引子闭合）。
+                # 旧版全池软 pull（reduce_sim = top_k·Σ(w·sim)/B）与首臂
+                # round-0 key 塌缩（有效秩 87.8 → 6.5）同时出现，判定为
+                # 强候选驱动机制：w 近均匀时该式把全部 key 拉向特征均值
+                # 方向，FedAvg 抵消各客户端判别分量后仅存共性方向；
+                # 是否为唯一根因待 A 方案真实训练对照验证。
                 # 修订：pull 槽位选择逐字复刻官方路径（top-k +
                 # batchwise 批内多数投票，本协议 batchwise_prompt=True），
                 # 选择用 detach 的 sim（索引不传梯度），pull 梯度仅经
                 # 未 detach 的被选中相似度回传到对应 key；CE 路径保持
                 # 全池软路由不变（梯度仍经 w 流向全部 key）。
                 #   官方 reduce_sim = Σ_b Σ_{k∈idx} cos(x_b, key_k) / B
-                #   gather 版      = Σ(sel_sim) / B（数值与梯度等价）
+                #   gather 版      = Σ(sel_sim) / B
+                # （数学值与梯度等价；浮点累加顺序不同，非逐位等价，
+                #   逐位声明需容差数值测试验证）
                 _, idx = torch.topk(similarity.detach(), k=self.top_k, dim=1)  # B, top_k
                 if self.batchwise_prompt:
                     prompt_id, id_counts = torch.unique(idx, return_counts=True, sorted=True)
