@@ -127,6 +127,12 @@ def build_server(args, run_manager=None):
         prompt_key_init=args.prompt_key_init,
         head_type=args.head_type,
         use_prompt_mask=args.use_prompt_mask,
+        # A2-R 路由修复（--route_fix / --route_tau）：透传到 Global_Prompt
+        # （R1 正交球面 key 初始化 + R2 软路由）。默认 False = 官方行为
+        # 逐位一致。route_seed 用 --seed：R1 的独立随机流由 run 种子决定。
+        route_fix=args.route_fix,
+        route_tau=args.route_tau,
+        route_seed=args.seed,
     )
 
     original_model.to(device)

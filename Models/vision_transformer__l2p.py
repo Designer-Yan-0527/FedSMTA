@@ -340,7 +340,8 @@ class VisionTransformer(nn.Module):
             class_token=True, no_embed_class=False, fc_norm=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
             weight_init='', embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block,
             prompt_length=None, embedding_key='cls', prompt_init='uniform', prompt_pool=False, prompt_key=False, pool_size=None,
-            top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,):
+            top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,
+            route_fix=False, route_tau=0.1, route_seed=0,):
         """
         Args:
             img_size (int, tuple): input image size
@@ -390,6 +391,13 @@ class VisionTransformer(nn.Module):
         self.batchwise_prompt = batchwise_prompt
         self.prompt_key_init = prompt_key_init
         self.prompt_init = prompt_init
+        # A2-R 路由修复开关（CLI --route_fix / --route_tau）透传给
+        # Global_Prompt；同时存到 self，供 init_prompts() 重建 prompt 池时
+        # 转发（Client_DF 在 prompts 为 None 时走 init_prompts 路径）。
+        # 默认 False/0.1 = 官方行为逐位一致。
+        self.route_fix = route_fix
+        self.route_tau = route_tau
+        self.route_seed = route_seed
 
 
 
@@ -412,10 +420,11 @@ class VisionTransformer(nn.Module):
         self.head_type = head_type
         self.use_prompt_mask = use_prompt_mask
         # print('im l2p transformer')
-        if prompt_length is not None and pool_size is not None and prompt_pool: 
+        if prompt_length is not None and pool_size is not None and prompt_pool:
             self.prompt = Global_Prompt(length=prompt_length, embed_dim=embed_dim, embedding_key=embedding_key, prompt_init=prompt_init,
                     prompt_pool=prompt_pool, prompt_key=prompt_key, pool_size=pool_size, top_k=top_k, batchwise_prompt=batchwise_prompt,
-                    prompt_key_init=prompt_key_init,)
+                    prompt_key_init=prompt_key_init,
+                    route_fix=route_fix, route_tau=route_tau, route_seed=route_seed)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
@@ -559,7 +568,9 @@ class VisionTransformer(nn.Module):
                                     prompt_init=self.prompt_init,
                                     prompt_pool=self.prompt_pool, prompt_key=self.prompt_key, pool_size=self.pool_size, top_k=self.top_k,
                                     batchwise_prompt=self.batchwise_prompt,
-                                    prompt_key_init=self.prompt_key_init, )
+                                    prompt_key_init=self.prompt_key_init,
+                                    route_fix=self.route_fix, route_tau=self.route_tau,
+                                    route_seed=self.route_seed)
     def load_prompts(self,prompt):
         self.prompt = deepcopy(prompt)
 

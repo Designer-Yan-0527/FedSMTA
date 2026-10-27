@@ -121,6 +121,19 @@ def get_args_parser(subparsers):
                                  'aggregation; fed_avg_head\'s only live effect is the '
                                  'x2^(N-1)/round in-place aliasing corruption of the shared '
                                  'vit.head (INR_PHASE1_HEAD_DIVERGENCE.md Sec. 4.5).')
+    subparsers.add_argument('--route_fix', action='store_true',
+                            help='A2-R routing fix (default OFF = official behavior, '
+                                 'bit-identical): R1 = orthogonal-spherical prompt_key init '
+                                 '(independent RNG stream, seeded by --seed) + R2 = '
+                                 'differentiable soft routing w = softmax(sim/tau) over the '
+                                 'whole pool with token count length*top_k preserved; train '
+                                 'and infer use the same soft weighting. Probe verdict '
+                                 '(diagnostics/probe_route_fix.py): keyH revived 5/5 '
+                                 'clients (+3~4 bits) with accuracy held. Orthogonal to '
+                                 '--method / --a2_arm / --skip_fed_avg_head.')
+    subparsers.add_argument('--route_tau', default=0.1, type=float,
+                            help='R2 soft routing temperature: w = softmax(similarity/tau). '
+                                 'Only used with --route_fix (probe-validated default 0.1).')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
     subparsers.add_argument('--client_num', default=5, type=int,

@@ -677,6 +677,11 @@ class Server_DF(object):
         # old checkpoints without this key are unaffected (two-sided
         # membership check below)
         "skip_fed_avg_head",
+        # route_fix (A2-R): resuming an ON checkpoint without
+        # --route_fix would silently fall back to hard routing and
+        # contaminate the ablation arm; two-sided check keeps old
+        # checkpoints without the key compatible.
+        "route_fix", "route_tau",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):
