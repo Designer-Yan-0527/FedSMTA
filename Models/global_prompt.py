@@ -145,14 +145,30 @@ class Global_Prompt(nn.Module):
                 out['x_embed_norm'] = x_embed_norm
                 out['similarity'] = similarity
                 out['soft_weights'] = w
-                # 软路由版 pull 项（探针同款公式）：
-                #   官方 reduce_sim = mean_b(Σ_{k∈top-k} cos(x_b, key_sel))
-                #   软版本        = top_k · mean_b(Σ_s w[b,s]·cos(x_b, key_s))
-                # 软权重和为 1，乘 top_k 对齐官方 top-k 求和的量级；对
-                # prompt_key 经 w 可导 → CE − 0.1×pull 官方语义保持成立，
-                # 无需退化为纯 CE。
-                reduce_sim = (self.top_k * torch.sum(w * similarity)
-                              / x_embed.shape[0])
+                # A 方案 pull 解耦（2026-10-27 全轨迹判决后修订）：
+                # 旧版全池软 pull（reduce_sim = top_k·Σ(w·sim)/B）是冷启动
+                # key 塌缩的驱动源——w 近均匀时 pull 把全部 key 拉向特征
+                # 均值方向，FedAvg 抵消各客户端判别分量后仅存共性方向
+                # （实测 round-0 有效秩 87.8 → 6.5，key 塌缩吸引子闭合）。
+                # 修订：pull 槽位选择逐字复刻官方路径（top-k +
+                # batchwise 批内多数投票，本协议 batchwise_prompt=True），
+                # 选择用 detach 的 sim（索引不传梯度），pull 梯度仅经
+                # 未 detach 的被选中相似度回传到对应 key；CE 路径保持
+                # 全池软路由不变（梯度仍经 w 流向全部 key）。
+                #   官方 reduce_sim = Σ_b Σ_{k∈idx} cos(x_b, key_k) / B
+                #   gather 版      = Σ(sel_sim) / B（数值与梯度等价）
+                _, idx = torch.topk(similarity.detach(), k=self.top_k, dim=1)  # B, top_k
+                if self.batchwise_prompt:
+                    prompt_id, id_counts = torch.unique(idx, return_counts=True, sorted=True)
+                    if prompt_id.shape[0] < self.pool_size:
+                        prompt_id = torch.cat([prompt_id, torch.full((self.pool_size - prompt_id.shape[0],), torch.min(idx.flatten()), device=prompt_id.device)])
+                        id_counts = torch.cat([id_counts, torch.full((self.pool_size - id_counts.shape[0],), 0, device=id_counts.device)])
+                    _, major_idx = torch.topk(id_counts, k=self.top_k)  # top_k
+                    major_prompt_id = prompt_id[major_idx]  # top_k
+                    idx = major_prompt_id.expand(x_embed.shape[0], -1)  # B, top_k
+                sel_sim = similarity.gather(1, idx)  # B, top_k（similarity 未 detach，梯度保留）
+                out['pull_idx'] = idx
+                reduce_sim = torch.sum(sel_sim) / x_embed.shape[0]
                 out['reduce_sim'] = reduce_sim
             else:
                 # 官方路径（route_fix 关闭）：以下代码逐字保留，保证默认
