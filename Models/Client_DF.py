@@ -53,6 +53,11 @@ class Client_DF(object):
         self.local_protos = None
         self.global_protos = None
         self.prompts = None
+
+        # --route_audit: read-only forensics logger attached by Server_DF
+        # when --route_audit is ON; None (no-op) otherwise.
+        self.route_audit_logger = None
+        self._route_grad_audited = False
         self.heads = [None,None,None,None,None,None,None,None,None,None]
         self.vit_heads = [None,None,None,None,None,None,None,None,None,None]
 
@@ -286,10 +291,26 @@ class Client_DF(object):
     def train(self, round, args):
         self.original_model.eval()
 
+        _audit_logger = self.route_audit_logger if getattr(
+            args, 'route_audit', False) else None
+
         if self.prompts is not None:
             self.vit.load_prompts(self.prompts)
         else:
             self.vit.init_prompts()
+
+        # --route_audit timepoint A: the key state this branch starts from.
+        # Round 0: every client re-initializes (R1 orthogonal basis, freshly
+        # re-seeded); later rounds: the client's own broadcast snapshot.
+        # sha256 lets the five round-0 inits be verified identical WITHOUT
+        # assuming it from the shared route_seed.
+        if _audit_logger is not None:
+            _audit_logger.log_key_snapshot(
+                round,
+                "init" if self.prompts is None else "branch_start",
+                self.id,
+                self.vit.get_prompts().prompt_key)
+        self._route_grad_audited = False
 
         ###train###
         # update train data
@@ -327,6 +348,19 @@ class Client_DF(object):
                 logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
 
                 loss = criterion(logits,target)  - 0.1 * pull_off
+                # --route_audit: first-minibatch CE/pull gradient audit on
+                # the REAL forward graph. torch.autograd.grad with
+                # retain_graph=True never writes .grad and never consumes
+                # RNG; loss.backward() below is untouched, so training stays
+                # bit-identical with the audit on (unit-tested).
+                if _audit_logger is not None and not self._route_grad_audited:
+                    self._route_grad_audited = True
+                    _audit_logger.log_client_grad_audit(
+                        round, self.id, iteration,
+                        criterion(logits, target),   # CE term, same graph
+                        -0.1 * pull_off,              # pull term, same graph
+                        self.vit.get_prompts().prompt_key,
+                        output.get('pull_idx'))
                 optimizer.zero_grad()
                 loss.backward()
                 # torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip_grad)
@@ -393,6 +427,12 @@ class Client_DF(object):
 
         # save local input enhancement
         self.prompts = deepcopy(self.vit.get_prompts())
+        # --route_audit timepoint B: post-local key state, read from the
+        # client's OWN snapshot (NOT the shared ViT, which the next client
+        # will re-initialize/reload before this object is inspected).
+        if _audit_logger is not None:
+            _audit_logger.log_key_snapshot(
+                round, "post_local", self.id, self.prompts.prompt_key)
 
     def load_global_weights(self,weights):
         self.model.load_state_dict(weights)

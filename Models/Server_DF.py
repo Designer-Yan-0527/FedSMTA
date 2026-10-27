@@ -111,6 +111,18 @@ class Server_DF(object):
         max_rounds = int(getattr(self.args, 'max_rounds', 0) or 0)
         end_round = total_rounds if max_rounds <= 0 else min(total_rounds, max_rounds)
 
+        # --route_audit: read-only forensics logger (default OFF). Attached
+        # here so every client can log A/B timepoints; the server logs the
+        # cross-branch alignment and the fusion (C) timepoints.
+        if getattr(self.args, 'route_audit', False) and self.run_manager is not None:
+            from diagnostics.route_audit import RouteAuditLogger
+            self.route_audit_logger = RouteAuditLogger(
+                self.run_manager.run_dir, self.args.seed)
+            for c in self.clients:
+                c.route_audit_logger = self.route_audit_logger
+        else:
+            self.route_audit_logger = None
+
         for i in range(start_round, end_round):
             self.thisclients = [i for i in range(self.client_num)]
 
@@ -142,6 +154,18 @@ class Server_DF(object):
             for j in self.thisclients:
                 self.clients[j].train(round=i,args=self.args)
 
+            # --route_audit: cross-branch key alignment after all local
+            # trainings (same-slot cosine / cross-Gram / principal angles),
+            # read from each client's OWN snapshot. Separates "each branch
+            # collapsed internally" from "branches healthy but drifted into
+            # different subspaces" (distillation targets incoherent).
+            if self.route_audit_logger is not None:
+                _keys = {j: self.clients[j].prompts.prompt_key
+                         for j in self.thisclients
+                         if self.clients[j].prompts is not None}
+                if _keys:
+                    self.route_audit_logger.log_cross_branch(i, _keys)
+
             # Phase 0: local-phase accuracies (after local training, before
             # aggregation) -> metrics/train_log.csv
             # (skipped entirely under --no_instrumentation)
@@ -162,8 +186,23 @@ class Server_DF(object):
 
             # BUGFIX: hardcoded `!= 4` assumed global_epoch == 5; with other
             # values the last round of a task wrongly skipped SIKF fusion
-            if i % self.global_epoch != self.global_epoch - 1:
-                self.kd_fusion_prompt(self.thisclients)
+            # --route_audit timepoint C: the server key is the deepcopy of
+            # client[0]'s branch fused by kd_fusion_prompt below; pre/post
+            # hashes settle empirically whether the fusion changed it at all.
+            _fusion_ran = i % self.global_epoch != self.global_epoch - 1
+            if self.route_audit_logger is not None:
+                _src = self.clients[self.thisclients[0]].prompts
+                if _src is not None:
+                    self.route_audit_logger.log_key_snapshot(
+                        i, "pre_fusion", self.thisclients[0],
+                        _src.prompt_key)
+            if _fusion_ran:
+                self.kd_fusion_prompt(self.thisclients, round_i=i)
+            if self.route_audit_logger is not None and self.prompt is not None:
+                self.route_audit_logger.log_key_snapshot(
+                    i, "post_fusion", None, self.prompt.prompt_key,
+                    note="fusion_ran" if _fusion_ran
+                    else "fusion_skipped_this_round_prompt_stale")
 
             # HS-N fix switch (default OFF = official behavior, bit-identical):
             # skip fed_avg_head entirely. The paper (arXiv 2412.18355 Fig. 3 /
@@ -593,7 +632,7 @@ class Server_DF(object):
             print("All values have the same shape.")
 
 
-    def kd_fusion_prompt(self,chosen_clients):
+    def kd_fusion_prompt(self,chosen_clients,round_i=None):
         my_result = None
         if len(chosen_clients)==1:
             # BUGFIX: clients have no .global_prompt attribute -> AttributeError
@@ -628,6 +667,17 @@ class Server_DF(object):
                             cls_features = None
 
                     self.model.load_prompts(my_result)
+                    # --route_audit: capture the model-side STUDENT key NOW:
+                    # load_prompts() deepcopies my_result into self.model, so
+                    # the forward runs through this throwaway parameter while
+                    # Adam steps my_result (whose .grad stays None -- the
+                    # suspected structural no-op). The teacher loop below
+                    # replaces self.model.prompt, so the reference must be
+                    # taken before it.
+                    _audit_model_key = (
+                        self.model.get_prompts().prompt_key
+                        if getattr(self, 'route_audit_logger', None) is not None
+                        else None)
                     output = self.model.forward_features(x, cls_features=cls_features, train=False)['x']
                     outputs = []
                     with torch.no_grad():
@@ -638,6 +688,28 @@ class Server_DF(object):
                             outputs.append(my)
 
                     loss = global_distillation_loss(output,outputs)
+                    # --route_audit: first fusion minibatch of the round.
+                    # Captures per-teacher distill losses, teacher-output
+                    # pairwise consistency, and the distillation gradient
+                    # w.r.t. BOTH key objects:
+                    #   * model_key   = the throwaway deepcopy the student
+                    #     forward actually ran through (captured above), and
+                    #   * optimizer_key = my_result.prompt_key (what the
+                    #     Adam above actually steps).
+                    # If optimizer_key grads are None while model_key grads
+                    # are finite, the SIKF fusion is EMPIRICALLY a no-op.
+                    if (getattr(self, 'route_audit_logger', None) is not None
+                            and h == 0 and iteration == 0):
+                        with torch.no_grad():
+                            _per_teacher = [
+                                float(global_distillation_loss(output, [o]))
+                                for o in outputs]
+                        self.route_audit_logger.log_fusion_audit(
+                            round_i, iteration, loss,
+                            _audit_model_key,
+                            my_result.prompt_key,
+                            output, outputs,
+                            list(chosen_clients[1:]), _per_teacher)
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()

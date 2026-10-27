@@ -134,6 +134,21 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--route_tau', default=0.1, type=float,
                             help='R2 soft routing temperature: w = softmax(similarity/tau). '
                                  'Only used with --route_fix (probe-validated default 0.1).')
+    subparsers.add_argument('--route_audit', action='store_true',
+                            help='A2-R collapse forensics instrumentation '
+                                 '(default OFF = official path bit-identical). '
+                                 'ON adds read-only diagnostics only (never '
+                                 'changes loss/optimizer/data/RNG): key '
+                                 'snapshots at three timepoints (branch '
+                                 'init/start, per-client post-local, '
+                                 'pre/post SIKF fusion), first-minibatch '
+                                 'CE/pull gradient audit per client, and '
+                                 'fusion-batch distillation gradient audit '
+                                 'vs BOTH the model key and the optimizer '
+                                 'key (empirically settles whether '
+                                 'kd_fusion is a structural no-op). '
+                                 'Output: <run_dir>/route_audit/*.jsonl+npz. '
+                                 'See RUNCOMMANDS.md Sec.20.3.')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
     subparsers.add_argument('--client_num', default=5, type=int,

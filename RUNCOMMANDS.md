@@ -443,3 +443,49 @@ python main.py datasets_delay \
 - resume：`route_fix`/`route_tau` 随 args 全量入 checkpoint（`build_checkpoint.args`）；行为开关以命令行传参为准（模型参数从 state_dict 恢复），跨开关 resume 自行保证传参一致
 - 冒烟（1 任务 + protected 0 slots 预期）：
   `python main.py datasets_delay --data_name cifar100 --method fedta_a2 --a2_arm both --skip_fed_avg_head --route_fix --task_num 1 --global_epoch 5 --local_epoch 1 --seed 42 --run_name routefix_smoke`
+
+### 20.3 `--route_audit` 塌缩取证插桩（A 方案门控 FAIL 后的定位诊断，2026-10-27）
+
+> **触发事由**：A 方案（pull 解耦，commit b4311c8+be2d491）round-0 门控 **FAIL**（key 有效秩 87.8→6.59、样本间 w 余弦 0.8726、使用熵 0.85 bits，全局与 5 客户端全挂）——全池软 pull 被**证伪为塌缩的必要条件**。剩余嫌疑：CE 全池软路由梯度路径、客户端本地训练、SIKF 蒸馏融合（本仓库 prompt key **无任何 FedAvg**：`fed_avg_prompt` 死代码、5 客户端共享同一 ViT、keys 的"聚合"= `kd_fusion_prompt` 蒸馏）。
+> **结构性疑点（插桩将实证）**：`kd_fusion_prompt` 的 Adam 作用于 `my_result.parameters()`，但前向经 `load_prompts()` deepcopy 出的 `self.model.prompt` 运行——梯度落在模型内的一次性副本上，`my_result` 的 `.grad` 恒为 None（Adam 跳过 grad-None 参数）→ **蒸馏疑似结构性 no-op**（server prompt ≡ client-0 分支原样）。若属实，塌缩完全发生在本地训练阶段。
+> **实现**：`--route_audit`（默认 off = 官方路径零改动）。ON 时只读插桩：A 时刻（分支起点 key 快照 + sha256 实证 5 个 round-0 再初始化是否逐字节一致，不因共享 route_seed 而假设）、每客户端首 minibatch CE/pull 梯度审计（`torch.autograd.grad`，retain_graph，不写 `.grad`、不耗 RNG，训练逐位不变——单测 `tests/test_route_audit_invariance.py` 5/5 PASS 含 off/on 逐位等价）、B 时刻（各自 `self.prompts` 快照，**不读共享 ViT**）、跨分支对齐（同槽余弦/跨分支 Gram/子空间主角度——区分"分支内部塌缩"与"分支间子空间漂移"）、C 时刻（pre/post 融合 + 蒸馏首 batch 对**模型侧 key 与优化器侧 key 双梯度**审计，直接判定 no-op）。输出 `<run_dir>/route_audit/*.jsonl+npz`。
+
+```bash
+# 20.3a 塌缩取证 run（与 20.1 全同协议 + --route_audit + --max_rounds 1，新 run_name 保隔离）
+python main.py datasets_delay \
+    --data_name cifar100 --method fedta \
+    --route_fix --route_tau 0.1 \
+    --route_audit \
+    --seed 42 --global_epoch 5 --threshold 0.25 \
+    --run_name cifar_route_audit \
+    --max_rounds 1 \
+    --data-path <DATA_PATH>
+
+# 20.3b 插桩不变性集成验证：本 run（audit ON）的 round_0000.pth 应与
+#      be2d491 无插桩 run（cifar_route_fix/seed_42，同 seed 同协议）逐位一致
+python - <<'EOF'
+import torch
+a = torch.load("output/cifar100/fedta/cifar_route_audit/seed_42/checkpoints/round_0000.pth",
+               map_location="cpu")
+b = torch.load("output/cifar100/fedta/cifar_route_fix/seed_42/checkpoints/round_0000.pth",
+               map_location="cpu")
+mism = [k for k in ("server_model", "server_prompt", "global_head")
+        if not all(torch.equal(a[k][t], b[k][t])
+                   for t in a[k] if torch.is_tensor(a[k][t]))]
+print("MISMATCH:", mism if mism else "NONE (bitwise identical)")
+EOF
+
+# 20.3c 单元测试（含 off/on 逐位不变性 + no-op 检测器）
+python -m unittest tests.test_route_audit_invariance -v
+
+# 20.3d 官方 parity 回归（route_audit 默认 off 硬约束；官方仓库克隆所在机器执行）
+python tests/test_official_fedta_parity.py \
+    --official_repo /path/to/official_FedTA \
+    --data_path ./local_datasets \
+    --global_epoch 5 --task_num 2 --rounds 10 --local_epoch 1 \
+    --batch_size 16 --surrogate_num 20 --threshold 0.25 \
+    --seed 42 --device cuda
+```
+
+- 判读顺序（20.3a 跑完后）：① 5 个 `init` 快照 sha256 应一致（R1 再播种确定性）；② `init→post_local` 有效秩分解塌缩量（本地训练责任）；③ `cross_branch` 同槽余弦/子空间主角度（分支间漂移）；④ `fusion_audit` 的 `optimizer_target_grad_was_none`（True = 蒸馏 no-op 实证）；⑤ `pre_fusion` vs `post_fusion` sha256（不一致才有实际融合发生）
+- 约束：`--route_audit` 不改变 loss/优化器/数据/RNG/客户端顺序；resume 跨 audit 开关安全（观察者性质，不入 RESUME_MUST_MATCH）
