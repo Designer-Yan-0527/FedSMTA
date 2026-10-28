@@ -578,12 +578,41 @@ python main.py datasets_delay \
 
 **c0 重点观察**：若 E1 后 c0 仍显著低于其余客户端（如 4/86/88/90/84 形态），则 pull+WD 次级通路升级为独立问题，开第二层诊断；若 85/88/90/87/89 形态则 Track A 修复闭合。
 
-**E1 后续（审查者裁决的顺序，勿提前混因果）**：E1 通过 Gate 1-3 但 Gate 2 出现未使用 key 范数萎缩 → 才做 **E2 = E1 + prompt_key no-weight-decay**（归一化路由 key 语义由方向决定，对 raw key 做 L2 shrink 本身值得质疑）；E1 完整通过 → τ 作为第二阶段性能超参数；Track A 升格为 **Gradient-Decoupled Soft Prompt Routing** 正式方法模块。
+**E1 实测结果（2026-10-28，cifar_route_repair_E1_selectedce/seed_42）**：Gate 1 FAIL（c0 4.85 全塌；c1-c4 = 54.84/65.00/56.70/52.21，从 A 的 3.5-6.6 半修复但低于 70 门槛与 B 臂 81-91）；Gate 2 FAIL（`key_frac_norm_lt_1e-3` 0.97-0.98 全体，与 B 臂 0.0067 同量级——E1 按设计保留原 wd，预期之中）；Gate 3 c0 FAIL（跨客户端 top-10 子空间余弦 0.917，暂不解释）；Gate 4 PASS（92.70 vs A 92.15 vs B 92.38，c0=95.65 全场最高）。**两个新发现**：① wd 萎缩与方向劣化疑似同机制——key 范数被磨小后，CE 梯度经 `l2_normalize` 的 Jacobian（∝1/|K|）被放大，小更新大幅扭转已萎缩 key 的方向（E1 c1-c4 秩 52-65 < B 臂 81-91 的解释）；② c0 对一切 CE 侧干预免疫（A 6.59 / B 3.92 / E1 4.85 三臂全塌）且准确率解耦，触发预注册的 pull+WD 第二层诊断条件。
+
+**E2 放行（2026-10-28 第三轮终审）**：E2 = E1 + `prompt_key` no-weight-decay，严格单变量（R1 init、τ=0.1、selected-slot CE backward、pull、prompt/value wd、optimizer/LR/epochs/data/seed 全不变），仅 `prompt_key` 的 weight decay 1e-3→0（optimizer 双参数组）。fail-closed：必须同时开 `--route_fix` 与 `--route_selected_ce_grad`。判读重点：E2 同时检验 Gate 1 与 Gate 2 是否同一 wd 机制（若 E2 后秩回升至 >70 且 near-zero 两档≈0，则一次修复两个 Gate）；**c0 是 E2 的第一刀诊断**——c0 复活 → WD 是 E1 条件下的主要次级通路；c0 仍塌 → 预注册 E3 = E2 + disable_pull（此时才干净归因 pull，勿提前）。正确结论表述（审查者措辞）：E1 证明了 selected-slot CE backward 消除了 dense CE coupling 的大部分几何塌缩（3-6 → 52-65），但保留原 WD 时产生 dormant-key norm collapse，单独不足以形成最终修复——不写"selected-slot CE 没用"。
 
 ```bash
-# 20.5b 单测（E1 梯度拓扑 + 前向逐位一致 + fail-closed + 默认 off 不变）
+# 20.5b 单测（E1 梯度拓扑 + E2 参数组不变量/fail-closed/零梯度 wd 判别 + route_audit E2 证据字段 + 前向逐位一致 + 默认 off 不变）
 python -m unittest tests.test_route_ablation_switches -v
 ```
+
+### 20.5c E2 修复臂：E1 + prompt_key no-weight-decay（2026-10-28 第三轮终审放行）
+
+```bash
+# 20.5c E2 臂（--max_rounds 1 短程，与 A/B/E1 同协议对照；仅在 E1 命令上单变量追加 --route_key_no_wd）
+python main.py datasets_delay \
+    --data_name cifar100 --method fedta \
+    --route_fix --route_tau 0.1 \
+    --route_selected_ce_grad \
+    --route_key_no_wd \
+    --route_audit \
+    --seed 42 --global_epoch 5 --threshold 0.25 \
+    --run_name cifar_route_repair_E2_keynowd \
+    --max_rounds 1 \
+    --data-path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+```
+
+**判读（四 Gate 全部逐 client，Gate 2 为 E2 核心因果指标；Gate 4 须 corrected 口径）**：
+
+| Gate | E2 判据 | 说明 |
+|---|---|---|
+| 1. Key geometry | 秩 >70，最好接近 D 官方 ≈88（不要求 99） | E1 c1-c4 只有 52-65 |
+| 2. Key norm | `key_frac_norm_lt_1e-3` **≈0**、`key_frac_norm_lt_1e-2` 显著下降；看 median/p10/p25（route_audit 已加，mean 易被少数大 key 掩盖） | E1 为 0.97-0.98 |
+| 3. Routing utilization | 熵↑、top-1 dominance↓，不退回官方单槽 | 同 E1 |
+| 4. Accuracy | Acc_E2 ≥ Acc_A2，且用 Track E corrected 口径判（短程 native 数字仅作同协议臂间参照） | 审查者要求 |
+
+**新增机制证据（审查者要求的 WD 因果记录）**：route_audit post_local 行新增 `key_norm_ratio_*`（|K_post|/|K_init| 的 mean/median/p10/p25/min/max）与 `n_selected_slots_{ce,pull,union}` + `key_norm_ratio_{selected,unselected}_mean`（按"本轮被 CE selected-slot backward 和/或 pull 触碰过"分组）。判读形态：若 E1 未选中 key ratio≈0、E2 未选中 key ratio≈1，即 wd 因果链的漂亮证据。若 E2 后 c0 复活（如 82/88/90/87/86 形态）→ WD 是主要次级通路；c0 仍 3-5 → 跑预注册 E3 = E2 + `--disable_pull`。0.917 子空间趋同：等 E2 去除 near-zero key 后再解释，暂不立项。
 
 ## 21. Track B/E 探针命令（SSRA headroom / H1-H2 / 评测 Dropout 因果与重评，2026-10-28）
 

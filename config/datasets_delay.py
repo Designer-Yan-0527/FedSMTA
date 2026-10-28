@@ -165,6 +165,24 @@ def get_args_parser(subparsers):
                                  'collapse driver (B/C/D verdict) without '
                                  'the B-arm key-norm starvation side effect. '
                                  'See RUNCOMMANDS.md Sec.20.5.')
+    subparsers.add_argument('--route_key_no_wd', action='store_true',
+                            help='A2-R repair arm E2 (2026-10-28 GPT ruling, '
+                                 'default OFF = bit-identical). Strictly '
+                                 'single-variable on top of E1: ONLY the '
+                                 'prompt_key weight decay 1e-3 -> 0 via '
+                                 'optimizer parameter groups (tau, R1 init, '
+                                 'selected-slot CE backward, pull, '
+                                 'prompt/value wd, optimizer/LR/epochs/data/'
+                                 'seed all unchanged). Requires --route_fix '
+                                 'AND --route_selected_ce_grad (E2 = E1 + '
+                                 'key-only no-wd; fail-closed otherwise). '
+                                 'Rationale: E1 showed 97-98 percent of keys '
+                                 'starved to |K|<1e-3 by wd, and the '
+                                 'l2_normalize '
+                                 'Jacobian (~1/|K|) amplifies direction '
+                                 'rotation of shrunk keys, coupling Gate 1 '
+                                 '(rank) and Gate 2 (norm health). See '
+                                 'RUNCOMMANDS.md Sec.20.5b.')
     subparsers.add_argument('--disable_pull', action='store_true',
                             help='A2-R ablation arm C (2026-10-28, default OFF = '
                                  'bit-identical). Removes the -0.1*reduce_sim pull '

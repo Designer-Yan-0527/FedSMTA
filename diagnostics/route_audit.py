@@ -104,6 +104,13 @@ def key_stats(key):
         "key_norm_std": round(float(norms.std().item()), 6),
         "key_norm_min": round(float(norms.min().item()), 6),
         "key_norm_max": round(float(norms.max().item()), 6),
+        # E2 Gate 2（2026-10-28 终审 §5）：mean 容易被少数大 key 掩盖，
+        # 补 median 与 p10/p25 分位。
+        "key_norm_median": round(float(norms.median().item()), 6),
+        "key_norm_p10": round(float(
+            torch.quantile(norms, 0.10).item()), 6),
+        "key_norm_p25": round(float(
+            torch.quantile(norms, 0.25).item()), 6),
         # E1 臂监控（2026-10-28 终审 Gate 2）：B 臂暴露了 rank healthy ≠
         # key pool healthy——detach 后无梯度 key 被 weight decay 磨到近零
         # （mean 0.0067）。near-zero key fraction 按审查者建议取
@@ -131,6 +138,11 @@ class RouteAuditLogger(object):
         self.seed = seed
         self.t0 = time.time()
         self._f = open(self.jsonl_path, "a", encoding="utf-8", buffering=1)
+        # E2 mechanism evidence: per-(round, client) init/branch_start key
+        # snapshot cache so post_local can report |K_post|/|K_init| ratio
+        # stats, grouped by slots the CE selected-slot backward and/or pull
+        # actually touched this round (reviewer request, non-blocking).
+        self._init_key_cache = {}
 
     # -- internals ---------------------------------------------------------
 
@@ -168,11 +180,56 @@ class RouteAuditLogger(object):
 
     # -- timepoint A / B / C key snapshots ----------------------------------
 
-    def log_key_snapshot(self, round_id, phase, client_id, key, note=None):
+    def log_key_snapshot(self, round_id, phase, client_id, key, note=None,
+                         selected_slots=None):
+        """Key snapshot at a timepoint. On post_local, additionally reports
+        per-key norm ratio |K_post|/|K_init| (vs the cached init snapshot
+        for the same (round, client)) and, when selected_slots is given
+        ({"ce": [...], "pull": [...]}), the ratio grouped by touched vs
+        untouched slots. Read-only; no effect on training."""
         row = self._base_row(round_id, phase, client_id=client_id)
         row.update(key_stats(key))
         if note:
             row["note"] = note
+        if phase in ("init", "branch_start"):
+            self._init_key_cache[(round_id, client_id)] = (
+                key.detach().cpu().float().clone())
+        elif phase == "post_local":
+            init_key = self._init_key_cache.pop((round_id, client_id), None)
+            if init_key is not None and init_key.shape == key.shape:
+                init_norms = init_key.norm(dim=1)
+                norms = key.detach().cpu().float().norm(dim=1)
+                ratio = norms / (init_norms + 1e-12)
+                row["key_norm_ratio_mean"] = round(
+                    float(ratio.mean().item()), 6)
+                row["key_norm_ratio_median"] = round(
+                    float(ratio.median().item()), 6)
+                row["key_norm_ratio_p10"] = round(float(
+                    torch.quantile(ratio, 0.10).item()), 6)
+                row["key_norm_ratio_p25"] = round(float(
+                    torch.quantile(ratio, 0.25).item()), 6)
+                row["key_norm_ratio_min"] = round(
+                    float(ratio.min().item()), 6)
+                row["key_norm_ratio_max"] = round(
+                    float(ratio.max().item()), 6)
+            if selected_slots:
+                ce = sorted(set(int(s) for s in
+                                (selected_slots.get("ce") or [])))
+                pull = sorted(set(int(s) for s in
+                                  (selected_slots.get("pull") or [])))
+                row["n_selected_slots_ce"] = len(ce)
+                row["n_selected_slots_pull"] = len(pull)
+                union = sorted(set(ce) | set(pull))
+                row["n_selected_slots_union"] = len(union)
+                if init_key is not None and init_key.shape == key.shape \
+                        and union:
+                    mask = torch.zeros(ratio.shape[0], dtype=torch.bool)
+                    mask[torch.tensor(union, dtype=torch.long)] = True
+                    row["key_norm_ratio_selected_mean"] = round(float(
+                        ratio[mask].mean().item()), 6)
+                    row["key_norm_ratio_unselected_mean"] = round(float(
+                        ratio[~mask].mean().item()), 6) \
+                        if bool((~mask).any()) else None
         self._write(row, tensors={"key": key})
         return row
 

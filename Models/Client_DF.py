@@ -29,6 +29,27 @@ import matplotlib.pyplot as plt
 
 
 # 每个客户端拥有的
+def split_key_param_groups(params, key_param):
+    """E2（--route_key_no_wd）optimizer 参数组切分：按 id() 把参数序列
+    精确划分为 (key_group, other_group)——单遍分区保证两组互斥且并集
+    等于输入参数集（审查者要求的 fail-closed 不变量，由单测覆盖）。
+    key_param 缺失时立即报错（不允许静默退化成全量 wd）。"""
+    key_id = id(key_param)
+    seen = set()
+    key_group, other_group = [], []
+    for p in params:
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        (key_group if pid == key_id else other_group).append(p)
+    if not key_group:
+        raise SystemExit(
+            "split_key_param_groups: prompt_key not found among "
+            "vit.parameters() -- refusing to build E2 optimizer")
+    return key_group, other_group
+
+
 class Client_DF(object):
 
     def __init__(self,id,original_model,model_name,task_per_global_epoch,subset,local_epoch,batch_size,lr,device,method,class_mask,args,vit):
@@ -288,11 +309,37 @@ class Client_DF(object):
             self._a2_post_step_restore()
 
 
+    def _build_vit_optimizer(self, args):
+        """官方 Adam(vit.parameters(), lr, wd=1e-3)——默认逐位一致。
+        E2（--route_key_no_wd，2026-10-28 GPT 放行）：双参数组，仅
+        prompt_key 的 weight_decay 置 0，其余全部参数保持 1e-3（严格
+        单变量；fail-closed：必须同时开 --route_fix 与
+        --route_selected_ce_grad，即 E2 = E1 + key-only no-wd）。"""
+        if not bool(getattr(args, 'route_key_no_wd', False)):
+            return torch.optim.Adam(self.vit.parameters(), lr=self.lr,
+                                    weight_decay=1e-03)
+        if not (bool(getattr(args, 'route_fix', False))
+                and bool(getattr(args, 'route_selected_ce_grad', False))):
+            raise SystemExit(
+                "--route_key_no_wd requires --route_fix and "
+                "--route_selected_ce_grad (E2 = E1 + key-only no-wd)")
+        key_param = self.vit.get_prompts().prompt_key
+        key_group, other_group = split_key_param_groups(
+            self.vit.parameters(), key_param)
+        return torch.optim.Adam(
+            [{"params": key_group, "weight_decay": 0.0},
+             {"params": other_group, "weight_decay": 1e-3}],
+            lr=self.lr)
+
     def train(self, round, args):
         self.original_model.eval()
 
         _audit_logger = self.route_audit_logger if getattr(
             args, 'route_audit', False) else None
+        # --route_audit E2 evidence: slots touched by CE selected-slot
+        # backward and/or pull this round (read-only union; see tracking
+        # block in the training loop).
+        _route_sel_union = {"ce": set(), "pull": set()}
 
         if self.prompts is not None:
             self.vit.load_prompts(self.prompts)
@@ -323,8 +370,8 @@ class Client_DF(object):
         train_loader = DataLoader(self.traindata, batch_size=16, num_workers=args.num_workers, shuffle=True)
         print(f'Client {self.id} on Task {self.task_id} is training prompts')
 
-        # training input enhancement
-        optimizer = torch.optim.Adam(self.vit.parameters(), lr=self.lr,weight_decay=1e-03)
+        # Input-Enhancement
+        optimizer = self._build_vit_optimizer(args)
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
         cos = nn.CosineEmbeddingLoss()
         for epoch in tqdm(range(self.local_epoch)):
@@ -355,6 +402,22 @@ class Client_DF(object):
                     loss = criterion(logits, target)
                 else:
                     loss = criterion(logits,target)  - 0.1 * pull_off
+                # --route_audit selected-slot union tracking (E2 Gate 2
+                # mechanism evidence, read-only): per-key |K_post|/|K_init|
+                # will be grouped by "touched by CE and/or pull this
+                # round" at post_local. Indices are detached; no RNG, no
+                # gradient, training bit-identical.
+                if _audit_logger is not None:
+                    _tsel = output.get('ce_route_topk')
+                    if _tsel is not None:
+                        _route_sel_union["ce"].update(
+                            int(s) for s in
+                            _tsel.detach().cpu().flatten().tolist())
+                    _psel = output.get('pull_idx')
+                    if _psel is not None:
+                        _route_sel_union["pull"].update(
+                            int(s) for s in
+                            _psel.detach().cpu().flatten().tolist())
                 # --route_audit: first-minibatch CE/pull gradient audit on
                 # the REAL forward graph. torch.autograd.grad with
                 # retain_graph=True never writes .grad and never consumes
@@ -439,7 +502,11 @@ class Client_DF(object):
         # will re-initialize/reload before this object is inspected).
         if _audit_logger is not None:
             _audit_logger.log_key_snapshot(
-                round, "post_local", self.id, self.prompts.prompt_key)
+                round, "post_local", self.id, self.prompts.prompt_key,
+                selected_slots={
+                    "ce": sorted(_route_sel_union["ce"]),
+                    "pull": sorted(_route_sel_union["pull"]),
+                })
 
     def load_global_weights(self,weights):
         self.model.load_state_dict(weights)
@@ -1038,7 +1105,7 @@ class Client_DF(object):
         print(f'Client {self.id} on Task {self.task_id} is training prompts')
 
         # Input-Enhancement
-        optimizer = torch.optim.Adam(self.vit.parameters(), lr=self.lr,weight_decay=1e-03)
+        optimizer = self._build_vit_optimizer(args)
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
         cos = nn.CosineEmbeddingLoss()
         for epoch in tqdm(range(self.local_epoch)):

@@ -421,5 +421,220 @@ class TestArmESelectedCeGrad(unittest.TestCase):
                                     torch.get_rng_state()))
 
 
+class _StubPromptPool(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prompt_key = torch.nn.Parameter(torch.randn(6, 8))
+
+
+class _StubVit(torch.nn.Module):
+    """Minimal vit stand-in: parameters() must include the pool key so the
+    E2 partition invariants are exercised on a realistic structure."""
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = torch.nn.Linear(8, 8)
+        self.pool = _StubPromptPool()
+
+    def get_prompts(self):
+        return self.pool
+
+
+def _make_e2_client(route_key_no_wd=False, route_fix=True,
+                   route_selected_ce_grad=True):
+    from Models.Client_DF import Client_DF
+    args = types.SimpleNamespace(
+        nb_classes=20, route_fix=route_fix,
+        route_selected_ce_grad=route_selected_ce_grad,
+        route_key_no_wd=route_key_no_wd)
+    return Client_DF(0, None, 'Tail_Anchor', 5, [None] * 10, 1, 16, 0.01,
+                     'cpu', 'fedta', [[0] * 20] * 10, args, _StubVit())
+
+
+class TestArmE2KeyNoWd(unittest.TestCase):
+    """E2 repair arm (--route_key_no_wd, 2026-10-28 GPT approval):
+    strictly single-variable on top of E1 -- ONLY prompt_key's weight decay
+    goes 1e-3 -> 0, via optimizer parameter groups. E1 forensics: 97-98% of
+    keys starved to |K|<1e-3 by wd, and the l2_normalize Jacobian (~1/|K|)
+    amplifies direction rotation of shrunk keys, coupling Gate 1 (rank)
+    and Gate 2 (norm health)."""
+
+    def test_default_off_single_group_official(self):
+        """Flag OFF: exactly the official Adam(vit.parameters(), wd=1e-3) --
+        one group, same parameter sequence (bit-identical path)."""
+        client = _make_e2_client(route_key_no_wd=False)
+        opt = client._build_vit_optimizer(
+            types.SimpleNamespace(route_key_no_wd=False))
+        self.assertEqual(len(opt.param_groups), 1)
+        self.assertEqual(opt.param_groups[0]['weight_decay'], 1e-3)
+        self.assertEqual([id(p) for p in opt.param_groups[0]['params']],
+                         [id(p) for p in client.vit.parameters()])
+
+    def test_e2_param_groups_exact_partition(self):
+        """Flag ON: two groups; wd=0 ONLY on prompt_key, 1e-3 elsewhere;
+        groups disjoint, union == every trainable parameter (the reviewer's
+        fail-closed invariant)."""
+        client = _make_e2_client(route_key_no_wd=True)
+        args = types.SimpleNamespace(
+            route_key_no_wd=True, route_fix=True,
+            route_selected_ce_grad=True)
+        opt = client._build_vit_optimizer(args)
+        self.assertEqual(len(opt.param_groups), 2)
+        key_group, other_group = opt.param_groups
+        self.assertEqual(key_group['weight_decay'], 0.0)
+        self.assertEqual(other_group['weight_decay'], 1e-3)
+        self.assertEqual([id(p) for p in key_group['params']],
+                         [id(client.vit.get_prompts().prompt_key)])
+        all_ids = [id(p) for p in client.vit.parameters()]
+        key_ids = {id(p) for p in key_group['params']}
+        other_ids = {id(p) for p in other_group['params']}
+        self.assertEqual(len(key_ids & other_ids), 0, "groups overlap")
+        self.assertEqual(key_ids | other_ids, set(all_ids),
+                         "union must cover every trainable parameter")
+        self.assertEqual(len(other_ids), len(all_ids) - 1)
+
+    def test_e2_wd_actually_exempts_key_in_a_step(self):
+        """End-to-end single step, zero-grad discriminator: torch Adam
+        couples wd into grad, so with zero grad a wd>0 param STILL moves
+        (~ -lr*sign(p)) while a wd=0 param stays bit-identical. Flag ON:
+        key untouched, backbone moves. Flag OFF: key moves too (official)."""
+        torch.manual_seed(3)
+        client_on = _make_e2_client(route_key_no_wd=True)
+        torch.manual_seed(3)
+        client_off = _make_e2_client(route_key_no_wd=False)
+        key_on0 = client_on.vit.get_prompts().prompt_key.detach().clone()
+        key_off0 = client_off.vit.get_prompts().prompt_key.detach().clone()
+        bb_on0 = client_on.vit.backbone.weight.detach().clone()
+        self.assertTrue(torch.equal(key_on0, key_off0))
+        # flag ON: key exempt (bit-identical), backbone coupled wd moves it
+        opt_on = client_on._build_vit_optimizer(types.SimpleNamespace(
+            route_key_no_wd=True, route_fix=True, route_selected_ce_grad=True))
+        for p in client_on.vit.parameters():
+            p.grad = torch.zeros_like(p)
+        opt_on.step()
+        self.assertTrue(torch.equal(
+            client_on.vit.get_prompts().prompt_key.detach(), key_on0),
+            "E2 key must not shrink with zero grad (wd exempt)")
+        self.assertFalse(torch.equal(
+            client_on.vit.backbone.weight.detach(), bb_on0),
+            "other params must still receive the coupled wd update")
+        # flag OFF: official optimizer shrinks the key too
+        opt_off = client_off._build_vit_optimizer(
+            types.SimpleNamespace(route_key_no_wd=False))
+        for p in client_off.vit.parameters():
+            p.grad = torch.zeros_like(p)
+        opt_off.step()
+        self.assertFalse(torch.equal(
+            client_off.vit.get_prompts().prompt_key.detach(), key_off0),
+            "official coupled wd must reach prompt_key")
+
+    def test_fail_closed_without_e1_flags(self):
+        """E2 requires --route_fix AND --route_selected_ce_grad
+        (E2 = E1 + key-only no-wd); anything less must refuse to build."""
+        client = _make_e2_client(route_key_no_wd=True,
+                                 route_selected_ce_grad=False)
+        with self.assertRaises(SystemExit):
+            client._build_vit_optimizer(types.SimpleNamespace(
+                route_key_no_wd=True, route_fix=True,
+                route_selected_ce_grad=False))
+        client = _make_e2_client(route_key_no_wd=True, route_fix=False)
+        with self.assertRaises(SystemExit):
+            client._build_vit_optimizer(types.SimpleNamespace(
+                route_key_no_wd=True, route_fix=False,
+                route_selected_ce_grad=True))
+
+    def test_split_missing_key_fails_closed(self):
+        from Models.Client_DF import split_key_param_groups
+        p1, p2 = torch.nn.Parameter(torch.randn(2)), \
+            torch.nn.Parameter(torch.randn(2))
+        with self.assertRaises(SystemExit):
+            split_key_param_groups([p1, p2],
+                                   torch.nn.Parameter(torch.randn(2)))
+
+
+class TestRouteAuditE2Evidence(unittest.TestCase):
+    """route_audit E2 additions: key_norm median/p10/p25 in every snapshot;
+    post_local |K_post|/|K_init| ratio stats + selected/unselected grouping
+    (reviewer-requested WD causal evidence); backward compatible with
+    pre-E2 callers (no selected_slots -> no grouping fields)."""
+
+    def _logger(self, tmp):
+        from diagnostics.route_audit import RouteAuditLogger
+        return RouteAuditLogger(tmp, seed=42)
+
+    def _rows(self, tmp):
+        import json
+        path = os.path.join(tmp, "route_audit", "route_audit.jsonl")
+        return [json.loads(l) for l in open(path)]
+
+    def test_norm_ratio_and_selected_grouping(self):
+        import tempfile
+        torch.manual_seed(5)
+        k0 = torch.randn(6, 8)
+        k1 = k0.clone()
+        k1[0] *= 2.0
+        k1[1] *= 0.25
+        k1[2] *= 1.5
+        k1[3] *= 0.5
+        k1[4] *= 0.75
+        k1[5] *= 1.25
+        with tempfile.TemporaryDirectory() as tmp:
+            log = self._logger(tmp)
+            log.log_key_snapshot(0, "init", 0, k0)
+            log.log_key_snapshot(0, "post_local", 0, k1,
+                                 selected_slots={"ce": [0, 2],
+                                                 "pull": [2, 4]})
+            rows = self._rows(tmp)
+        init_row, post_row = rows
+        # every snapshot carries the new norm quantiles
+        for r in (init_row, post_row):
+            self.assertIn("key_norm_median", r)
+            self.assertIn("key_norm_p10", r)
+            self.assertIn("key_norm_p25", r)
+        # init phase: no ratio fields yet
+        self.assertNotIn("key_norm_ratio_mean", init_row)
+        ratio = k1.norm(dim=1) / k0.norm(dim=1)
+        self.assertAlmostEqual(post_row["key_norm_ratio_mean"],
+                               float(ratio.mean()), places=6)
+        self.assertAlmostEqual(post_row["key_norm_ratio_median"],
+                               float(ratio.median()), places=6)
+        # grouping: union of {0,2} and {2,4} == {0,2,4}
+        self.assertEqual(post_row["n_selected_slots_ce"], 2)
+        self.assertEqual(post_row["n_selected_slots_pull"], 2)
+        self.assertEqual(post_row["n_selected_slots_union"], 3)
+        sel = [0, 2, 4]
+        unsel = [1, 3, 5]
+        self.assertAlmostEqual(post_row["key_norm_ratio_selected_mean"],
+                               float(ratio[sel].mean()), places=6)
+        self.assertAlmostEqual(post_row["key_norm_ratio_unselected_mean"],
+                               float(ratio[unsel].mean()), places=6)
+
+    def test_post_local_without_selected_slots_backward_compatible(self):
+        import tempfile
+        torch.manual_seed(6)
+        k0, k1 = torch.randn(6, 8), torch.randn(6, 8)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = self._logger(tmp)
+            log.log_key_snapshot(0, "init", 3, k0)
+            log.log_key_snapshot(0, "post_local", 3, k1)
+            rows = self._rows(tmp)
+        post_row = rows[-1]
+        self.assertIn("key_norm_ratio_mean", post_row)
+        self.assertNotIn("n_selected_slots_union", post_row)
+        self.assertNotIn("key_norm_ratio_selected_mean", post_row)
+
+    def test_post_local_without_init_snapshot_is_safe(self):
+        import tempfile
+        torch.manual_seed(7)
+        k1 = torch.randn(6, 8)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = self._logger(tmp)
+            log.log_key_snapshot(0, "post_local", 1, k1)
+            rows = self._rows(tmp)
+        post_row = rows[-1]
+        self.assertNotIn("key_norm_ratio_mean", post_row)
+        self.assertIn("key_effective_rank", post_row)
+
+
 if __name__ == '__main__':
     unittest.main()
