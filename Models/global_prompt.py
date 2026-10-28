@@ -6,7 +6,7 @@ import torch.nn as nn
 class Global_Prompt(nn.Module):
     def __init__(self, length=5, embed_dim=768, embedding_key='mean', prompt_init='uniform', prompt_pool=False,
                  prompt_key=False, pool_size=None, top_k=None, batchwise_prompt=False, prompt_key_init='uniform',
-                 route_fix=False, route_tau=0.1, route_seed=0):
+                 route_fix=False, route_tau=0.1, route_seed=0, route_detach_ce_key_grad=False):
         super().__init__()
         self.length = length
         self.embed_dim = embed_dim
@@ -29,6 +29,18 @@ class Global_Prompt(nn.Module):
         self.route_fix = route_fix
         # R2 软路由温度 τ：w = softmax(similarity / route_tau)，CLI --route_tau
         self.route_tau = route_tau
+        # B 臂消融开关（CLI --route_detach_ce_key_grad，默认 False）：
+        # route_audit 取证（r0, seed42）判决塌缩 100% 发生在本地训练，
+        # 且 100 个 key 全部相互对齐——需要作用于全池的力，只有 CE 软路由
+        # 的 softmax 耦合提供。本开关把 CE 路由用的相似度改为基于
+        # prompt_norm.detach() 重算：前向数值逐位不变，但 CE 对 key 的
+        # 梯度被阻断（对样本特征的梯度保留）；pull 继续用原始未 detach
+        # 的 similarity（官方等价语义、仅选中槽）。与 --route_fix 绑定，
+        # 未开启 route_fix 时 fail-closed 拒绝（防静默无效配置）。
+        self.route_detach_ce_key_grad = route_detach_ce_key_grad
+        if self.route_detach_ce_key_grad and not self.route_fix:
+            raise ValueError(
+                "--route_detach_ce_key_grad only takes effect with --route_fix")
 
         # 初始化提示池  提示数量x长度x嵌入维度
         # 提示长度为5？
@@ -133,8 +145,19 @@ class Global_Prompt(nn.Module):
                     raise RuntimeError(
                         "--route_fix soft routing is incompatible with "
                         "use_prompt_mask=True")
-                # 按样本软加权，天然取代官方 batchwise 批内多数投票分支
-                w = torch.softmax(similarity / self.route_tau, dim=-1)  # B, Pool
+                # 按样本软加权，天然取代官方 batchwise 批内多数投票分支。
+                # B 臂消融（--route_detach_ce_key_grad）：CE 路由用的相似度
+                # 改为基于 prompt_norm.detach() 重算——数值与 similarity 逐位
+                # 相同（前向完全不变），但 CE 梯度不再经 w 流向 prompt_key
+                # （经 x_embed_norm 流向样本特征的路径保留）；pull 仍用下方
+                # 原始未 detach 的 similarity。默认 False 时 route_sim 就是
+                # similarity 本身，与开关引入前的代码逐位一致。
+                if self.route_detach_ce_key_grad:
+                    route_sim = torch.matmul(
+                        x_embed_norm, prompt_norm.detach().t())
+                else:
+                    route_sim = similarity
+                w = torch.softmax(route_sim / self.route_tau, dim=-1)  # B, Pool
                 batched_prompt = torch.einsum('bp,plc->blc', w, self.prompt)  # B, length, C
                 if self.top_k > 1:
                     # token 数保持 length×top_k 不变（结构兼容：官方聚合 /

@@ -133,6 +133,10 @@ def build_server(args, run_manager=None):
         route_fix=args.route_fix,
         route_tau=args.route_tau,
         route_seed=args.seed,
+        # B 臂消融（--route_detach_ce_key_grad）：CE 软路由对 key 的梯度
+        # 隔离。默认 False = 逐位一致；仅 --route_fix 时生效。
+        route_detach_ce_key_grad=bool(
+            getattr(args, 'route_detach_ce_key_grad', False)),
     )
 
     original_model.to(device)

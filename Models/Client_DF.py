@@ -347,7 +347,14 @@ class Client_DF(object):
                 not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
                 logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
 
-                loss = criterion(logits,target)  - 0.1 * pull_off
+                # C 臂消融（--disable_pull，默认 False = 逐位一致）：
+                # 从活跃 fedta loss 中移除 -0.1*reduce_sim pull 项，仅保留
+                # CE。reduce_sim 前向照常计算（route_audit 的梯度审计仍会
+                # 只读记录 pull 本可贡献的梯度）；优化器/数据/RNG/种子不变。
+                if bool(getattr(args, 'disable_pull', False)):
+                    loss = criterion(logits, target)
+                else:
+                    loss = criterion(logits,target)  - 0.1 * pull_off
                 # --route_audit: first-minibatch CE/pull gradient audit on
                 # the REAL forward graph. torch.autograd.grad with
                 # retain_graph=True never writes .grad and never consumes

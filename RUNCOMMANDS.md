@@ -489,3 +489,61 @@ python tests/test_official_fedta_parity.py \
 
 - 判读顺序（20.3a 跑完后）：① 5 个 `init` 快照 sha256 应一致（R1 再播种确定性）；② `init→post_local` 有效秩分解塌缩量（本地训练责任）；③ `cross_branch` 同槽余弦/子空间主角度（分支间漂移）；④ `fusion_audit` 的 `optimizer_target_grad_was_none`（True = 蒸馏 no-op 实证）；⑤ `pre_fusion` vs `post_fusion` sha256（不一致才有实际融合发生）
 - 约束：`--route_audit` 不改变 loss/优化器/数据/RNG/客户端顺序；resume 跨 audit 开关安全（观察者性质，不入 RESUME_MUST_MATCH）
+
+### 20.4 A2-R 塌缩归因消融矩阵（route_audit 取证判决后的 B/C/D 臂，2026-10-28）
+
+> **取证判决（20.3a，seed 42）**：塌缩 100% 发生在本地训练（init 99 → post_local 3.5-6.6，5/5 分支）；SIKF 融合实证 no-op（`optimizer_target_grad_was_none=true`，pre/post sha256 相同）；pull 单槽集中、CE 全池耦合（softmax 分母把梯度送达全部 key）。审查裁决：优先隔离 CE 的 key 梯度（B 臂），τ=1.0 温度消融暂缓（同时改变前向与反向，且高温会使样本间权重余弦趋近 1，即使 key 秩改善也会挂在原门控上）。**暂不修复 SIKF no-op、不启动完整训练与 A2 组合臂**——先分清本地训练两条 key 梯度路径的责任，再决定修复组合（修 no-op 前必须先控制塌缩：教师输出两两余弦已 0.77-0.87，接通 1.3e5 量级蒸馏梯度只会加速趋同）。
+
+| 臂 | CE 路由对 key 的梯度 | pull | 初始化 / τ | 已有结果 |
+|---|---|---|---|---|
+| A | 开 | 开 | 正交 / 0.1 | **塌缩**（cifar_route_audit，有效秩 3.5-6.6） |
+| B | **关** | 开 | 正交 / 0.1 | 待跑 |
+| C | 开 | **关** | 正交 / 0.1 | 待跑 |
+| D | 官方硬路由（CE 本就无 key 通道） | 官方 | uniform | 待跑（历史参照） |
+
+B/C/D 全部 `--max_rounds 1` 短程；B/C 带 `--route_audit`（D 也带：`log_client_grad_audit` 已兼容官方硬路由 `pull_idx=None`，还能实测官方 CE 对 key 无梯度通道这一结构性事实）。D 的 init 快照 sha256 各客户端**不**一致属预期（官方 uniform 消耗全局 RNG，每客户端构造结果不同）。
+
+```bash
+# 20.4a B 臂：CE-key 梯度隔离（--route_detach_ce_key_grad）
+python main.py datasets_delay \
+    --data_name cifar100 --method fedta \
+    --route_fix --route_tau 0.1 \
+    --route_detach_ce_key_grad \
+    --route_audit \
+    --seed 42 --global_epoch 5 --threshold 0.25 \
+    --run_name cifar_route_ablate_B_detachce \
+    --max_rounds 1 \
+    --data-path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+
+# 20.4b C 臂：去 pull（--disable_pull）
+python main.py datasets_delay \
+    --data_name cifar100 --method fedta \
+    --route_fix --route_tau 0.1 \
+    --disable_pull \
+    --route_audit \
+    --seed 42 --global_epoch 5 --threshold 0.25 \
+    --run_name cifar_route_ablate_C_nopull \
+    --max_rounds 1 \
+    --data-path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+
+# 20.4c D 臂：官方基线（route_fix off；审计兼容官方硬路由路径）
+python main.py datasets_delay \
+    --data_name cifar100 --method fedta \
+    --route_audit \
+    --seed 42 --global_epoch 5 --threshold 0.25 \
+    --run_name cifar_route_ablate_D_official \
+    --max_rounds 1 \
+    --data-path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+
+# 20.4d 单测（B/C 开关语义 + 默认 off 逐位不变性）
+python -m unittest tests.test_route_ablation_switches -v
+```
+
+判读表（对照 A 臂 init 99 → post_local 3.5-6.6）：
+
+- **B 不塌、C 塌**：CE 全池软路由梯度是主驱动 → 修复方向 = 改造 CE 路由梯度（detach / 只达选中槽 / 调 τ）
+- **B 塌、C 不塌**：pull 或其与 CE 的交互是主驱动 → 修复方向 = 改造 pull
+- **B、C 都不塌**：两条路径共同促成 → 需进一步检查交互效应（可能要 B+C 组合臂）
+- **B、C 都塌**：嫌疑转向其他本地因素（优化器 / weight_decay=1e-3 / key 范数塌缩参与率口径），需逐槽更新轨迹分析
+
+判据口径与 20.3 相同：post_local 有效秩（主要指标，>50 健康线）、样本间/分支间余弦、sha256。注意单 minibatch 的梯度范数（grad_audit 首批快照）不代表整个 30 epoch 的累计作用，责任判定以 post_local 快照为准。D 臂不能与 A 直接归因到单一梯度通道（route_fix 同时切换 R1 初始化，非干净对照），只作历史参照 + 官方"CE 无 key 通道"的结构性实证。

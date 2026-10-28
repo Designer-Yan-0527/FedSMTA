@@ -341,7 +341,8 @@ class VisionTransformer(nn.Module):
             weight_init='', embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block,
             prompt_length=None, embedding_key='cls', prompt_init='uniform', prompt_pool=False, prompt_key=False, pool_size=None,
             top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,
-            route_fix=False, route_tau=0.1, route_seed=0,):
+            route_fix=False, route_tau=0.1, route_seed=0,
+            route_detach_ce_key_grad=False,):
         """
         Args:
             img_size (int, tuple): input image size
@@ -398,6 +399,10 @@ class VisionTransformer(nn.Module):
         self.route_fix = route_fix
         self.route_tau = route_tau
         self.route_seed = route_seed
+        # B 臂消融开关（CLI --route_detach_ce_key_grad）透传给 Global_Prompt；
+        # 存到 self 供 init_prompts() 重建 prompt 池时转发。默认 False =
+        # 行为逐位一致。
+        self.route_detach_ce_key_grad = route_detach_ce_key_grad
 
 
 
@@ -424,7 +429,8 @@ class VisionTransformer(nn.Module):
             self.prompt = Global_Prompt(length=prompt_length, embed_dim=embed_dim, embedding_key=embedding_key, prompt_init=prompt_init,
                     prompt_pool=prompt_pool, prompt_key=prompt_key, pool_size=pool_size, top_k=top_k, batchwise_prompt=batchwise_prompt,
                     prompt_key_init=prompt_key_init,
-                    route_fix=route_fix, route_tau=route_tau, route_seed=route_seed)
+                    route_fix=route_fix, route_tau=route_tau, route_seed=route_seed,
+                    route_detach_ce_key_grad=route_detach_ce_key_grad)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
@@ -570,7 +576,8 @@ class VisionTransformer(nn.Module):
                                     batchwise_prompt=self.batchwise_prompt,
                                     prompt_key_init=self.prompt_key_init,
                                     route_fix=self.route_fix, route_tau=self.route_tau,
-                                    route_seed=self.route_seed)
+                                    route_seed=self.route_seed,
+                                    route_detach_ce_key_grad=self.route_detach_ce_key_grad)
     def load_prompts(self,prompt):
         self.prompt = deepcopy(prompt)
 

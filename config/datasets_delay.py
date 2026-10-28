@@ -134,6 +134,30 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--route_tau', default=0.1, type=float,
                             help='R2 soft routing temperature: w = softmax(similarity/tau). '
                                  'Only used with --route_fix (probe-validated default 0.1).')
+    subparsers.add_argument('--route_detach_ce_key_grad', action='store_true',
+                            help='A2-R ablation arm B (2026-10-28, default OFF = '
+                                 'bit-identical). Only takes effect with --route_fix: '
+                                 'the similarity used to build the soft routing '
+                                 'weights w is recomputed from prompt_norm.detach(), '
+                                 'so the CE loss can no longer reach prompt_key '
+                                 'through the softmax coupling (grad to the sample '
+                                 'features is kept). Forward VALUES are bitwise '
+                                 'unchanged; pull keeps using the original '
+                                 'grad-carrying similarity (official-equivalent, '
+                                 'selected slots only). Isolates whether the CE '
+                                 'all-pool soft-routing gradient is the round-0 '
+                                 'key-rank collapse driver. See RUNCOMMANDS.md Sec.20.4.')
+    subparsers.add_argument('--disable_pull', action='store_true',
+                            help='A2-R ablation arm C (2026-10-28, default OFF = '
+                                 'bit-identical). Removes the -0.1*reduce_sim pull '
+                                 'term from the active fedta Client_DF.train() loss '
+                                 '(CE only); forward computation of reduce_sim is '
+                                 'untouched (route_audit still records what pull '
+                                 'WOULD contribute, read-only). Other loss terms, '
+                                 'optimizer, data, RNG and seeds unchanged. Tests '
+                                 'whether the pull term alone (official-equivalent '
+                                 'semantics) drives the key-rank collapse. '
+                                 'See RUNCOMMANDS.md Sec.20.4.')
     subparsers.add_argument('--route_audit', action='store_true',
                             help='A2-R collapse forensics instrumentation '
                                  '(default OFF = official path bit-identical). '
