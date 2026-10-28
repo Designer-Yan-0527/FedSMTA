@@ -4,9 +4,11 @@ Pinned semantics (mirroring the ncm_probe test conventions):
 
   * standardization stats are fit on TRAIN rows only (an eval-row mean
     must not shift them) -- the probe must never see test statistics;
-  * head_predict fails closed when an allowed class has no train row
-    (silently dropping candidates would shrink the choice set and
-    inflate accuracy);
+  * head_predict fails closed when an allowed class has no OUTPUT UNIT
+    (a join error); a mask class with zero train rows keeps its
+    suppressed unit in the choice set -- native Chead semantics under
+    the CIFAR public-class protocol (a (client, task) share of a public
+    class can be 0-1 samples), never shrinks the candidate set;
   * masked-argmax restriction: predictions are always inside the
     allowed class set, even for a head trained on many more classes;
   * prediction must not mutate the fitted head (no-grad eval, no state
@@ -54,11 +56,28 @@ class TestOracleHeadroomProbe(unittest.TestCase):
         self.assertTrue(np.allclose(handle.mu, z_tr.mean(axis=0)))
         del z_evil
 
-    def test_fail_closed_allowed_class_without_train_row(self):
+    def test_fail_closed_allowed_class_without_output_unit(self):
         z_tr, y, classes = _two_class_data()
         handle = fit_head(z_tr, y, classes, seed=stable_seed("b"), **_HP)
         with self.assertRaises(RuntimeError):
             head_predict(handle, z_tr[:4], allowed=[3, 7, 11])
+
+    def test_zero_train_row_mask_class_keeps_suppressed_unit(self):
+        # CIFAR public-class reality: a (client, task) mask class can
+        # have ZERO train rows (client 0/class 10 in cifar_hsn). The
+        # head still carries an output unit for it (trained only by the
+        # softmax suppression gradient), so it competes in the argmax
+        # exactly like the native Chead -- the choice set is never
+        # shrunk and prediction stays inside the allowed set.
+        z_tr, y, _ = _two_class_data(n_per=40)
+        mask = [3, 7, 11]  # class 11 has no train rows
+        handle = fit_head(z_tr, y, mask, seed=stable_seed("b2"), **_HP)
+        self.assertIn(11, handle.idx_of)  # unit exists
+        pred = head_predict(handle, z_tr, mask)
+        self.assertTrue(set(int(p) for p in pred) <= set(mask))
+        # the suppressed unit must lose the argmax against classes it
+        # was actually trained on (softmax suppression pushed it down)
+        self.assertFalse(any(int(p) == 11 for p in pred))
 
     def test_unknown_train_label_fails_loud(self):
         z_tr, y, classes = _two_class_data()

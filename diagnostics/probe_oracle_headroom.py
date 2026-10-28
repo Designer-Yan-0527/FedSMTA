@@ -190,14 +190,22 @@ def fit_head(z_tr, y_tr, classes, *, seed, hidden, epochs, lr, wd, dropout,
 
 def head_predict(handle, z_te, allowed):
     """Masked-argmax prediction restricted to `allowed` class ids -- the
-    native class_mask semantics. Fail closed: every allowed class must be
-    a class the head was TRAINED on; silently dropping candidates would
-    shrink the choice set and inflate accuracy (ncm_probe precedent)."""
+    native class_mask semantics. Fail closed: every allowed class must
+    have an output unit in the head (a join error otherwise). A mask
+    class with ZERO train rows keeps its output unit: it is trained only
+    by the softmax suppression gradient from the other classes' CE,
+    exactly like the native Chead -- under the CIFAR public-class
+    protocol a (client, task) share of a public class can be 0-1 samples
+    (verified in the cifar_hsn features: client 0/class 10 had 1 test
+    row and 0 train rows; client 2/class 56 had none at all), and the
+    native head still gives such classes a (suppressed) unit. Dropping
+    them from the candidates would shrink the choice set and inflate
+    accuracy (ncm_probe precedent)."""
     allowed = list(dict.fromkeys(int(c) for c in allowed))
-    missing = [c for c in allowed if c not in handle.train_classes]
+    missing = [c for c in allowed if c not in handle.idx_of]
     if missing:
-        raise RuntimeError(f"allowed classes the head was never trained on: "
-                           f"{sorted(missing)}")
+        raise RuntimeError(f"allowed classes missing from the head's "
+                           f"output units: {sorted(missing)}")
     zt = torch.tensor((np.asarray(z_te, dtype=np.float32) - handle.mu)
                       / handle.sd, dtype=torch.float32, device=handle.device)
     with torch.no_grad():
@@ -256,8 +264,9 @@ def probe_boundary(data, masks, t, feat, args):
             yt = labels[sel_te]
             # local heads train on this (client, task) train rows only;
             # fit_head's remap fails loud if a train label is outside the
-            # mask, head_predict fails loud if a mask class has no train
-            # row -- the same fail-closed coverage as ncm_probe
+            # mask; a mask class with zero train rows keeps a suppressed
+            # output unit (native Chead semantics, see head_predict) --
+            # the same fail-closed coverage as ncm_probe
             lin = fit_head(z[sel_tr], labels[sel_tr], allowed,
                            seed=stable_seed(args.seed_base, "lin", t, feat,
                                             cid, k),
