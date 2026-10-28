@@ -19,6 +19,23 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+def _current_parser_defaults():
+    """Parsed defaults of EVERY arg the current parser defines.
+
+    Backfills keys introduced after an old run's args.json was recorded
+    (e.g. --route_fix on pre-A2-R runs) so build_server can consume
+    Namespaces from any run era. Hand-maintaining the backfill list broke
+    once per new switch (cifar_hsn crash: AttributeError 'route_fix');
+    deriving it from the parser cannot go stale.
+    """
+    import argparse
+    from config.datasets_delay import get_args_parser
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="subparser_name")
+    get_args_parser(sub.add_parser("datasets_delay"))
+    return vars(parser.parse_args(["datasets_delay"]))
+
+
 def load_args_from_run_dir(run_dir, data_path=None, device=None):
     """Rebuild an args Namespace from {run_dir}/args.json.
 
@@ -34,9 +51,12 @@ def load_args_from_run_dir(run_dir, data_path=None, device=None):
         raw = json.load(f)
     args = argparse.Namespace(**raw)
 
-    # defaults for args introduced after the run was recorded
-    for key, default in (("deterministic", False), ("max_rounds", 0),
-                         ("eval_all_every", 0)):
+    # defaults for args introduced after the run was recorded: every
+    # CURRENT parser key missing from the old args.json gets the current
+    # default (old runs were trained under official behavior, and every
+    # post-hoc switch defaults to OFF = official, so this replay stays
+    # faithful)
+    for key, default in _current_parser_defaults().items():
         if not hasattr(args, key):
             setattr(args, key, default)
 
