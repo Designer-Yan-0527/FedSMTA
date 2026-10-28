@@ -237,12 +237,15 @@ python diagnostics/probe_oracle_headroom.py \
     --out_csv diagnostics_output/oracle_headroom_inr_a2.csv \
     --c2p 86.86,91.14
 
-# CIFAR-100 官方 D 臂（需先提特征，GPU 几分钟；探针本身 CPU）
+# CIFAR-100 cifar_hsn 臂（唯一有完整 checkpoint + 标准 metrics 的全协议 cifar run；
+# 需先提特征，GPU 几分钟；探针本身 CPU）
 python diagnostics/probe_oracle_headroom.py \
-    --run_dir output/cifar100/fedta/cifar_route_ablate_D_official/seed_42 \
-    --checkpoints task_00_end.pth \
-    --out_csv diagnostics_output/oracle_headroom_cifar_D_t0.csv
+    --run_dir output/cifar100/fedta/cifar_hsn/seed_42 \
+    --checkpoints task_00_end.pth,task_04_end.pth \
+    --out_csv diagnostics_output/oracle_headroom_cifar_hsn.csv
 ```
+
+- **cifar 辅助读数的 caveat**：cifar_hsn 带 `skip_fed_avg_head=True`（HS-N 修复臂，非纯官方）。z_ref（冻结主干）读数不受任何影响；z_op 的 prompt 训练路径不含 vit.head，大概率等价官方但未验证。官方 D 臂（route_fix off）不可用于本探针：`max_rounds=1` 短程协议无 client CSV / accuracy_matrix / task_XX_end.pth，native 对账管线按设计 fail-closed 拒绝。Phase-0 官方全协议 cifar run 的 checkpoint 已清理，同样不可用。
 
 - **三探针**（每特征空间 z_ref/z_op 各一套，全部只在 inner.train 上训练、inner.test 上评估、候选限制 (client, task) class_mask = native R[t][k] 同语义）：
   - `linear_local`：每 (client, task) 逻辑回归——**sanity 锚**，应落在 native 附近（同为线性可训练接口）
