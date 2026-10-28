@@ -554,7 +554,9 @@ python -m unittest tests.test_route_ablation_switches -v
 
 ### 21.1 Track E 因果三态探针（`probe_eval_dropout_causal.py`，先行闭环）
 
-同一个 checkpoint、同一个 test loader 上三种模式：native（逐字官方 evaluate）/ head_eval（仅 Tail_Anchor 含 Chead `.eval()`，Tail_Anchor 无 BN、Chead 外无 Dropout → 精确隔离 Dropout 因果）/ full_eval（model+vit+original_model 全 `.eval()` = 修正确定性协议；vit `train=True` 前向语义逐字保留）。native 重复 15 次展示随机波动，eval 模式重复 3 次验证确定性。
+同一个 checkpoint、同一个 test loader 上三种模式：native（逐字官方 evaluate）/ head_eval（仅 Tail_Anchor 含 Chead `.eval()`，Tail_Anchor 无 BN、Chead 外无 Dropout → 精确隔离 Dropout 因果）/ full_eval（model+vit+original_model 全 `.eval()` = **Dropout 关闭的 corrected 评测，但保留官方 shuffle 语义**；vit `train=True` 前向语义逐字保留）。native 重复 15 次展示随机波动，eval 模式重复 3 次验证稳定性。
+
+**第三轮裁决补充（2026-10-28，shuffle × batchwise_prompt 混淆）**：官方 `evaluate()` 每次调用都重建 `DataLoader(test_data, batch_size=8, shuffle=True)`，且 `Global_Prompt` 的 batchwise_prompt 按 batch 多数投票选 prompt 并扩展给整个 batch——预测不仅依赖样本本身，还依赖**它这次随机和哪些样本同批**。因此即使 Dropout 全关，重复 full_eval 理论上仍可能不同，"deterministic corrected evaluation" 不能提前成立，须由本探针实测。判读标准：`eval_repeat_spread_max` ≤0.05pp → shuffle 混淆可忽略，Track E 结案为"Dropout 是主要直接原因"，21.2 直接放行；>0.1pp → corrected 仍有实质波动，须先做 paired-RNG 版本（同一 RNG state 分别喂给 native/head_eval/full_eval，batch grouping 相同、唯一差异是 module mode）或 corrected 多重复取均值，再全量重评。JSON 已带 `corrected_repeat_stability`（negligible/minor/material）与 `reeval_gate_21_2` 字段。
 
 **复审修复（2026-10-28 第二轮，阻断一）**：官方 `evaluate()` 内部 `load_head()` 会 `deepcopy(heads[task])` 重新替换 `self.head`，deepcopy 继承 `heads[task]` 自己的 training flag——只切 `client.model.eval()` 会被绕过，head_eval/full_eval 未必真的关闭最终参与推理的 Dropout。现 `eval_in_mode` 在 head_eval/full_eval 下同时把源头 `client.heads[task]` 切到 `.eval()`（finally 中恢复其原始标志）。运行时证据经 forward_pre_hook 在**前向时刻**采集（调用后读取不可靠：finally 恢复 `model.train(True)` 是递归的，会把已装进去的 head 翻回 train），写入 JSON 字段 `loaded_head_training_evidence`。`CAUSAL_CONFIRMED` 判据新增两条：native 前向时 head 标志全 True、head_eval/full_eval 前向时全 False。
 
@@ -567,9 +569,11 @@ python diagnostics/probe_eval_dropout_causal.py \
 
 预期：native ≈ 82.87 且重复间有波动；head_eval ≈ full_eval ≈ 84.81 且重复几乎一致。`CAUSAL_CONFIRMED` 判据：dropout 效应 ≥1pp、|head_eval−full_eval|≤0.5pp、native 有随机性、eval 重复稳定。产物 `diagnostics_output/eval_dropout_causal.{json,csv}`。
 
-### 21.2 Track E 全量 corrected-eval 只读重评（`eval_mode_reeval.py`，21.1 结案后跑）
+### 21.2 Track E 全量 corrected-eval 只读重评（`eval_mode_reeval.py`，**条件放行**：21.1 结案后跑）
 
 对每个 `task_XX_end.pth`、每个 (client, 已见任务 k) 输出双口径 `official_compat_acc` / `corrected_eval_acc`，外加 R[t][k] 矩阵与 AA。**只读**：不覆盖 run_dir 内任何历史产物，输出仅落 `diagnostics_output/eval_mode_reeval.{csv,json}`。不预设"所有历史结果都涨 1-2pp"——逐 checkpoint 实测。corrected 口径复用 21.1 的 load_head 绕过修复，并做 fail-closed 校验：任一 checkpoint 的 corrected 评测若经 forward_pre_hook 在前向时刻检测到 head 仍处 train mode，打 WARNING 并计入 JSON 字段 `corrected_head_train_mode_failures`（判读时应为全 0，非 0 即修复未生效、该批 corrected 数字不可信）。
+
+**第三轮条件（2026-10-28）**：每个 corrected cell 目前只评一次。若 21.1 显示 corrected repeat spread 可忽略（`eval_repeat_spread_max` ≤0.05pp）→ 本命令直接放行，现有单次口径即可；若 corrected 仍有实质波动（>0.1pp）→ 单次 corrected 数字依赖某次随机 batch grouping，须先升级：**首选**官方兼容口径（保留 `shuffle=True`，corrected 每 cell 重复多次取均值，不改 batchwise routing 协议）；可另设 `shuffle=False` 固定 batch 口径作为第二严格确定性参照。升级完成并复审后再跑本命令。
 
 ```bash
 python diagnostics/eval_mode_reeval.py \
@@ -577,7 +581,9 @@ python diagnostics/eval_mode_reeval.py \
     --native_repeats 1
 ```
 
-### 21.3 B2 SSRA 结构搜索（`probe_ssra_headroom.py --mode b2`，val 选结构、test 只评一次）
+### 21.3 B2 SSRA 结构搜索（`probe_ssra_headroom.py --mode b2`，val 选结构、test 只评一次）——**第三轮裁决：正式放行，可直接执行**
+
+B2 使用缓存好的 `z_op` 特征，不再经过 `Global_Prompt` 的 batchwise routing，因此不受第三轮发现的 shuffle × batchwise_prompt 混淆影响。
 
 网格：bottleneck {64,128,256} × residual scale {fixed, learnable α} × dropout {0, 0.2} × wd {1e-3}（12 配置）。**协议（审查者裁决）**：所有结构只比 3-seed validation（选 epoch 的 val acc），胜者 freeze 后 TEST 只评一次；P0 线性参照臂照旧 val+test 一次。任何搜索结构不产生 test 数字。Gate 仍是 GREEN ≥2pp / YELLOW 1-2pp / RED <1pp（作用于 winner−P0 的 test-once delta）。约 4× v2 探针计算量（195 次训练 × 150 epochs，cached 特征上，GPU 需求很小）。
 

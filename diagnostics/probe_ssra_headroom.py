@@ -23,9 +23,11 @@ Question (pre-registered, Roadmap A5-P2 / NCM probe verdict "A5 共享
 Scope: "task-in supervised headroom probe on the FIXED A2 T0
 representation" -- a screening gate, NOT a mathematical upper bound of
 full SSRA (federation / cross-task init / contrastive supervision are
-not simulated). Cache provenance verified: inr_a2_key_p40 seed_42,
-method=fedta_a2, a2_arm=key, route_fix absent (= off) -- the SSRA
-proposal requires the route_fix=off A2 baseline, and this cache is it.
+not simulated). Cache provenance pre-verified (MANUAL args.json check at
+cache-build time; load_cache itself only re-checks npz metadata):
+inr_a2_key_p40 seed_42, method=fedta_a2, a2_arm=key, route_fix absent
+(= off) -- the SSRA proposal requires the route_fix=off A2 baseline,
+and this cache is it.
 
 Protocol per (client, task 0), 8-way over the client's own class mask
 (native R[0][0] semantics):
@@ -643,7 +645,10 @@ def main():
         "cache": {"npz": str(npz), "run_dir": meta.get("run_dir"),
                   "checkpoint": meta.get("checkpoint"),
                   "provenance": "method fedta_a2 / a2_arm key / "
-                                "route_fix off (verified via args.json)"},
+                                "route_fix off (pre-verified provenance: "
+                                "args.json checked MANUALLY when the cache "
+                                "was built; load_cache re-checks npz "
+                                "metadata only)"},
         "protocol": {"seeds": args.seeds, "epochs": args.epochs,
                      "batch_size": args.batch_size, "lr": args.lr,
                      "weight_decay": args.weight_decay,

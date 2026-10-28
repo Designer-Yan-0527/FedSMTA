@@ -13,14 +13,28 @@ test loader, with three toggle states (reviewer-approved protocol):
   head_eval : ONLY client.model (Tail_Anchor incl. Chead) switched to
               .eval(); Tail_Anchor has no BatchNorm and no Dropout outside
               the Chead, so this toggles exactly the Chead Dropout(0.5)
-  full_eval : model + vit + original_model all .eval() = the corrected
-              deterministic-inference protocol (forward semantics -- incl.
-              the official `train=True` vit kwarg and batch-8 shuffling --
-              are kept verbatim; only module-level Dropout is disabled)
+  full_eval : model + vit + original_model all .eval() = the
+              Dropout-disabled corrected evaluation under the ORIGINAL
+              shuffled-batch semantics (forward semantics -- incl. the
+              official `train=True` vit kwarg and the batch-8
+              shuffle=True DataLoader -- are kept verbatim; only
+              module-level Dropout is disabled)
+
+Reviewer note (2026-10-28 round 3): shuffle=True + Global_Prompt
+batchwise_prompt (per-batch majority prompt, expanded to the whole
+batch) is a stochastic source INDEPENDENT of Dropout -- a prediction
+may depend on which samples share a batch. Repeated full_eval calls
+are therefore NOT a priori bit-deterministic; whether this shuffle
+confound is negligible on a given checkpoint is answered empirically
+by eval_repeat_spread_max (<=0.05pp negligible / 0.05-0.1pp minor /
+>0.1pp material -> paired-RNG or multi-repeat before the full
+re-scoring, reviewer thresholds).
 
 Expected if the Dropout explanation is causal:
-  native ~ 82.87 with stochastic scatter across repeats (Dropout sampling)
-  head_eval ~ full_eval ~ 84.81 with near-zero scatter across repeats
+  native ~ 82.87 with stochastic scatter across repeats (Dropout
+           sampling, plus the same shuffle confound)
+  head_eval ~ full_eval ~ 84.81; scatter across repeats is the pure
+              shuffle confound (Dropout is off)
 
 Read-only: bootstraps via diagnostics.probe_head_retrain (args.json +
 checkpoint restore; never writes into run_dir); outputs go to
@@ -227,6 +241,14 @@ def main():
     native_stochastic = float(np.mean(native_std)) >= 0.05
     eval_stable = eval_spread <= 0.5 and eval_spread <= 2.0 * float(
         np.mean(native_spread))
+    # reviewer round-3 thresholds: the shuffle x batchwise_prompt confound
+    # (independent of Dropout) gates the full corrected re-scoring (21.2)
+    if eval_spread <= 0.05:
+        corrected_stability = "negligible_shuffle_confound"
+    elif eval_spread <= 0.1:
+        corrected_stability = "minor_shuffle_confound"
+    else:
+        corrected_stability = "material_shuffle_confound"
     # runtime evidence: the head actually installed by load_head must be
     # train-mode under native and eval-mode under the corrected protocols
     heads_native_ok = all(
@@ -252,9 +274,12 @@ def main():
             "native": "verbatim evaluate(), module train flags untouched",
             "head_eval": "only Tail_Anchor (incl. Chead) .eval(); no other "
                          "change -- isolates the Chead Dropout(0.5)",
-            "full_eval": "model+vit+original_model .eval(); forward "
-                         "semantics (vit train=True kwarg, batch-8 shuffle) "
-                         "kept verbatim = corrected deterministic protocol",
+            "full_eval": "model+vit+original_model .eval() = "
+                         "Dropout-disabled corrected evaluation under the "
+                         "original shuffled-batch semantics (vit train=True "
+                         "kwarg, batch-8 shuffle kept verbatim); residual "
+                         "shuffle x batchwise_prompt confound is quantified "
+                         "by eval_repeat_spread_max",
             "native_repeats": args.native_repeats,
             "eval_repeats": args.eval_repeats,
             "aggregation": "unweighted mean over clients (matrix semantics)",
@@ -267,6 +292,12 @@ def main():
         "native_repeat_std_per_client": [round(s, 4) for s in native_std],
         "native_repeat_spread_max": round(float(np.max(native_spread)), 4),
         "eval_repeat_spread_max": round(eval_spread, 4),
+        "corrected_repeat_stability": corrected_stability,
+        "reeval_gate_21_2": ("DIRECT (corrected repeat spread negligible)"
+                             if corrected_stability == "negligible_shuffle_confound"
+                             else "CONDITIONAL: isolate the shuffle confound "
+                              "before the full re-scoring (paired-RNG or "
+                              "multi-repeat; reviewer round 3)"),
         "dropout_effect_pp": dropout_effect,
         "head_eval_minus_full_eval_pp": head_vs_full,
         "loaded_head_training_evidence": {
@@ -302,6 +333,8 @@ def main():
           % (agg["full_eval"]["mean"], args.eval_mode_ref, eval_spread))
     print("dropout effect %+.4fpp | head_eval - full_eval %+.4fpp"
           % (dropout_effect, head_vs_full))
+    print("corrected repeat spread max %.4fpp -> %s | 21.2 gate: %s"
+          % (eval_spread, corrected_stability, summary["reeval_gate_21_2"]))
     print("VERDICT: %s" % summary["verdict"])
     print("wrote %s and %s" % (out_json, args.out_csv))
     return 0
