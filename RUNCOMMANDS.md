@@ -591,7 +591,7 @@ B2 使用缓存好的 `z_op` 特征，不再经过 `Global_Prompt` 的 batchwise
 
 ```bash
 python diagnostics/probe_ssra_headroom.py \
-    --features diagnostics_output/features_ImageNet-R_task_00_end_promptcurrent.npz \
+    --features diagnostics_output/ncm_inr_a2_seed42/features_ImageNet-R_task_00_end_promptcurrent.npz \
     --mode b2 \
     --bottlenecks 64 128 256 --scale_modes fixed learnable \
     --dropouts 0.0 0.2 --wds 1e-3
