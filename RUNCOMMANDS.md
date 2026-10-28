@@ -224,6 +224,38 @@ python diagnostics/ncm_probe.py \
 - **T0-gap 判据**：T0 行对照 C²P 参考（86.86）——NCM 若大幅缩小 ~4pp 差距，A5 优先做分类接口；增益只在 T4 出现才支持持续迁移叙事
 - **已跑结果（INR seed42，2026-10-20）**：AA T0/T4 = native 82.87/79.43、z_ref NCM 79.06/76.04、z_op NCM 82.49/80.62（C²P 86.86/91.14）。判决：T0-gap 非分类接口瓶颈（z_op NCM≈native Chead），纯统计原型分类接口判负，A5 共享语义层必须可训练（Roadmap §6）
 
+### 9.3.6 Oracle headroom probe（probe_oracle_headroom.py，A5 Gate A-2）
+
+**问题**：NCM 判负只证明"统计读出饱和"，没有证明"可训练接口能多榨出 ~4pp"——C²P 的 86.86 是在它自己特征上拿的，T0 差距可能根本不在我们特征里。本探针在**任何 A5-v2 工程开工前**判决：可训练接口在我们特征上有没有 headroom。
+
+```bash
+# INR A2 臂（特征缓存已存在于 ncm_inr_a2_seed42/，零提取，纯 CPU 分钟级）
+python diagnostics/probe_oracle_headroom.py \
+    --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
+    --checkpoints task_00_end.pth,task_04_end.pth \
+    --features_dir diagnostics_output/ncm_inr_a2_seed42 \
+    --out_csv diagnostics_output/oracle_headroom_inr_a2.csv \
+    --c2p 86.86,91.14
+
+# CIFAR-100 官方 D 臂（需先提特征，GPU 几分钟；探针本身 CPU）
+python diagnostics/probe_oracle_headroom.py \
+    --run_dir output/cifar100/fedta/cifar_route_ablate_D_official/seed_42 \
+    --checkpoints task_00_end.pth \
+    --out_csv diagnostics_output/oracle_headroom_cifar_D_t0.csv
+```
+
+- **三探针**（每特征空间 z_ref/z_op 各一套，全部只在 inner.train 上训练、inner.test 上评估、候选限制 (client, task) class_mask = native R[t][k] 同语义）：
+  - `linear_local`：每 (client, task) 逻辑回归——**sanity 锚**，应落在 native 附近（同为线性可训练接口）
+  - `mlp_local`：每 (client, task) 2 层 MLP——本地-only 可训练接口天花板（未来 "local-only g" 消融的预演）
+  - `mlp_pooled`：每边界一个 MLP，池化训练全部客户端已见任务 train 行——**信息量 oracle**（跨客户端池化+标签，违反联邦协议的纯诊断上界，不是方法）
+- **分解读法**：`delta_pooled = mlp_pooled − native` = 总可提取 headroom（Gate 输入）；`delta_local = mlp_local − native` = 不联邦也能拿到的部分；`federated_premise = mlp_pooled − mlp_local` = FedAvg 共享接口的收益预览（≈0 则 A5-v2 的联邦主张降级）
+- **fail-closed**：复用 ncm_probe 全套（缓存身份校验、aa_native 与 accuracy_matrix.csv 对账 >0.02pp 拒绝、mask 类训练行全覆盖缺失即报错）；标准化统计只 fit train 行；seed 派生自探针身份（SHA256），逐位可复现（单测 8/8 PASS）
+- **预注册 Gate（只看 T0 行、z_op 主读数；T4 与 z_ref 仅作上下文，不进 Gate）**：
+  - GREEN：`delta_pooled ≥ +2.00pp` → A5-v2（可训练共享语义接口）立项
+  - RED：`delta_pooled ≤ +1.00pp` → 接口线判死，T0 差距在特征质量（C²P 的 prompt+对比训练），方向转 feature-shaping 组件——**A5-v2 整个方案免建**
+  - YELLOW：之间 → 连数字送外审裁决
+- 探针超参（hidden 256 / epochs 100 / lr 1e-3 / wd 1e-4 / dropout 0.1 / batch 64）与 Gate 阈值均写入 summary.json 溯源
+
 ### 9.4 已删除命令（tombstone）
 
 多模态分析（旧 §9.2）、Synthetic Oracle-K2（旧 §9.4）、z_op precheck（旧 §14）、原版 slot 碰撞诊断（旧 §9.3.3）——所属假说已判负或设计判死，存档见 FEDSMTA_ROADMAP.md §4，原命令在 git 历史。
