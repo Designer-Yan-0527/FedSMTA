@@ -606,3 +606,22 @@ python -m unittest tests.test_track_e_and_b2 -v
 ```
 
 覆盖：ResidualAdapter 零初始化恒等（fixed/learnable）、α=1.0 可学习、dropout 模块按需挂载、eval_in_mode 三态标志与恢复、native 随机 vs eval 确定、`evaluate_test=False` 不产生任何 test 字段、冻结 best_state 经 `test_from_state` 重放确定。第二轮修复新增回归：`test_head_eval_survives_load_head_bypass`（FakeClient 复刻官方 `load_head` deepcopy 绕过路径：head_eval/full_eval 前向时刻 head 标志必须为 False 且结果确定，源头 `heads[task]` 与各模块 training 标志必须恢复）、`test_search_run_never_touches_test`（搜索传 None 正常训练）、`test_evaluate_test_true_with_none_raises`（fail-closed）、`test_acc_eval_mode_deterministic_and_restores`（eval 口径确定 + 标志恢复）、`test_frozen_state_replay_is_deterministic`。当前 17 项全 PASS。
+
+### 21.5 终审结案（2026-10-28，审查者裁决）
+
+**21.1 实测（Track E = CLOSED / confirmed evaluation bug）**：`CAUSAL_CONFIRMED` 全判据通过，且 head_eval = full_eval = 84.8066 逐位相同、`eval_repeat_spread_max = 0`——第三轮担心的 shuffle × batchwise_prompt 混淆在实测中不存在；额外把 vit/original_model 切 eval 不产生任何可测变化。**核心发现是"82.xx 本身不是稳定性能值"**：native 15 次重复 spread 达 7.17pp，历史 82.87 只是随机 Dropout 评测分布中的一次 realization，不应继续当作模型真实确定性性能。**措辞规范（论文用）**：写"关闭 Chead Dropout 后，确定性准确率为 84.81%；相较 15 次原评测重复的均值 82.12%，提高约 2.69pp"；不写"A2 准确率固定提高 2.69pp"（+1.94pp 对应的是历史那一次 realization 的差值）。
+
+**21.2 = DIRECT PASS**：corrected spread 可忽略，现有单次口径直接跑，无需 paired-RNG/多重复升级。全矩阵出来后重算 T0-T4 / after-T4 AA / forgetting / BWT / A2 与其他方法的真实差距——不再假设所有任务都是 +1.94 或 +2.69pp，逐 checkpoint 实测。
+
+**21.3 实测（Track B / minimal SSRA = RED / stop engineering）**：winner `ssra_b64_fixed_d0`（val 88.87 排第一）test-once 85.72，P0 test 85.00（与强线性参照逐位吻合）→ **+0.72pp**（逐 seed +0.96/+0.76/+0.43），未过 ≥1pp 门槛。结构趋势 b64>b128>b256、fixed≥learnable、d0>d0.2：容量增加不产生 task-in 判别余量。**停止一切联邦工程**：Adapter FedAvg / task snapshot / checkpoint-resume / prototype loss 接入 / SSRA audit 全部不做。措辞规范：不写"B2 推翻了 v2 的 +1.28pp"（v2 b128 与 B2 winner 非同一路径，B2 也故意没有逐候选读 test）；写"早期单配置探针提示 +1.28pp，但在更严格的预注册 val-only 结构选择协议下，入选 SSRA 配置在冻结 test 上仅 +0.72pp，未过 ≥1pp 续作门槛"。
+
+**状态板（终审）**：
+
+| 路线 | 状态 |
+|---|---|
+| Track E | **CLOSED / confirmed evaluation bug** |
+| Track B 极简 SSRA | **RED / stop engineering** |
+| Track A（prompt routing → h 形成过程） | **ACTIVE / 当前主要机制研发线**（B/C/D 归因待跑，§20.4） |
+| A5 | **重新设计**：仅否 A5-P2-v1（fixed feature + post-feature adapter）形态，共享语义学习整体未判负；待 21.2 + B/C/D 完成后定形态 |
+
+**下一步（顺序）**：① 跑 21.2（上面命令）；② 跑 §20.4 B/C/D 三臂（Track A 归因，最直接的上游 representation 机制实验）；③ 两件事完成后重新设计 A5，先不开新模块。判负不是坏结果：H1（+0.35pp）+ H2（+0.15pp）+ B2（+0.72pp）闭环证明 T0 余量主体是评测协议而非结构，一个廉价离线 Gate 提前砍掉了整条低收益联邦工程线。

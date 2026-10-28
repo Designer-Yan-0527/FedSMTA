@@ -67,6 +67,8 @@
 
 **P2（按 P1 结果定）**：小型共享语义层，普通类掩码聚合 vs 类感知聚合 → 兼容性约束（surrogate 约束残差融合）→ FedTA/A2/Shared/A5 四臂析因（交互项 I=Y₁₁−Y₁₀−Y₀₁+Y₀₀，BWT 与 forgetting 分开报）。T0-gap 判据同样适用。LCDC/CPA/FedAvg 均不预设为必需组件。
 
+**P2-minimal（post-feature SSRA）Gate 判负（2026-10-28 终审，B2 结构搜索）**：固定 A2 T0 特征上的零初始化残差 adapter（768→bottleneck→768 + 线性头），12 配置（bottleneck {64,128,256} × scale {fixed, learnable α} × dropout {0, 0.2}）按预注册 val-only 协议选结构、winner 冻结后 test 只评一次：winner（b64/fixed/d0）−P0 = **+0.72pp**（逐 seed +0.96/+0.76/+0.43），未过 ≥1pp 续作门槛 → **RED，停止一切联邦工程**（Adapter FedAvg / task snapshot / checkpoint-resume / prototype loss 接入 / SSRA audit 全部不做）。结构趋势 b64>b128>b256、fixed≥learnable、d0>d0.2：容量增加不产生可利用的 task-in 判别余量。与 H1（head 重训 +0.35pp）、H2（anchor 通道 +0.15pp）闭环：T0 剩余问题不是"固定特征后堆更强 classifier/MLP"能解决的。**注意 scope：判负的仅是 A5-P2-v1（fixed feature + small residual adapter）这一形态；prompt-aware 语义学习、表征级对比训练、共享原型反向影响特征形成、feature distillation、prompt 条件化共享模块、backbone/prompt 联合低秩 adaptation 均未被本探针测试、均未被否**。新 A5 待 21.2 全量重评 + Track A B/C/D 归因完成后重新设计，重心从 post-feature 变换移向 h 的形成过程（x→ViT→Global Prompt routing→h）。措辞规范（论文用）：不写"B2 推翻了 v2 的 +1.28pp"；写"早期单配置探针提示 +1.28pp，但在更严格的预注册 val-only 结构选择协议下，入选 SSRA 配置在冻结 test 上仅 +0.72pp，未过 ≥1pp 续作门槛"。
+
 **A2 槽位容量挤压风险**：A5 落地前用 verify_slot_binding.py 量化受保护槽比例/跨任务槽争抢。
 
 ## 7. 外部对比实验格局（主表 ~14 行）
