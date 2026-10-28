@@ -147,6 +147,24 @@ def get_args_parser(subparsers):
                                  'selected slots only). Isolates whether the CE '
                                  'all-pool soft-routing gradient is the round-0 '
                                  'key-rank collapse driver. See RUNCOMMANDS.md Sec.20.4.')
+    subparsers.add_argument('--route_selected_ce_grad', action='store_true',
+                            help='A2-R repair arm E1 (2026-10-28, default OFF '
+                                 '= bit-identical). Only takes effect with '
+                                 '--route_fix and mutually exclusive with '
+                                 '--route_detach_ce_key_grad. Forward is '
+                                 'bitwise unchanged: route_sim = sim_no_key '
+                                 '+ mask*(similarity - sim_no_key) where '
+                                 'sim_no_key uses prompt_norm.detach() and '
+                                 'mask is the per-sample detached top-k '
+                                 '(deliberately NOT batchwise majority). '
+                                 'Backward: CE gradient to prompt_key only '
+                                 'through the selected slots (sparse but '
+                                 'per-sample dispersed); CE gradient to '
+                                 'sample features fully kept; pull keeps '
+                                 'official semantics. Fixes the dominant '
+                                 'collapse driver (B/C/D verdict) without '
+                                 'the B-arm key-norm starvation side effect. '
+                                 'See RUNCOMMANDS.md Sec.20.5.')
     subparsers.add_argument('--disable_pull', action='store_true',
                             help='A2-R ablation arm C (2026-10-28, default OFF = '
                                  'bit-identical). Removes the -0.1*reduce_sim pull '

@@ -6,7 +6,8 @@ import torch.nn as nn
 class Global_Prompt(nn.Module):
     def __init__(self, length=5, embed_dim=768, embedding_key='mean', prompt_init='uniform', prompt_pool=False,
                  prompt_key=False, pool_size=None, top_k=None, batchwise_prompt=False, prompt_key_init='uniform',
-                 route_fix=False, route_tau=0.1, route_seed=0, route_detach_ce_key_grad=False):
+                 route_fix=False, route_tau=0.1, route_seed=0, route_detach_ce_key_grad=False,
+                 route_selected_ce_grad=False):
         super().__init__()
         self.length = length
         self.embed_dim = embed_dim
@@ -41,6 +42,25 @@ class Global_Prompt(nn.Module):
         if self.route_detach_ce_key_grad and not self.route_fix:
             raise ValueError(
                 "--route_detach_ce_key_grad only takes effect with --route_fix")
+        # E1 臂修复开关（CLI --route_selected_ce_grad，默认 False）：
+        # B/C/D 三臂归因（2026-10-28 终审）判决 CE 全池软路由梯度是 key
+        # 塌缩主驱动（B 断后 4/5 客户端保秩 81-91；C 留 CE 则 5/5 全塌
+        # 3-8），但 B 的纯 detach 有严重副作用——绝大多数 key 失去梯度
+        # 供养后被 weight decay 磨没（mean norm 0.0067，rank healthy ≠
+        # key pool healthy）。E1 = forward-soft / backward-selected：
+        # 前向与 route_fix 逐位一致；CE 对 key 的梯度只经 per-sample
+        # detached top-k 选中槽回传（稀疏且按样本分散，刻意不做
+        # batchwise 多数投票——修复目标正是"全池被共同拉向同一方向"）；
+        # CE 对样本特征的梯度完整保留；pull 保持官方语义。与
+        # --route_fix 绑定，且与 B 臂互斥（同一消融矩阵的互斥臂）。
+        self.route_selected_ce_grad = route_selected_ce_grad
+        if self.route_selected_ce_grad and not self.route_fix:
+            raise ValueError(
+                "--route_selected_ce_grad only takes effect with --route_fix")
+        if self.route_selected_ce_grad and self.route_detach_ce_key_grad:
+            raise ValueError(
+                "--route_selected_ce_grad is mutually exclusive with "
+                "--route_detach_ce_key_grad")
 
         # 初始化提示池  提示数量x长度x嵌入维度
         # 提示长度为5？
@@ -155,6 +175,25 @@ class Global_Prompt(nn.Module):
                 if self.route_detach_ce_key_grad:
                     route_sim = torch.matmul(
                         x_embed_norm, prompt_norm.detach().t())
+                elif self.route_selected_ce_grad:
+                    # E1（--route_selected_ce_grad）：mask 重构技巧。
+                    #   sim_no_key = x_norm @ K_norm.detach().T   （无 key 梯度通道）
+                    #   ce_topk_idx = topk(sim.detach())          （per-sample 选择）
+                    #   route_sim = sim_no_key + mask*(sim - sim_no_key)
+                    # 数值上 route_sim == similarity（前向逐位不变），但反向：
+                    #   ∂route_sim/∂K = mask ⊙ ∂sim/∂K   → CE→key 仅选中槽
+                    #   ∂route_sim/∂x = ∂sim/∂x（全量）    → CE→feature 完整
+                    # softmax 耦合仍在（dL/droute_sim 对全槽非零），只是被
+                    # mask 门控后才到达 key——CE→feature 语义与 route_fix
+                    # 逐位相同。
+                    sim_no_key = torch.matmul(
+                        x_embed_norm, prompt_norm.detach().t())
+                    ce_topk_idx = torch.topk(
+                        similarity.detach(), k=self.top_k, dim=1).indices
+                    ce_mask = torch.zeros_like(similarity).scatter_(
+                        1, ce_topk_idx, 1.0)
+                    route_sim = sim_no_key + ce_mask * (
+                        similarity - sim_no_key)
                 else:
                     route_sim = similarity
                 w = torch.softmax(route_sim / self.route_tau, dim=-1)  # B, Pool
@@ -168,6 +207,10 @@ class Global_Prompt(nn.Module):
                 out['x_embed_norm'] = x_embed_norm
                 out['similarity'] = similarity
                 out['soft_weights'] = w
+                if self.route_selected_ce_grad:
+                    # E1 诊断：本次 CE 反向可更新哪些槽（per-sample top-k，
+                    # 仅观察用，索引不传梯度）
+                    out['ce_route_topk'] = ce_topk_idx
                 # A 方案 pull 解耦（2026-10-27 全轨迹判决后修订）：
                 # 旧版全池软 pull（reduce_sim = top_k·Σ(w·sim)/B）与首臂
                 # round-0 key 塌缩（有效秩 87.8 → 6.5）同时出现，判定为

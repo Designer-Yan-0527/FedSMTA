@@ -240,6 +240,7 @@ def bootstrap_with_new_arg_defaults(run_dir, checkpoint, device=None):
     args = load_args_from_run_dir(run_dir, device=device)
     for key, default in (("route_fix", False), ("route_tau", 0.1),
                          ("route_detach_ce_key_grad", False),
+                         ("route_selected_ce_grad", False),
                          ("disable_pull", False)):
         if not hasattr(args, key):
             setattr(args, key, default)

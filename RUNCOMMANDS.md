@@ -548,6 +548,43 @@ python -m unittest tests.test_route_ablation_switches -v
 
 判据口径与 20.3 相同：post_local 有效秩（主要指标，>50 健康线）、样本间/分支间余弦、sha256。注意单 minibatch 的梯度范数（grad_audit 首批快照）不代表整个 30 epoch 的累计作用，责任判定以 post_local 快照为准。D 臂不能与 A 直接归因到单一梯度通道（route_fix 同时切换 R1 初始化，非干净对照），只作历史参照 + 官方"CE 无 key 通道"的结构性实证。
 
+### 20.5 E1 修复臂：forward-soft / backward-selected CE routing（2026-10-28 终审裁决）
+
+**判读实测（§20.4 出案，终审批准）**：命中判读表第一行——B 断 CE→key 后 4/5 客户端保秩 81-91（c0 个例 3.92 仍塌），C 留 CE 去 pull 则 5/5 全塌 3.4-8.3，D 官方结构性无 CE→key 通道（g_ce_exists 全 False）且从不塌。正式表述：**CE 全池软路由梯度是主驱动（dominant but not exclusive）**；c0 残余失败提示 pull+wd 次级退化通路。B 臂副作用警告：纯 detach 后 key 范数全体萎缩（mean 0.0067，wd 磨掉无梯度 key）——rank healthy ≠ key pool healthy，纯 detach 不可作正式方案。
+
+**E1 = --route_selected_ce_grad**：前向与 route_fix 逐位一致；CE 对 key 梯度只经 per-sample detached top-k 选中槽回传（刻意不做 batchwise 多数——修复目标正是"全池被共同拉向同一方向"）；CE 对样本特征梯度完整（sim_no_key 提供全量 x 通道）；pull 保持官方语义。暂不调 τ（τ 会同时改前向 mixture/熵/梯度幅值/Jacobian，混因果；E1 成功后 τ 才作为第二阶段性能超参数）、暂不做范数维持补丁（机制绕）。
+
+```bash
+# 20.5a E1 臂（--max_rounds 1 短程，与 B/C/D 同协议对照）
+python main.py datasets_delay \
+    --data_name cifar100 --method fedta \
+    --route_fix --route_tau 0.1 \
+    --route_selected_ce_grad \
+    --route_audit \
+    --seed 42 --global_epoch 5 --threshold 0.25 \
+    --run_name cifar_route_repair_E1_selectedce \
+    --max_rounds 1 \
+    --data-path /root/autodl-tmp/users/ych/FedSMTA/local_datasets
+```
+
+**四 Gate（E1 升格为正式方法模块的前置条件，全部逐 client 报告，不只报均值）**：
+
+| Gate | 判据 | 参照 |
+|---|---|---|
+| 1. Key geometry | post_local 有效秩保持在明显高秩区（**>70**） | A 臂塌到 3.5-6.6；D 官方 ≈88 |
+| 2. Key norm | 无 B 臂式萎缩：key_norm_mean 量级正常、`key_frac_norm_lt_1e-3`/`key_frac_norm_lt_1e-2` 两档 ≈0 | B 臂 mean 0.0067（route_audit 已新增两档 near-zero fraction 字段） |
+| 3. Routing utilization | 不退回官方单槽垄断：熵 ↑、top-1 dominance ↓ | route_audit 各时点 |
+| 4. Accuracy | **Acc_E ≥ Acc_A2**（最终最重要；不能再"指标变漂亮、准确率轻微下降"） | 与 §20 同协议 run 对照 |
+
+**c0 重点观察**：若 E1 后 c0 仍显著低于其余客户端（如 4/86/88/90/84 形态），则 pull+WD 次级通路升级为独立问题，开第二层诊断；若 85/88/90/87/89 形态则 Track A 修复闭合。
+
+**E1 后续（审查者裁决的顺序，勿提前混因果）**：E1 通过 Gate 1-3 但 Gate 2 出现未使用 key 范数萎缩 → 才做 **E2 = E1 + prompt_key no-weight-decay**（归一化路由 key 语义由方向决定，对 raw key 做 L2 shrink 本身值得质疑）；E1 完整通过 → τ 作为第二阶段性能超参数；Track A 升格为 **Gradient-Decoupled Soft Prompt Routing** 正式方法模块。
+
+```bash
+# 20.5b 单测（E1 梯度拓扑 + 前向逐位一致 + fail-closed + 默认 off 不变）
+python -m unittest tests.test_route_ablation_switches -v
+```
+
 ## 21. Track B/E 探针命令（SSRA headroom / H1-H2 / 评测 Dropout 因果与重评，2026-10-28）
 
 > **Track E 定性（审查者裁决）**：官方 `Client_DF.evaluate()` 全程不调用 `.eval()`，Chead（`Linear(1536→512) → ReLU → Dropout(0.5) → 200`）的 Dropout 在推理时保持激活 → 评测是随机采样且系统性低估（T0 实测：matrix 82.87 → eval-mode 84.81，+1.94pp）。仓库实现层面定性为 **evaluation-mode implementation bug**；论文算法与代码实现是两个层次，官方报告值保留为 official-compatible，不覆盖。H1/H2 已结案：native head 无欠训练（重训仅 +0.35pp）、Tail_Anchor 在 T0 判别贡献 ≈ +0.15pp；82.87→85.00 的差距主体是评测协议效应而非 head 优化余量。

@@ -137,6 +137,12 @@ def build_server(args, run_manager=None):
         # 隔离。默认 False = 逐位一致；仅 --route_fix 时生效。
         route_detach_ce_key_grad=bool(
             getattr(args, 'route_detach_ce_key_grad', False)),
+        # E1 臂修复（--route_selected_ce_grad）：forward-soft /
+        # backward-selected CE routing——前向逐位不变，CE 对 key 的梯度
+        # 只经 per-sample top-k 选中槽回传，CE 对特征梯度完整。默认
+        # False = 逐位一致；仅 --route_fix 时生效、与 B 臂互斥。
+        route_selected_ce_grad=bool(
+            getattr(args, 'route_selected_ce_grad', False)),
     )
 
     original_model.to(device)

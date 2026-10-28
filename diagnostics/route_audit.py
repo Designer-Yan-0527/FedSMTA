@@ -104,6 +104,14 @@ def key_stats(key):
         "key_norm_std": round(float(norms.std().item()), 6),
         "key_norm_min": round(float(norms.min().item()), 6),
         "key_norm_max": round(float(norms.max().item()), 6),
+        # E1 臂监控（2026-10-28 终审 Gate 2）：B 臂暴露了 rank healthy ≠
+        # key pool healthy——detach 后无梯度 key 被 weight decay 磨到近零
+        # （mean 0.0067）。near-zero key fraction 按审查者建议取
+        # ε=1e-3 / 1e-2 两档，判读时健康状态应要求两档都 ≈0。
+        "key_frac_norm_lt_1e-3": round(
+            float((norms < 1e-3).float().mean().item()), 6),
+        "key_frac_norm_lt_1e-2": round(
+            float((norms < 1e-2).float().mean().item()), 6),
         "key_sha256": sha256_tensor(k),
     }
 
