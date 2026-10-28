@@ -547,3 +547,52 @@ python -m unittest tests.test_route_ablation_switches -v
 - **B、C 都塌**：嫌疑转向其他本地因素（优化器 / weight_decay=1e-3 / key 范数塌缩参与率口径），需逐槽更新轨迹分析
 
 判据口径与 20.3 相同：post_local 有效秩（主要指标，>50 健康线）、样本间/分支间余弦、sha256。注意单 minibatch 的梯度范数（grad_audit 首批快照）不代表整个 30 epoch 的累计作用，责任判定以 post_local 快照为准。D 臂不能与 A 直接归因到单一梯度通道（route_fix 同时切换 R1 初始化，非干净对照），只作历史参照 + 官方"CE 无 key 通道"的结构性实证。
+
+## 21. Track B/E 探针命令（SSRA headroom / H1-H2 / 评测 Dropout 因果与重评，2026-10-28）
+
+> **Track E 定性（审查者裁决）**：官方 `Client_DF.evaluate()` 全程不调用 `.eval()`，Chead（`Linear(1536→512) → ReLU → Dropout(0.5) → 200`）的 Dropout 在推理时保持激活 → 评测是随机采样且系统性低估（T0 实测：matrix 82.87 → eval-mode 84.81，+1.94pp）。仓库实现层面定性为 **evaluation-mode implementation bug**；论文算法与代码实现是两个层次，官方报告值保留为 official-compatible，不覆盖。H1/H2 已结案：native head 无欠训练（重训仅 +0.35pp）、Tail_Anchor 在 T0 判别贡献 ≈ +0.15pp；82.87→85.00 的差距主体是评测协议效应而非 head 优化余量。
+
+### 21.1 Track E 因果三态探针（`probe_eval_dropout_causal.py`，先行闭环）
+
+同一个 checkpoint、同一个 test loader 上三种模式：native（逐字官方 evaluate）/ head_eval（仅 Tail_Anchor 含 Chead `.eval()`，Tail_Anchor 无 BN、Chead 外无 Dropout → 精确隔离 Dropout 因果）/ full_eval（model+vit+original_model 全 `.eval()` = 修正确定性协议；vit `train=True` 前向语义逐字保留）。native 重复 15 次展示随机波动，eval 模式重复 3 次验证确定性。
+
+```bash
+python diagnostics/probe_eval_dropout_causal.py \
+    --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
+    --checkpoint checkpoints/task_00_end.pth \
+    --task 0 --native_repeats 15 --eval_repeats 3
+```
+
+预期：native ≈ 82.87 且重复间有波动；head_eval ≈ full_eval ≈ 84.81 且重复几乎一致。`CAUSAL_CONFIRMED` 判据：dropout 效应 ≥1pp、|head_eval−full_eval|≤0.5pp、native 有随机性、eval 重复稳定。产物 `diagnostics_output/eval_dropout_causal.{json,csv}`。
+
+### 21.2 Track E 全量 corrected-eval 只读重评（`eval_mode_reeval.py`，21.1 结案后跑）
+
+对每个 `task_XX_end.pth`、每个 (client, 已见任务 k) 输出双口径 `official_compat_acc` / `corrected_eval_acc`，外加 R[t][k] 矩阵与 AA。**只读**：不覆盖 run_dir 内任何历史产物，输出仅落 `diagnostics_output/eval_mode_reeval.{csv,json}`。不预设"所有历史结果都涨 1-2pp"——逐 checkpoint 实测。
+
+```bash
+python diagnostics/eval_mode_reeval.py \
+    --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
+    --native_repeats 1
+```
+
+### 21.3 B2 SSRA 结构搜索（`probe_ssra_headroom.py --mode b2`，val 选结构、test 只评一次）
+
+网格：bottleneck {64,128,256} × residual scale {fixed, learnable α} × dropout {0, 0.2} × wd {1e-3}（12 配置）。**协议（审查者裁决）**：所有结构只比 3-seed validation（选 epoch 的 val acc），胜者 freeze 后 TEST 只评一次；P0 线性参照臂照旧 val+test 一次。任何搜索结构不产生 test 数字。Gate 仍是 GREEN ≥2pp / YELLOW 1-2pp / RED <1pp（作用于 winner−P0 的 test-once delta）。约 4× v2 探针计算量（195 次训练 × 150 epochs，cached 特征上，GPU 需求很小）。
+
+```bash
+python diagnostics/probe_ssra_headroom.py \
+    --features diagnostics_output/features_ImageNet-R_task_00_end_promptcurrent.npz \
+    --mode b2 \
+    --bottlenecks 64 128 256 --scale_modes fixed learnable \
+    --dropouts 0.0 0.2 --wds 1e-3
+```
+
+产物 `diagnostics_output/ssra_b2_search.{json,csv}`。`--mode gate`（默认）保持 v2 三臂行为不变，旧命令不受影响。
+
+### 21.4 单测（Track E 切换语义 + B2 无 test 泄漏）
+
+```bash
+python -m unittest tests.test_track_e_and_b2 -v
+```
+
+覆盖：ResidualAdapter 零初始化恒等（fixed/learnable）、α=1.0 可学习、dropout 模块按需挂载、eval_in_mode 三态标志与恢复、native 随机 vs eval 确定、`evaluate_test=False` 不产生任何 test 字段、冻结 best_state 经 `test_from_state` 重放确定。
