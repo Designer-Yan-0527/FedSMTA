@@ -726,3 +726,62 @@ python -m unittest tests.test_track_e_and_b2 -v
 | A5 | **重新设计**：仅否 A5-P2-v1（fixed feature + post-feature adapter）形态，共享语义学习整体未判负；待 21.2 + B/C/D 完成后定形态 |
 
 **下一步（顺序）**：① 跑 21.2（上面命令）；② 跑 §20.4 B/C/D 三臂（Track A 归因，最直接的上游 representation 机制实验）；③ 两件事完成后重新设计 A5，先不开新模块。判负不是坏结果：H1（+0.35pp）+ H2（+0.15pp）+ B2（+0.72pp）闭环证明 T0 余量主体是评测协议而非结构，一个廉价离线 Gate 提前砍掉了整条低收益联邦工程线。
+
+## 22. Track A 终局 + A5 Gate A-2 双数据集判读 + 送审包（2026-10-28，待终审）
+
+> 本节为送审正文，若终审通过则取代 §21.5 状态板中 Track A / A5 两行。
+
+### 22.1 E2 四 Gate 判读（§20.5c 预注册）与 kill criterion 触发
+
+E2 = E1 + `--route_key_no_wd`（`cifar_route_repair_E2_keynowd`，seed 42，短程协议）。判读源：`route_audit/route_audit.jsonl` + `logs/train.log`。
+
+| Gate | 指标 | E1 | E2 | 判定 |
+|---|---|---|---|---|
+| 1 秩 | 有效秩逐 client（init 99） | 54.84/65.00/56.70/52.21/4.85 | **96.47/96.14/97.47/97.68/95.20**，post_fusion 96.47 | **PASS**（>70） |
+| 2 范数（核心因果） | frac<1e-3 | 0.97-0.98 | **0.0**（全部 client + fusion 后） | **PASS** |
+| 2 范数分组 | 未选中 key ratio / 选中 key ratio | 萎缩 | **1.0 逐位不动 / 1.03-1.06** | wd=0 下未触碰 key 完全保持 |
+| 附 | mean_abs_offdiag_cosine | — | 0.0057（近正交保持） | — |
+| 4 准确率 | train.log 末轮均值 | 92.69 | **≈92.5**（两列口径 92.61/92.48） | **FAIL**（≤ D 94.50） |
+
+四臂对照（同一短程协议）：**D 官方 94.50 > E1 92.69 ≈ E2 92.5 > B 92.38 > A 92.15**。
+
+**Kill criterion 触发**（§20.5c 预注册）："E2 几何全绿但准确率仍 ≤ D → Track A 修复线关闭，基线回到官方 D"。几何全绿 ✓ + 准确率 ≤ D ✓ → **触发**。
+
+**因果结论（Track A 的最终科学产出）**：
+1. **wd 是 key 范数饥饿的主驱动——证实**：免 wd 后未选中 key 逐位不动（Adam 零梯度 + wd=0 不移动）、零饥饿；E1 的"wd 经 l2_normalize Jacobian（∝1/|K|）放大 CE 梯度扭转"假说被 E2 直接证实。
+2. **c0 之谜解开**：c0 在 A/B/E1 三臂全塌且对 CE 侧干预免疫，E2 下复活（96.47）→ c0 塌缩主因是 wd 而非 CE；按第六轮预注册"c0 恢复 → WD 是主次级通路"，**E3（E2+disable_pull）不再需要**。
+3. **塌缩与当前任务准确率双向解耦**：E1 塌着 92.69 / E2 修干净 ≈92.5——修复 key 池一分准确率不还。"修好 key 池准确率回来"的立项假设被否证；route_fix 家族 −1.9pp 的成本来自软路由 prompt 混合与 R1 init 本身，与 key 健康无关。
+4. **关闭措辞（论文用）**：不写"机制修复无效"；写"key 池健康与当前任务准确率无因果通路（双向解耦实测）；机制修复的假想收益在多轮保持维度，未测且不构成当前优先级"。软路由复活须先在 A2 INR 主线拿出多轮 retention 证据（维持原判据）。
+
+### 22.2 A5 Gate A-2：oracle headroom 双数据集判读
+
+工具 `diagnostics/probe_oracle_headroom.py`（§9.3.6，Gate 预注册：只看 T0 z_op `delta_pooled`，≥2 GREEN / ≤1 RED）。探针运行中修复三件事：`diag_utils` 老 run args 回填改 parser 默认值自动派生（2f5f1c2）；`Server_DF.load_checkpoint` global_head 按保存结构重建（75ead14，skip_fed_avg_head 臂 resume 真 bug）；mask 类零训练行保留被压低的输出单元（24f9810，CIFAR 公共类 (client,task) 份额可为 0-1 样本的协议现实，native Chead 同语义）。
+
+| 数据集 | run | T0 z_op native / mlp_local / mlp_pooled | d_loc | d_pool | fed | Gate |
+|---|---|---|---|---|---|---|
+| INR（主判读） | inr_a2_key_p40 | 82.87 / 86.91 / 85.75 | +4.04 | **+2.88** | **−1.16** | **GREEN** |
+| INR z_ref | 同上 | 82.87 / 84.01 / 83.09 | +1.14 | +0.22 | −0.92 | RED（上下文） |
+| CIFAR | cifar_hsn | 94.67 / 96.93 / 96.13 | +2.26 | **+1.46** | **−0.80** | **YELLOW** |
+
+INR 参考：mlp_local 86.91 ≈ C²P T0 86.86（T0 差距被本地重训接口完全吃掉）。CIFAR native 94.67 与 D 官方 94.50 吻合（hsn 臂 z_ref 读数有效性 sanity）。
+
+**判读**：
+1. **headroom 双重确认**（INR GREEN / CIFAR YELLOW）：可训练接口在 OUR 特征上可多榨 +1.5~4pp，且信息在 z_op（prompt 增强特征）不在 z_ref——prompt 有效，接口是瓶颈。
+2. **"联邦共享"组件被否证（决定性）**：CIFAR 有 25 个跨客户端公共类，池化 oracle 仍输给本地头（96.13 < 96.93）；双数据集、有无类重叠两形态 `fed` 全负。**A5-v2 的"共享 g + FedAvg"设计无证据支持。**
+3. **native 接口训练浪费**：连线性头干净重训都 +2.21（CIFAR）/ +2.90（INR）——Chead 的训练方式（Dropout 0.5 / 与 prompt 联训 / 优化配置）把 2-3pp 留在桌上。
+4. **T4 上下文（不进 Gate，回溯重访口径）**：CIFAR native AA 74.65 vs 本地重训头 96.53（**+20pp**）；INR 84.82 vs 79.43（+5.4）。遗忘的主体是**接口漂移**（旧任务头与漂移后 prompt 特征失配），不是信息丢失——"本地数据巩固/接口重对齐"组件的 headroom 证据（协议合法，数据不出域）。
+
+### 22.3 A5-v2 方向修正（待审）
+
+原设计"轻量共享语义投影 g + FedAvg"按 22.2-2 撤回。修正设计要点：
+- **基座**：官方 FedTA 全部不动（hard routing、official prompt 训练、corrected 口径 Gate 4）。
+- **方法主体**：本地语义接口的解耦/巩固训练——利用本地已见任务数据（不出域）周期性重对齐接口，吸收 22.2-3 的 T0 headroom 与 22.2-4 的保持 headroom。
+- **机制归因消融**（预注册）：Chead Dropout 0.5 / 联训 vs 后置 / 输入标准化 三因素拆解 native 接口为何弱。
+- **Gate（预注册）**：当前任务 corrected 准确率 ≥ 官方 D+1pp = GREEN；约束 BWT_corrected ≥ −2pp。
+- 联邦聚合作为增强臂保留（fed<0 不立项、只作消融），不再作为方法主张。
+
+### 22.4 送审问题（请审查者裁决）
+
+1. **Track A 关闭**：22.1 kill criterion 触发是否成立？E3 按预注册（c0 复活 → WD 归因）判"不需要"是否同意？
+2. **A5-v2 方向修正**：由"共享语义层 + FedAvg"转向"本地接口解耦训练"，依据 22.2-2/3/4（双数据集 fed<0、linear refit +2~3pp、T4 +20pp 漂移证据）——是否成立？
+3. **A5-v2 立项**：INR GREEN / CIFAR YELLOW 的 Gate 判定与 22.3 设计要点是否放行？若无异议，下一步产出 A5-v2 正式 spec（方法节 + 消融矩阵 + 实验计划）。
