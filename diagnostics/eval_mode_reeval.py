@@ -34,7 +34,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from diagnostics.probe_head_retrain import bootstrap_with_new_arg_defaults
-from diagnostics.probe_eval_dropout_causal import eval_in_mode
+from diagnostics.probe_eval_dropout_causal import (eval_in_mode,
+                                                   head_flags_during_forward)
 
 
 def discover_checkpoints(run_dir):
@@ -82,6 +83,7 @@ def main():
           % (len(ckpts), [c[1] for c in ckpts]))
 
     detail_rows = []
+    head_checks = {}
     matrices = {"official_compat": {}, "corrected_eval": {}}
     for t, ckpt in ckpts:
         aargs, server = bootstrap_with_new_arg_defaults(
@@ -94,13 +96,20 @@ def main():
                       "-- evaluate() uses task_id=%s in the vit forward "
                       "(official semantics preserved as-is)"
                       % (c.id, c.task_id, t, c.task_id))
+        corrected_head_failures = 0
         for k in range(t + 1):
             off_accs, corr_accs = [], []
             for c in clients:
                 off = float(sum(eval_in_mode(c, k, nb_classes, "native")
                                for _ in range(args.native_repeats))
                            / args.native_repeats)
-                corr = eval_in_mode(c, k, nb_classes, "full_eval")
+                corr, head_flags = head_flags_during_forward(
+                    c, k, nb_classes, "full_eval")
+                # fail-closed runtime check: the head actually installed
+                # by load_head (which bypasses model.eval()) must be in
+                # eval mode AT FORWARD TIME under the corrected protocol
+                if head_flags != [False]:
+                    corrected_head_failures += 1
                 off_accs.append(off)
                 corr_accs.append(corr)
                 detail_rows.append([ckpt, t, c.id, k, round(off, 4),
@@ -115,6 +124,11 @@ def main():
                      matrices["corrected_eval"][t][k],
                      matrices["corrected_eval"][t][k]
                      - matrices["official_compat"][t][k]))
+        if corrected_head_failures:
+            print("WARNING: %s: %d corrected evaluations ran with a "
+                  "train-mode loaded head (load_head bypass not covered)"
+                  % (ckpt, corrected_head_failures))
+        head_checks[ckpt] = corrected_head_failures
         del server
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -144,6 +158,7 @@ def main():
                              for t, row in mat.items()}
                      for proto, mat in matrices.items()},
         "average_accuracy": aa,
+        "corrected_head_train_mode_failures": head_checks,
         "per_client_detail": [dict(zip(
             ("checkpoint", "task_t", "client", "eval_task",
              "official_compat_acc", "corrected_eval_acc"), r))

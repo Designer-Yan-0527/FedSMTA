@@ -61,8 +61,21 @@ def eval_in_mode(client, task, nb_classes, mode):
 
     The official path is called VERBATIM (batch 8, shuffle=True, load_head,
     vit train=True kwarg, class_mask); only the module-level train/eval
-    flags differ per mode, and they are restored in a finally block."""
+    flags differ per mode, and they are restored in a finally block.
+
+    Reviewer fix (2026-10-28): evaluate() calls
+    self.model.load_head(self.heads[task]) FIRST, and Tail_Anchor.load_head
+    re-installs a deepcopy of heads[task] as the active head -- the copy
+    inherits heads[task]'s OWN training flag, so toggling client.model
+    alone is bypassed. Therefore head_eval/full_eval must ALSO switch the
+    SOURCE module client.heads[task] to eval() (restored in finally)."""
     flags = snapshot_flags(client)
+    head_src = None
+    head_src_flag = None
+    heads = getattr(client, "heads", None)
+    if heads is not None and heads[task] is not None:
+        head_src = heads[task]
+        head_src_flag = head_src.training
     try:
         if mode == "native":
             pass
@@ -70,15 +83,44 @@ def eval_in_mode(client, task, nb_classes, mode):
             # Tail_Anchor: no BatchNorm, no Dropout outside Chead ->
             # this isolates exactly the Chead Dropout(0.5).
             client.model.eval()
+            if head_src is not None:
+                head_src.eval()
         elif mode == "full_eval":
             client.model.eval()
             client.vit.eval()
             client.original_model.eval()
+            if head_src is not None:
+                head_src.eval()
         else:
             raise ValueError("unknown mode: %r" % mode)
         return client.evaluate(task, nb_classes)
     finally:
         restore_flags(client, flags)
+        if head_src is not None:
+            head_src.train(head_src_flag)
+
+
+def head_flags_during_forward(client, task, nb_classes, mode):
+    """Run eval_in_mode with a forward_pre_hook on client.model that
+    records, AT FORWARD TIME, the training flag of the head ACTUALLY
+    installed by evaluate()'s load_head (the deepcopy carries
+    heads[task]'s own flag -- the load_head bypass path).
+
+    Returns (acc, sorted set of flags seen across all batches). The flag
+    must be read during the forward: after eval_in_mode returns, the
+    finally-restore (model.train(True) is recursive) flips the installed
+    head back to train mode, so a post-call read would be misleading."""
+    seen = []
+
+    def _hook(_module, _inputs):
+        seen.append(bool(client.model.head.training))
+
+    handle = client.model.register_forward_pre_hook(_hook)
+    try:
+        acc = eval_in_mode(client, task, nb_classes, mode)
+    finally:
+        handle.remove()
+    return acc, sorted(set(seen))
 
 
 def dropout_inventory(client):
@@ -133,14 +175,19 @@ def main():
              ("head_eval", args.eval_repeats),
              ("full_eval", args.eval_repeats))
     per_client = {}
+    loaded_flags = {}   # (client id, mode) -> sorted set of training flags
     inventory = {}
     rows = []
     for c in clients:
         inventory[c.id] = dropout_inventory(c)
         rec = {}
         for mode, n in modes:
-            accs = [eval_in_mode(c, args.task, nb_classes, mode)
-                    for _ in range(n)]
+            accs = []
+            for _ in range(n):
+                a, flags = head_flags_during_forward(
+                    c, args.task, nb_classes, mode)
+                accs.append(a)
+                loaded_flags.setdefault((c.id, mode), set()).update(flags)
             rec[mode] = accs
             for i, a in enumerate(accs):
                 rows.append([c.id, mode, i, round(a, 4)])
@@ -180,10 +227,20 @@ def main():
     native_stochastic = float(np.mean(native_std)) >= 0.05
     eval_stable = eval_spread <= 0.5 and eval_spread <= 2.0 * float(
         np.mean(native_spread))
+    # runtime evidence: the head actually installed by load_head must be
+    # train-mode under native and eval-mode under the corrected protocols
+    heads_native_ok = all(
+        sorted(v) == [True] for (_cid, mode), v in loaded_flags.items()
+        if mode == "native")
+    heads_eval_ok = all(
+        sorted(v) == [False] for (_cid, mode), v in loaded_flags.items()
+        if mode in ("head_eval", "full_eval"))
     causal_confirmed = bool(dropout_effect >= 1.0
                             and abs(head_vs_full) <= 0.5
                             and native_stochastic
-                            and eval_stable)
+                            and eval_stable
+                            and heads_native_ok
+                            and heads_eval_ok)
 
     summary = {
         "probe": "eval_dropout_causal_toggle",
@@ -212,12 +269,16 @@ def main():
         "eval_repeat_spread_max": round(eval_spread, 4),
         "dropout_effect_pp": dropout_effect,
         "head_eval_minus_full_eval_pp": head_vs_full,
+        "loaded_head_training_evidence": {
+            "c%d_%s" % k: sorted(v) for k, v in loaded_flags.items()},
         "verdict": "CAUSAL_CONFIRMED" if causal_confirmed else "INCONCLUSIVE",
         "verdict_criteria": {
             "dropout_effect >= 1.0": dropout_effect >= 1.0,
             "|head_eval - full_eval| <= 0.5": abs(head_vs_full) <= 0.5,
             "native stochastic (mean repeat std >= 0.05)": native_stochastic,
             "eval repeats stable": eval_stable,
+            "loaded head train-mode under native": heads_native_ok,
+            "loaded head eval-mode under head_eval/full_eval": heads_eval_ok,
         },
         "per_client_accs": {str(cid): {m: [round(a, 4) for a in l]
                                        for m, l in rec.items()}

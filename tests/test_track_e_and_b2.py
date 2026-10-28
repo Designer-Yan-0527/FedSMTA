@@ -13,6 +13,7 @@ Covers:
 """
 import sys
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -23,9 +24,27 @@ import numpy as np
 import torch
 
 from diagnostics.probe_ssra_headroom import (ResidualAdapter, build_arm,
-                                             train_one, test_from_state)
+                                             train_one, test_from_state,
+                                             _acc_eval_mode)
 from diagnostics.probe_eval_dropout_causal import (eval_in_mode,
-                                                   snapshot_flags)
+                                                   snapshot_flags,
+                                                   head_flags_during_forward)
+
+
+class _ModelStub(torch.nn.Module):
+    """Tail_Anchor-like stand-in: load_head RE-INSTALLS a deepcopy of the
+    source head (which carries the SOURCE's training flag) -- this is the
+    official bypass path that the Track E fix must survive."""
+
+    def __init__(self):
+        super().__init__()
+        self.head = torch.nn.Identity()
+
+    def load_head(self, head):
+        self.head = deepcopy(head)
+
+    def forward(self, x):
+        return self.head(x)
 
 
 class _FakeClient(object):
@@ -34,9 +53,11 @@ class _FakeClient(object):
     def __init__(self):
         torch.manual_seed(0)
         self.id = 0
-        self.model = torch.nn.Sequential(
+        self.model = _ModelStub()
+        # stored heads live in TRAIN mode, exactly like the real system
+        self.heads = [torch.nn.Sequential(
             torch.nn.Linear(4, 4), torch.nn.ReLU(),
-            torch.nn.Dropout(0.5), torch.nn.Linear(4, 3))
+            torch.nn.Dropout(0.5), torch.nn.Linear(4, 3))]
         self.vit = torch.nn.Sequential(torch.nn.Linear(4, 4),
                                         torch.nn.Dropout(0.5))
         self.original_model = torch.nn.Sequential(torch.nn.Linear(4, 4),
@@ -47,6 +68,7 @@ class _FakeClient(object):
         # mimic official call order; record flags DURING the call
         # (task / nb_classes unused: signature matches the official path)
         self.observed_flags.append(snapshot_flags(self))
+        self.model.load_head(self.heads[task])  # official bypass path
         x = torch.ones(16, 4)
         self.original_model(x)
         self.vit(x)
@@ -123,6 +145,36 @@ class TestEvalModeToggle(unittest.TestCase):
         with self.assertRaises(ValueError):
             eval_in_mode(c, 0, 3, "bogus_mode")
 
+    def test_head_eval_survives_load_head_bypass(self):
+        """Regression for the reviewer-found bug: evaluate() re-installs a
+        deepcopy of heads[task] whose OWN training flag is train-mode, so
+        toggling client.model alone leaves Dropout ACTIVE. eval_in_mode
+        must also switch the SOURCE heads[task]. The installed head's
+        flag is verified AT FORWARD TIME (a post-call read is misleading:
+        the finally-restore flips the installed head back to train)."""
+        c = _FakeClient()
+        # native: the head actually used at forward time is train-mode
+        _acc, flags = head_flags_during_forward(c, 0, 3, "native")
+        self.assertEqual(flags, [True])
+        # corrected modes: installed head must be eval-mode AND
+        # deterministic despite the load_head re-install
+        for mode in ("head_eval", "full_eval"):
+            vals = []
+            for _ in range(4):
+                a, flags = head_flags_during_forward(c, 0, 3, mode)
+                vals.append(a)
+                self.assertEqual(flags, [False],
+                                 "%s: head must be eval-mode at forward "
+                                 "time" % mode)
+            self.assertEqual(len(set(vals)), 1,
+                             "%s: Dropout must be OFF (deterministic)"
+                             % mode)
+        # source head flag restored after every call
+        self.assertTrue(c.heads[0].training)
+        self.assertEqual(snapshot_flags(c),
+                         {"model": True, "vit": True,
+                          "original_model": True})
+
 
 class TestB2NoTestLeakage(unittest.TestCase):
 
@@ -134,10 +186,12 @@ class TestB2NoTestLeakage(unittest.TestCase):
         return X[:60], y[:60], X[60:75], y[60:75], X[75:], y[75:]
 
     def test_search_run_never_touches_test(self):
-        Xtr, ytr, Xva, yva, Xte, yte = self._data()
+        """Fail-closed: search runs pass X_te=y_te=None entirely -- test is
+        not read for n_classes nor materialized as a tensor."""
+        Xtr, ytr, Xva, yva, _Xte, _yte = self._data()
         cfg = {"bottleneck": 4, "scale_mode": "learnable", "dropout": 0.0,
                "weight_decay": 1e-3}
-        r, s = train_one("P1", Xtr, ytr, Xva, yva, Xte, yte, seed=42,
+        r, s = train_one("P1", Xtr, ytr, Xva, yva, None, None, seed=42,
                          epochs=6, batch_size=16, lr=1e-2,
                          weight_decay=cfg["weight_decay"], device="cpu",
                          fisher_in=1.0, cfg=cfg, evaluate_test=False)
@@ -146,6 +200,33 @@ class TestB2NoTestLeakage(unittest.TestCase):
         self.assertIn("val_acc_at_best", r)
         for key in ("feat", "head", "n_classes", "dim"):
             self.assertIn(key, s)
+
+    def test_evaluate_test_true_with_none_raises(self):
+        Xtr, ytr, Xva, yva, _Xte, _yte = self._data()
+        with self.assertRaises(ValueError):
+            train_one("P0", Xtr, ytr, Xva, yva, None, None, seed=42,
+                      epochs=6, batch_size=16, lr=1e-2, weight_decay=1e-3,
+                      device="cpu", fisher_in=1.0, evaluate_test=True)
+
+    def test_acc_eval_mode_deterministic_and_restores(self):
+        """Val/test protocol: _acc_eval_mode must switch dropout modules
+        to eval for the measurement and restore train mode afterwards."""
+        torch.manual_seed(1)
+        feat = ResidualAdapter(8, bottleneck=4, dropout=0.5,
+                               scale_mode="fixed")
+        head = torch.nn.Linear(8, 3)
+        feat.train()
+        X = torch.randn(32, 8)
+        y = torch.randint(0, 3, (32,))
+        a1 = _acc_eval_mode(feat, head, X, y)
+        a2 = _acc_eval_mode(feat, head, X, y)
+        self.assertEqual(a1, a2, "eval-mode accuracy must be deterministic")
+        self.assertTrue(feat.training, "train flag must be restored")
+        self.assertTrue(head.training)
+        # must equal a manual eval-mode measurement
+        feat.eval(), head.eval()
+        manual = float((head(feat(X)).argmax(dim=1) == y).float().mean())
+        self.assertEqual(a1, round(manual * 100.0, 6))
 
     def test_frozen_state_replay_is_deterministic(self):
         Xtr, ytr, Xva, yva, Xte, yte = self._data()

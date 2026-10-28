@@ -556,6 +556,8 @@ python -m unittest tests.test_route_ablation_switches -v
 
 同一个 checkpoint、同一个 test loader 上三种模式：native（逐字官方 evaluate）/ head_eval（仅 Tail_Anchor 含 Chead `.eval()`，Tail_Anchor 无 BN、Chead 外无 Dropout → 精确隔离 Dropout 因果）/ full_eval（model+vit+original_model 全 `.eval()` = 修正确定性协议；vit `train=True` 前向语义逐字保留）。native 重复 15 次展示随机波动，eval 模式重复 3 次验证确定性。
 
+**复审修复（2026-10-28 第二轮，阻断一）**：官方 `evaluate()` 内部 `load_head()` 会 `deepcopy(heads[task])` 重新替换 `self.head`，deepcopy 继承 `heads[task]` 自己的 training flag——只切 `client.model.eval()` 会被绕过，head_eval/full_eval 未必真的关闭最终参与推理的 Dropout。现 `eval_in_mode` 在 head_eval/full_eval 下同时把源头 `client.heads[task]` 切到 `.eval()`（finally 中恢复其原始标志）。运行时证据经 forward_pre_hook 在**前向时刻**采集（调用后读取不可靠：finally 恢复 `model.train(True)` 是递归的，会把已装进去的 head 翻回 train），写入 JSON 字段 `loaded_head_training_evidence`。`CAUSAL_CONFIRMED` 判据新增两条：native 前向时 head 标志全 True、head_eval/full_eval 前向时全 False。
+
 ```bash
 python diagnostics/probe_eval_dropout_causal.py \
     --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
@@ -567,7 +569,7 @@ python diagnostics/probe_eval_dropout_causal.py \
 
 ### 21.2 Track E 全量 corrected-eval 只读重评（`eval_mode_reeval.py`，21.1 结案后跑）
 
-对每个 `task_XX_end.pth`、每个 (client, 已见任务 k) 输出双口径 `official_compat_acc` / `corrected_eval_acc`，外加 R[t][k] 矩阵与 AA。**只读**：不覆盖 run_dir 内任何历史产物，输出仅落 `diagnostics_output/eval_mode_reeval.{csv,json}`。不预设"所有历史结果都涨 1-2pp"——逐 checkpoint 实测。
+对每个 `task_XX_end.pth`、每个 (client, 已见任务 k) 输出双口径 `official_compat_acc` / `corrected_eval_acc`，外加 R[t][k] 矩阵与 AA。**只读**：不覆盖 run_dir 内任何历史产物，输出仅落 `diagnostics_output/eval_mode_reeval.{csv,json}`。不预设"所有历史结果都涨 1-2pp"——逐 checkpoint 实测。corrected 口径复用 21.1 的 load_head 绕过修复，并做 fail-closed 校验：任一 checkpoint 的 corrected 评测若经 forward_pre_hook 在前向时刻检测到 head 仍处 train mode，打 WARNING 并计入 JSON 字段 `corrected_head_train_mode_failures`（判读时应为全 0，非 0 即修复未生效、该批 corrected 数字不可信）。
 
 ```bash
 python diagnostics/eval_mode_reeval.py \
@@ -579,6 +581,8 @@ python diagnostics/eval_mode_reeval.py \
 
 网格：bottleneck {64,128,256} × residual scale {fixed, learnable α} × dropout {0, 0.2} × wd {1e-3}（12 配置）。**协议（审查者裁决）**：所有结构只比 3-seed validation（选 epoch 的 val acc），胜者 freeze 后 TEST 只评一次；P0 线性参照臂照旧 val+test 一次。任何搜索结构不产生 test 数字。Gate 仍是 GREEN ≥2pp / YELLOW 1-2pp / RED <1pp（作用于 winner−P0 的 test-once delta）。约 4× v2 探针计算量（195 次训练 × 150 epochs，cached 特征上，GPU 需求很小）。
 
+**复审修复（2026-10-28 第二轮，阻断二/三）**：① 搜索运行真正 test-untouched（fail-closed）：b2 模式下 `train_one` 以 `X_te=None, y_te=None` 调用，`evaluate_test=False` 时 n_classes 只从 y_tr/y_val 推断、完全不物化 test 张量；`evaluate_test=True` 时传 None 直接 ValueError。② val/train/test 统一 eval-mode 口径（`_acc_eval_mode`：评估前保存 training 标志并临时 `.eval()`，评估后恢复），消除"dropout>0 的候选用带随机 Dropout 的 val 排名、胜者却用关 Dropout 的 test 报结果"的协议不一致；dropout=0 配置数值不变，v2/gate 旧结果不受影响。
+
 ```bash
 python diagnostics/probe_ssra_headroom.py \
     --features diagnostics_output/features_ImageNet-R_task_00_end_promptcurrent.npz \
@@ -587,7 +591,7 @@ python diagnostics/probe_ssra_headroom.py \
     --dropouts 0.0 0.2 --wds 1e-3
 ```
 
-产物 `diagnostics_output/ssra_b2_search.{json,csv}`。`--mode gate`（默认）保持 v2 三臂行为不变，旧命令不受影响。
+产物 `diagnostics_output/ssra_b2_search.{json,csv}`。**模式语义（第二轮裁决同步）**：`--mode gate`（默认）已改为现行裁决——P0=85.00 是强线性参照，verdict 直接按 winner−P0 的 test-once delta 三档判定，native 对齐仅作信息项（不再 CALIBRATION_FAIL）；v2 逐位旧行为（含 CALIBRATION_FAIL）保留在 `--mode legacy_gate`，仅供历史复现，不再代表当前裁决。
 
 ### 21.4 单测（Track E 切换语义 + B2 无 test 泄漏）
 
@@ -595,4 +599,4 @@ python diagnostics/probe_ssra_headroom.py \
 python -m unittest tests.test_track_e_and_b2 -v
 ```
 
-覆盖：ResidualAdapter 零初始化恒等（fixed/learnable）、α=1.0 可学习、dropout 模块按需挂载、eval_in_mode 三态标志与恢复、native 随机 vs eval 确定、`evaluate_test=False` 不产生任何 test 字段、冻结 best_state 经 `test_from_state` 重放确定。
+覆盖：ResidualAdapter 零初始化恒等（fixed/learnable）、α=1.0 可学习、dropout 模块按需挂载、eval_in_mode 三态标志与恢复、native 随机 vs eval 确定、`evaluate_test=False` 不产生任何 test 字段、冻结 best_state 经 `test_from_state` 重放确定。第二轮修复新增回归：`test_head_eval_survives_load_head_bypass`（FakeClient 复刻官方 `load_head` deepcopy 绕过路径：head_eval/full_eval 前向时刻 head 标志必须为 False 且结果确定，源头 `heads[task]` 与各模块 training 标志必须恢复）、`test_search_run_never_touches_test`（搜索传 None 正常训练）、`test_evaluate_test_true_with_none_raises`（fail-closed）、`test_acc_eval_mode_deterministic_and_restores`（eval 口径确定 + 标志恢复）、`test_frozen_state_replay_is_deterministic`。当前 17 项全 PASS。

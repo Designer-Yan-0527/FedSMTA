@@ -50,11 +50,13 @@ Diagnostics beyond accuracy (external review additions):
   vs post-transform (is the gain discriminability, not just capacity);
   train acc at best-val epoch + generalization gap.
 
-Gate (reviewer-approved):
-  calibration |mean(P0) - native_T0| <= 0.5pp else CALIBRATION_FAIL
-  (protocol misaligned -> fix protocol; NOT an SSRA verdict)
-  delta = mean over seeds of (P1_agg - P0_agg)
+Gate:
+  CURRENT ruling (Option A): P0 is the strong linear REFERENCE arm --
+  native alignment is INFORMATIONAL only; the verdict is purely
+  delta = mean over seeds of (P1_agg - P0_agg):
   GREEN >= 2.0 | YELLOW 1.0-2.0 | RED < 1.0
+  (--mode legacy_gate reproduces the v2 behavior -- CALIBRATION_FAIL if
+  |P0 - native_T0| > 0.5pp -- for historical runs only.)
 """
 import argparse
 import csv
@@ -152,18 +154,45 @@ def _eval_acc(feat, head, X, y):
     return 100.0 * correct / X.shape[0]
 
 
+def _acc_eval_mode(feat, head, X, y):
+    """Accuracy with modules temporarily switched to eval() (Dropout off),
+    restored afterwards (reviewer fix: val selection and test reporting
+    must use the SAME eval-mode protocol -- otherwise dropout>0 configs
+    are selected with stochastic val but reported with deterministic
+    test)."""
+    feat_flag = None if feat is None else feat.training
+    head_flag = head.training
+    if feat is not None:
+        feat.eval()
+    head.eval()
+    try:
+        return _eval_acc(feat, head, X, y)
+    finally:
+        if feat is not None:
+            feat.train(feat_flag)
+        head.train(head_flag)
+
+
 def train_one(arm, X_tr, y_tr, X_val, y_val, X_te, y_te, seed,
               epochs, batch_size, lr, weight_decay, device, fisher_in,
               cfg=None, evaluate_test=True):
     """One (client, seed, arm) run. VALIDATION selects the epoch; TEST is
     evaluated exactly once at the best-val state (no test leakage).
 
-    B2 search runs pass evaluate_test=False: TEST is never touched; the
-    run returns best-val metrics plus the frozen best_state. Returns
+    B2 search runs pass evaluate_test=False WITH X_te=y_te=None: TEST is
+    never touched at all (reviewer fix: not even read for n_classes or
+    materialized as a tensor -- the search is fail-closed test-untouched).
+    All accuracy evaluations (val / train / test) run in eval() mode so
+    the selection protocol matches the test protocol. Returns
     (run_dict, best_state)."""
     torch.manual_seed(seed)
     dim = X_tr.shape[1]
-    n_classes = int(max(y_tr.max(), y_val.max(), y_te.max())) + 1
+    if evaluate_test:
+        if X_te is None or y_te is None:
+            raise ValueError("evaluate_test=True requires X_te/y_te")
+        n_classes = int(max(y_tr.max(), y_val.max(), y_te.max())) + 1
+    else:
+        n_classes = int(max(y_tr.max(), y_val.max())) + 1
     feat, head, n_params = build_arm(arm, dim, n_classes, cfg)
     feat = feat.to(device) if feat is not None else None
     head = head.to(device)
@@ -172,10 +201,13 @@ def train_one(arm, X_tr, y_tr, X_val, y_val, X_te, y_te, seed,
         [p for m in mods for p in m.parameters()], lr=lr,
         weight_decay=weight_decay)
     criterion = torch.nn.CrossEntropyLoss()
-    Xs = {n: torch.from_numpy(a).float().to(device)
-          for n, a in (("tr", X_tr), ("val", X_val), ("te", X_te))}
-    ys = {n: torch.from_numpy(a).long().to(device)
-          for n, a in (("tr", y_tr), ("val", y_val), ("te", y_te))}
+    Xs = {"tr": torch.from_numpy(X_tr).float().to(device),
+          "val": torch.from_numpy(X_val).float().to(device)}
+    ys = {"tr": torch.from_numpy(y_tr).long().to(device),
+          "val": torch.from_numpy(y_val).long().to(device)}
+    if evaluate_test:
+        Xs["te"] = torch.from_numpy(X_te).float().to(device)
+        ys["te"] = torch.from_numpy(y_te).long().to(device)
     n = Xs["tr"].shape[0]
     g = torch.Generator()
     g.manual_seed(seed)
@@ -200,7 +232,7 @@ def train_one(arm, X_tr, y_tr, X_val, y_val, X_te, y_te, seed,
             loss.backward()
             opt.step()
         if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
-            val = _eval_acc(feat, head, Xs["val"], ys["val"])
+            val = _acc_eval_mode(feat, head, Xs["val"], ys["val"])
             if val > best_val:
                 best_val, best_epoch = val, epoch
                 best_state = _state_on_cpu()
@@ -210,11 +242,14 @@ def train_one(arm, X_tr, y_tr, X_val, y_val, X_te, y_te, seed,
         feat.load_state_dict(best_state["feat"])
     head.load_state_dict(best_state["head"])
 
-    tr = _eval_acc(feat, head, Xs["tr"], ys["tr"])
+    tr = _acc_eval_mode(feat, head, Xs["tr"], ys["tr"])
     fisher_out = fisher_in  # P0: feature unchanged
     if feat is not None:
+        feat_flag = feat.training
         with torch.no_grad():
+            feat.eval()
             fisher_out = fisher_ratio(feat(Xs["tr"]), ys["tr"])
+        feat.train(feat_flag)
     run = {
         "val_acc_at_best": round(best_val, 4),
         "train_acc_at_best": round(tr, 4),
@@ -224,7 +259,7 @@ def train_one(arm, X_tr, y_tr, X_val, y_val, X_te, y_te, seed,
         "fisher_transformed": round(float(fisher_out), 4),
     }
     if evaluate_test:
-        te = _eval_acc(feat, head, Xs["te"], ys["te"])  # single eval
+        te = _acc_eval_mode(feat, head, Xs["te"], ys["te"])  # single eval
         run["test_acc"] = round(te, 4)
         run["generalization_gap"] = round(tr - te, 4)
     return run, best_state
@@ -355,7 +390,8 @@ def run_b2(args, subsets, meta, clients, device):
         for label, cfg in grid:
             for cid in clients:
                 (Xtr, ytr), (Xva, yva), (Xte, yte) = splits[cid]
-                r, s = train_one("P1", Xtr, ytr, Xva, yva, Xte, yte, seed,
+                r, s = train_one("P1", Xtr, ytr, Xva, yva, None, None,
+                                 seed,
                                  args.epochs, args.batch_size, args.lr,
                                  cfg["weight_decay"], device,
                                  _fisher_input(Xtr, ytr, device),
@@ -476,10 +512,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--features", required=True,
                    help="features_ImageNet-R_task_00_end_promptcurrent.npz")
-    p.add_argument("--mode", choices=["gate", "b2"], default="gate",
-                   help="gate = v2 P0/P1/P2 three-arm gate; b2 = v3 "
-                        "structure search (val-only selection, test once "
-                        "for the frozen winner)")
+    p.add_argument("--mode", choices=["gate", "legacy_gate", "b2"],
+                   default="gate",
+                   help="gate = current ruling (Option A: P0 is the strong "
+                        "linear reference, verdict purely on P1-P0 delta); "
+                        "legacy_gate = v2 behavior verbatim (incl. "
+                        "CALIBRATION_FAIL vs native 82.87), historical "
+                        "reproduction only; b2 = v3 structure search "
+                        "(val-only selection, test once for the frozen "
+                        "winner)")
     p.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     p.add_argument("--native_t0", type=float, default=NATIVE_T0_DEFAULT)
     p.add_argument("--epochs", type=int, default=150)
@@ -577,7 +618,10 @@ def main():
             results[(s, "P0", c)]["fisher_input"], 1e-12)
          for s in args.seeds for c in clients])), 4)
 
-    if not calibrated:
+    if args.mode == "legacy_gate" and not calibrated:
+        # v2 behavior, kept for historical reproduction only; under the
+        # current ruling (Option A) P0 is a strong linear REFERENCE arm
+        # and native alignment is informational, not gating
         verdict = "CALIBRATION_FAIL"
         meaning = ("P0 %.2f deviates from native T0 %.2f by %+.2fpp "
                    "(>0.5pp): probe protocol not aligned -- fix protocol "
@@ -587,7 +631,9 @@ def main():
         verdict, meaning = _gate_delta_verdict(delta)
 
     summary = {
-        "probe": "ssra_headroom_v2",
+        "probe": ("ssra_headroom_gate" if args.mode != "legacy_gate"
+                  else "ssra_headroom_v2_legacy"),
+        "mode": args.mode,
         "interpretation_scope": ("task-in supervised headroom probe on the "
                                  "FIXED A2 T0 representation (z_op); "
                                  "screening gate, not a mathematical upper "
@@ -609,7 +655,9 @@ def main():
         "p1_ssra_mean": round(p1_mean, 4),
         "p2_plain_mlp_mean": round(p2_mean, 4),
         "calibration": {"delta_pp": calib_delta,
-                        "within_0_5pp": calibrated},
+                        "within_0_5pp": calibrated,
+                        "role": "informational under the current ruling "
+                                "(Option A); only legacy_gate gates on it"},
         "delta_per_seed": delta_per_seed,
         "delta_mean_pp": delta,
         "clients_with_gain_p1_vs_p0_per_seed": gain_counts,
