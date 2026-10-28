@@ -8,7 +8,7 @@ from Models.classification_head import Chead
 
 # 直接在尾部加参数
 class Tail_Anchor(nn.Module):
-    def __init__(self,anchor_size,key_size,nb_class):
+    def __init__(self,anchor_size,key_size,nb_class,dropout=0.5):
         super(Tail_Anchor,self).__init__()
         self.size = anchor_size
         self.key_size = key_size
@@ -18,7 +18,9 @@ class Tail_Anchor(nn.Module):
         self.key = nn.Parameter(torch.randn(key_pool_size))
         nn.init.uniform_(self.key, -1, 1)
 
-        self.head = Chead(200)
+        # A5-v2 F1（--head_dropout）：dropout 透传到 Chead，默认 0.5 =
+        # 官方行为逐位一致（Client_DF.init_local_model 从 args 注入）
+        self.head = Chead(200, dropout=dropout)
         anchor_pool_size = (nb_class,key_size)
         self.anchor_pool = nn.Parameter(torch.randn(anchor_pool_size))
         # nn.init.uniform_(self.anchor_pool, -1, 1)

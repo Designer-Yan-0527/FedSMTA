@@ -50,6 +50,60 @@ def split_key_param_groups(params, key_param):
     return key_group, other_group
 
 
+# ----------------------------------------------------------------------
+# A5-v2 解耦接口 refit + 巩固重对齐（RUNCOMMANDS §23，预注册 2026-10-28）
+# ----------------------------------------------------------------------
+import hashlib as _a5_hashlib
+
+from Models.classification_head import StandardizedChead as _A5StandardizedChead
+
+# refit 固定配方（预注册；探针 probe_oracle_headroom.py 的训练日程，
+# 仅 hidden 取 512 以保持 heads 存储 = Chead schema，见 §23.6-2）
+A5_REFIT_HIDDEN = 512
+A5_REFIT_DROPOUT = 0.1
+A5_REFIT_EPOCHS = 100
+A5_REFIT_LR = 1e-3
+A5_REFIT_WD = 1e-4
+A5_REFIT_BATCH = 64
+
+
+def a5_stable_seed(*parts):
+    """确定性 31 位本地种子（探针 stable_seed 同构）。refit 的
+    manual_seed 全程被四流 RNG 快照包裹，训练流不受扰动。"""
+    key = "|".join(str(p) for p in parts)
+    return int.from_bytes(_a5_hashlib.sha256(key.encode()).digest()[:4],
+                          "little")
+
+
+def rebuild_client_head(h_state, template):
+    """resume 时按 state keys 识别客户端头存储的结构并重建
+    （rebuild_global_head 的 heads 版先例，75ead14）：
+      * keys == template（官方 Chead）的 keys -> deepcopy(template) 装载；
+      * 含 mean/std buffer -> StandardizedChead（维度从 state 自证）；
+      * 其他 -> fail-closed 拒绝（截断/外来 keys 不允许静默误装载）。
+    """
+    keys = set(h_state.keys())
+    if keys == set(deepcopy(template).state_dict().keys()):
+        head = deepcopy(template)
+        head.load_state_dict(h_state)
+        return head
+    if "mean" in keys and "std" in keys:
+        in_features = h_state["mean"].shape[0]
+        out_features = h_state["head.3.weight"].shape[0]
+        dummy = _A5StandardizedChead(
+            out_features,
+            torch.zeros(in_features), torch.ones(in_features))
+        if keys == set(dummy.state_dict().keys()):
+            head = _A5StandardizedChead(
+                out_features,
+                torch.zeros(in_features), torch.ones(in_features))
+            head.load_state_dict(h_state)
+            return head
+    raise RuntimeError(
+        "unrecognized client head checkpoint structure: "
+        + str(sorted(keys)))
+
+
 class Client_DF(object):
 
     def __init__(self,id,original_model,model_name,task_per_global_epoch,subset,local_epoch,batch_size,lr,device,method,class_mask,args,vit):
@@ -68,7 +122,7 @@ class Client_DF(object):
         self.device=device
         self.method =method
         self.nb_classes = args.nb_classes
-        self.model = self.init_local_model(model_name)
+        self.model = self.init_local_model(model_name, args)
         self.class_mask = class_mask
 
         self.local_protos = None
@@ -103,10 +157,20 @@ class Client_DF(object):
 
         self.head = Chead(args.nb_classes)
 
+        # A5-v2（RUNCOMMANDS §23）：joint-head 轨迹 + 开关旗标（args 派
+        # 生；默认 OFF = 官方路径逐位一致）
+        self._a5_joint_head = None
+        self._a5_refit_or_consolidate = bool(
+            getattr(args, 'head_refit', False)
+            or getattr(args, 'interface_consolidate', False))
 
-    def init_local_model(self,model_name):
+
+    def init_local_model(self,model_name,args=None):
         if model_name=='Tail_Anchor':
-            return Tail_Anchor(10,768,200)
+            # A5-v2 F1（--head_dropout）：默认 0.5 = 官方逐位一致
+            dropout = (float(getattr(args, 'head_dropout', 0.5))
+                      if args is not None else 0.5)
+            return Tail_Anchor(10,768,200, dropout=dropout)
         else:
             return resnet18_cbam(pretrained=False)
 
@@ -441,6 +505,12 @@ class Client_DF(object):
         # self.evaluate_only_prompts(0,args.nb_classes)
         # self.evaluate_only_prompts(self.task_id,args.nb_classes)
 
+        # A5-v2：开关 ON 时 phase-2 从官方 joint-head 轨迹继续——上一轮
+        # evaluate 的 load_head 会把（可能的）refit 头装回 model.head，这
+        # 里恢复联训轨迹（OFF 臂 _a5_joint_head 恒为 None = 官方路径）
+        if self._a5_joint_head is not None:
+            self.model.load_head(deepcopy(self._a5_joint_head))
+
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-03)
         for epoch in tqdm(range(self.local_epoch)):
             for iteration, (input, target) in enumerate(train_loader):
@@ -487,6 +557,9 @@ class Client_DF(object):
         # save local classifier
         self.heads[self.task_id] = deepcopy(self.model.get_head())
 
+        # A5-v2：readout refit + 巩固重对齐钩子（默认 OFF = no-op）
+        self._a5_post_phase2_interface(round, args)
+
         # Official FedTA (GitHub main) calls evaluate unconditionally twice
         # here (evaluate(0) + evaluate(task_id)); on task 0 this evaluates
         # task 0 twice. This is intentional baseline behavior: evaluate()'s
@@ -507,6 +580,153 @@ class Client_DF(object):
                     "ce": sorted(_route_sel_union["ce"]),
                     "pull": sorted(_route_sel_union["pull"]),
                 })
+
+    # ------------------------------------------------------------------
+    # A5-v2: post-phase-2 readout refit + consolidation (RUNCOMMANDS §23)
+    # ------------------------------------------------------------------
+
+    def _a5_arms_on(self):
+        """refit/consolidation 任一 ON（joint-head 轨迹管理生效条件）。
+        head_standardize 单独 ON 在 Server_DF 侧已 fail-closed 拒绝。"""
+        return bool(self._a5_refit_or_consolidate)
+
+    def _a5_rng_snapshot(self):
+        """四流 RNG 快照（torch cpu/cuda / python / numpy）——refit 与
+        consolidation 对训练流完全中性（_a2_init_task_protection 同惯例）。"""
+        return {
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda_all": (torch.cuda.get_rng_state_all()
+                               if torch.cuda.is_available() else None),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+        }
+
+    def _a5_rng_restore(self, snap):
+        torch.set_rng_state(snap["torch_cpu"])
+        if snap["torch_cuda_all"] is not None:
+            torch.cuda.set_rng_state_all(snap["torch_cuda_all"])
+        random.setstate(snap["python"])
+        np.random.set_state(snap["numpy"])
+
+    def _a5_collect_head_inputs(self, task_id):
+        """head 真实输入 x1 的只读缓存：task 的 train split、当前接口状态
+        （vit 用当前任务 prompt = native evaluate 的 task_id=self.task_id
+        语义；model 前向取 x1），no_grad + 顺序 loader，test split 永不
+        触碰。与官方 proto 收集同数据流（train split 带增强）。"""
+        if task_id not in self.data_split_indices:
+            raise RuntimeError(
+                "client %d: task %d has no recorded train split (seen "
+                "tasks must have data_split_indices) -- refusing to "
+                "refit an unseen task (fail-closed)"
+                % (self.id, task_id))
+        dataset = Subset(self.train_data[task_id],
+                        list(self.data_split_indices[task_id]["train"]))
+        loader = DataLoader(dataset, batch_size=16, num_workers=0,
+                            shuffle=False)
+        xs, ys = [], []
+        for input, target in loader:
+            input = input.to(self.device, non_blocking=True)
+            target = target.long().to(self.device, non_blocking=True)
+            with torch.no_grad():
+                cls_features = None
+                if self.original_model is not None:
+                    output = self.original_model(input)
+                    cls_features = output['pre_logits']
+                output = self.vit(input, task_id=self.task_id,
+                                  cls_features=cls_features, train=True)
+                _, x1, _ = self.model(output['feat'].to(self.device),
+                                      target)
+            xs.append(x1)
+            ys.append(target)
+        if not xs:
+            return None, None
+        return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+
+    def _a5_refit_one_head(self, task_id, round_id, args):
+        """readout-only refit：在缓存 (x1, y) 上重训一个 Chead 形状读出头
+        （masked CE 同 phase-2 口径，mask 用该任务 class_mask 对
+        nb_classes 取补；标准化按 --head_standardize）。返回新头模块；
+        train split 为空（协议现实）时返回 None = 保留现有头。梯度只到
+        读出头——特征已缓存、no_grad 计算，key/anchor/prompt 不在图中。"""
+        x1, y = self._a5_collect_head_inputs(task_id)
+        if x1 is None:
+            return None
+        label_num = self.model.nb_class
+        classes = self.class_mask[task_id]
+        not_mask = np.setdiff1d(np.arange(self.nb_classes), classes)
+        not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
+        torch.manual_seed(a5_stable_seed(
+            args.seed, 'a5refit', self.id, task_id, round_id))
+        if bool(getattr(args, 'head_standardize', False)):
+            mean = x1.mean(dim=0)
+            std = x1.std(dim=0) + 1e-8
+            head = _A5StandardizedChead(label_num, mean, std,
+                                       hidden=A5_REFIT_HIDDEN,
+                                       dropout=A5_REFIT_DROPOUT)
+        else:
+            head = Chead(label_num, dropout=A5_REFIT_DROPOUT)
+        head.to(self.device)
+        head.train()
+        opt = torch.optim.Adam(head.parameters(), lr=A5_REFIT_LR,
+                               weight_decay=A5_REFIT_WD)
+        criterion = torch.nn.CrossEntropyLoss().to(self.device)
+        n = x1.shape[0]
+        bs = min(A5_REFIT_BATCH, n)
+        for _ in range(A5_REFIT_EPOCHS):
+            perm = torch.randperm(n, device=x1.device)
+            for s in range(0, n, bs):
+                idx = perm[s:s + bs]
+                logits = head(x1[idx])
+                logits = logits.index_fill(dim=1, index=not_mask,
+                                           value=float('-inf'))
+                loss = criterion(logits, y[idx])
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        print('[A5-v2] client %d task %d round %d: refit head on %d train '
+              'rows (standardize=%s)'
+              % (self.id, task_id, round_id, n,
+                 bool(getattr(args, 'head_standardize', False))))
+        return head
+
+    def _a5_post_phase2_interface(self, round, args):
+        """train() 末尾的 A5-v2 钩子（官方两 evaluate 之前、heads 保存
+        之后；默认 OFF = 完全 no-op）：
+          1. joint-head 轨迹快照（任何存储替换之前，_a5_joint_head）；
+          2. --head_refit：当前任务 heads[task_id] 换 refit 头（每轮）；
+          3. --interface_consolidate：任务边界轮对全部旧任务 t'<task_id
+             用当前接口状态 refit heads[t']（readout-only 巩固重对齐）。
+        全程四流 RNG 快照恢复 + 模块模式恢复——表征侧轨迹（prompt/key/
+        anchor/joint head）与官方 run 逐位一致，corrected 指标变化 100%
+        归因于接口替换（单测覆盖，RUNCOMMANDS §23.1 RNG 中立）。"""
+        if not self._a5_arms_on():
+            return
+        self._a5_joint_head = deepcopy(self.model.get_head())
+        rng = self._a5_rng_snapshot()
+        vit_was_training = self.vit.training
+        orig_was_training = (self.original_model.training
+                             if self.original_model is not None else None)
+        try:
+            if self.original_model is not None:
+                self.original_model.eval()
+            if bool(getattr(args, 'head_refit', False)):
+                head = self._a5_refit_one_head(self.task_id, round, args)
+                if head is not None:
+                    self.heads[self.task_id] = head
+            if bool(getattr(args, 'interface_consolidate', False)) \
+                    and (round + 1) % self.task_per_global_epoch == 0:
+                for t in range(self.task_id):
+                    head = self._a5_refit_one_head(t, round, args)
+                    if head is not None:
+                        self.heads[t] = head
+        finally:
+            if orig_was_training is not None:
+                self.original_model.train(orig_was_training)
+            self.vit.train(vit_was_training)
+            self._a5_rng_restore(rng)
+        # model.head 保持在 joint 轨迹上（后续 evaluate 的 load_head 会按
+        # 官方顺序装回 heads[task]；phase-2 前另有恢复，双保险）
+        self.model.load_head(deepcopy(self._a5_joint_head))
 
     def load_global_weights(self,weights):
         self.model.load_state_dict(weights)
@@ -757,6 +977,11 @@ class Client_DF(object):
         if self.method == 'fedta_a2':
             state["a2_state"] = self._a2_state_for_checkpoint()
 
+        # A5-v2（--head_refit / --interface_consolidate）：joint-head 轨迹
+        # 状态。schema 仅 ON 臂新增 key（frozen 基线 checkpoint 逐位不变）
+        if self._a5_refit_or_consolidate:
+            state["a5_joint_head"] = module_state_or_none(self._a5_joint_head)
+
         return state
 
     def _a2_state_for_checkpoint(self):
@@ -856,10 +1081,22 @@ class Client_DF(object):
             if h_state is None:
                 heads.append(None)
             else:
-                template = deepcopy(self.model.get_head())
-                template.load_state_dict(h_state)
-                heads.append(template)
+                heads.append(rebuild_client_head(
+                    h_state, deepcopy(self.model.get_head())))
         self.heads = heads
+
+        # A5-v2：joint-head 轨迹恢复，fail-closed（ON 臂 resume 从缺 key
+        # 的 checkpoint 继续 = 联训轨迹静默漂移，拒绝）
+        if self._a5_refit_or_consolidate:
+            jh = state.get("a5_joint_head")
+            if jh is None:
+                raise RuntimeError(
+                    "client %d: A5-v2 resume requires a5_joint_head in "
+                    "the checkpoint -- refusing to silently continue "
+                    "with a drifted joint-head trajectory (fail-closed; "
+                    "re-run from scratch)" % self.id)
+            self._a5_joint_head = rebuild_client_head(
+                jh, deepcopy(self.model.get_head()))
 
         self.global_protos = state.get("global_protos")
         self.local_protos = state.get("local_protos")

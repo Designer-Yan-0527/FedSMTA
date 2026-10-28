@@ -99,6 +99,17 @@ class Server_DF(object):
         self.accuracy_records = (
             run_manager.load_accuracy_records()
             if run_manager is not None else [])
+
+        # A5-v2 F3 fail-closed（RUNCOMMANDS §23.1）：standardize 只有在
+        # refit/consolidation 存在时才有作用对象；单独开启 = 无效配置，
+        # 拒绝启动而非静默忽略
+        if bool(getattr(args, 'head_standardize', False)) and not (
+                bool(getattr(args, 'head_refit', False))
+                or bool(getattr(args, 'interface_consolidate', False))):
+            raise SystemExit(
+                "--head_standardize requires --head_refit or "
+                "--interface_consolidate (nothing to standardize; "
+                "fail-closed, RUNCOMMANDS Sec.23)")
     def init_client(self):
         print('Initialize clients')
         for i in range(self.client_num):    #
@@ -782,6 +793,10 @@ class Server_DF(object):
         # contaminate the ablation arm; two-sided check keeps old
         # checkpoints without the key compatible.
         "route_fix", "route_tau",
+        # A5-v2（RUNCOMMANDS §23）：跨 ON/OFF resume 会静默改变接口语
+        # 义与 joint-head 轨迹管理；two-sided 检查保持老 checkpoint 兼容
+        "head_dropout", "head_refit", "head_standardize",
+        "interface_consolidate",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):

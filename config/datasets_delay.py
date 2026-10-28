@@ -211,6 +211,45 @@ def get_args_parser(subparsers):
                                  'See RUNCOMMANDS.md Sec.20.3.')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
+    # A5-v2 三因素归因消融 + 巩固重对齐（2026-10-28，预注册 RUNCOMMANDS §23）
+    subparsers.add_argument('--head_dropout', default=0.5, type=float,
+                            help='A5-v2 F1: train-side Dropout p of the phase-2 '
+                                 'jointly-trained Chead (default 0.5 = official, '
+                                 'bit-identical). Distinct from the CLOSED Track-E '
+                                 'eval-side dropout bug (corrected protocol). '
+                                 'p=0.0 is the attribution-ablation arm; it '
+                                 'changes phase-2 forward RNG consumption '
+                                 '(expected, arm-internal trajectory).')
+    subparsers.add_argument('--head_refit', action='store_true',
+                            help='A5-v2 F2 (default OFF = official, bit-identical): '
+                                 'post-phase-2 readout-only refit of the current '
+                                 'task head every round. Feature cache = the '
+                                 'task train split under the CURRENT interface '
+                                 'state (no_grad, shuffle=False); retrain a '
+                                 'Chead-shaped readout (masked CE, Adam 1e-3/wd '
+                                 '1e-4/100 epochs/batch 64, deterministic local '
+                                 'seed); replace heads[task_id] storage. RNG-neutral '
+                                 '(four-stream snapshot/restore): representation-side '
+                                 'trajectory (prompt/key/anchor/joint head) stays '
+                                 'bit-identical to the official run; the joint-head '
+                                 'trajectory is preserved separately (_a5_joint_head) '
+                                 'and restored before the next phase-2. See '
+                                 'RUNCOMMANDS.md Sec.23.')
+    subparsers.add_argument('--head_standardize', action='store_true',
+                            help='A5-v2 F3 (default OFF): standardize the refit '
+                                 'input with train-split mean/std (StandardizedChead, '
+                                 'mu/sd stored as buffers). Fail-closed: requires '
+                                 '--head_refit or --interface_consolidate.')
+    subparsers.add_argument('--interface_consolidate', action='store_true',
+                            help='A5-v2 component 2 (default OFF = official): at '
+                                 'every task-boundary round, refit heads[t] for all '
+                                 'OLD tasks t < task_id under the CURRENT interface '
+                                 'state (readout-only, same refit recipe, data = the '
+                                 'old-task train split via data_split_indices; the '
+                                 'test split is never touched). RNG-neutral like '
+                                 '--head_refit; the current-task refit belongs to '
+                                 '--head_refit (orthogonal switches). Absorbs the '
+                                 'interface-drift headroom (RUNCOMMANDS Sec.22.2-4).')
     subparsers.add_argument('--client_num', default=5, type=int,
                             help='the num of client')
     subparsers.add_argument('--task_num', default=5, type=int,

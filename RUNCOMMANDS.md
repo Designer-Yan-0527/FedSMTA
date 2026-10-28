@@ -785,3 +785,124 @@ INR 参考：mlp_local 86.91 ≈ C²P T0 86.86（T0 差距被本地重训接口�
 1. **Track A 关闭**：22.1 kill criterion 触发是否成立？E3 按预注册（c0 复活 → WD 归因）判"不需要"是否同意？
 2. **A5-v2 方向修正**：由"共享语义层 + FedAvg"转向"本地接口解耦训练"，依据 22.2-2/3/4（双数据集 fed<0、linear refit +2~3pp、T4 +20pp 漂移证据）——是否成立？
 3. **A5-v2 立项**：INR GREEN / CIFAR YELLOW 的 Gate 判定与 22.3 设计要点是否放行？若无异议，下一步产出 A5-v2 正式 spec（方法节 + 消融矩阵 + 实验计划）。
+
+## 23. A5-v2 正式 spec：解耦接口 refit + 本地巩固重对齐（2026-10-28，已开工）
+
+> 用户 2026-10-28 授权不等终审直接开工；若审查意见返回后与本 spec 冲突，以用户指令为准（冲突点须显式指出）。立项依据 = §22.2（headroom 双重确认 / fed<0 / 接口漂移 +20pp）。
+
+### 23.1 方法定义（实现即本节，代码为准）
+
+**基座不变**：官方 FedTA（hard routing、official prompt 训练、frozen ViT）一概不动；phase-1/phase-2/BGPS/SIKF 联训全部逐位保留。
+
+**组件一（--head_refit，因素 F2=解耦）**：每轮 phase-2 官方联训结束后，对本任务做 readout-only 后置 refit——
+
+1. 特征缓存：当前接口状态下（prompts 已加载、模型原状态），train split 顺序过一遍（no_grad、shuffle=False、batch 16），取 Tail_Anchor 的 head 输入 `x1`（1536 维 anchor-concat——native 接口的真实输入；探针 z_op 是 768 维 pre-anchor，见 23.6 已知偏差）；
+2. 重训一个 Chead 形状读出头（`1536→512→ReLU→Dropout(0.1)→C`，C 与官方 Chead 同维，masked CE 同 phase-2 口径，Adam lr=1e-3 / wd=1e-4 / 100 epoch / batch 64，确定性本地种子 sha256(seed,'refit',client,task,round)），梯度只到读出头；
+3. 替换 `heads[task_id]` 存储（评测即生效）；**joint head 轨迹独立保存**（`_a5_joint_head`），下一轮 phase-2 前恢复 → 联训 head 轨迹与官方 run 逐位一致。
+
+**因素 F1（--head_dropout，默认 0.5=官方）**：phase-2 Chead 的 train 端 Dropout p。与 Track E 已结案的 eval 端 bug 不同物：corrected 口径（§21.5）已修复 eval 端；F1 是 train 端训练动力学消融，p=0.0 改变 phase-2 前向 RNG 消耗（预期内，臂内轨迹自洽）。若消融显示 headroom 全来自 F1 → 组件一按预注册预案降级为"基线卫生"，不作方法主张。
+
+**因素 F3（--head_standardize，默认 off）**：refit 输入用 train-split mean/std 标准化（mu/sd 作为 buffer 随头存取，StandardizedChead 模块，评测路径经 load_head 深拷贝自然兼容）。fail-closed：必须与 --head_refit 或 --interface_consolidate 之一联用。
+
+**组件二（--interface_consolidate，巩固重对齐）**：每任务边界轮（该 task 最后一轮）train() 末尾，对本 client 全部旧任务 t'<t 用**当前**接口状态 refit `heads[t']`（同 refit 配方；数据 = 旧任务 train split，`data_split_indices[t']`，test split 永不触碰）。当前任务的 refit 专属 --head_refit（两开关正交，巩固只管旧任务）。吸收 §22.2-4 的接口漂移 headroom（CIFAR T4 +20pp 证据）。
+
+**RNG 中立（强归因性质，单测覆盖）**：refit/consolidation 全程四流快照恢复（torch cpu/cuda/python/numpy）+ DataLoader shuffle=False——(a) 全部开关 OFF = 官方行为逐位一致；(b) 开关 ON 时**表征侧轨迹（prompt/key/anchor/joint head）仍与官方 run 逐位一致**，任何 corrected 指标变化 100% 归因于接口替换。这是论文归因的核心卖点。
+
+**replay 访问级别定位（预注册声明）**：巩固 = replay 访问级别（每边界重访旧任务 train split），与 C²P 的 consolidation_train 公平（C²P 每轮本就重访 origin+target，prompt_hard.py L675-715）。三臂消融（readout-only vs 表征 replay vs stored-logits 蒸馏）中本 spec 只实现 readout-only；后两臂待本矩阵 Gate 后再议。venue 若要求 no-replay → 双记账口径预案。
+
+### 23.2 消融矩阵（预注册）
+
+| 臂 | flags | 检验内容 |
+|---|---|---|
+| M0 | 无（官方） | 基线 D |
+| M1 | `--head_dropout 0.0` | F1：train 端 Dropout 归因 |
+| M2 | `--head_refit` | F2：联训 vs 后置 refit |
+| M3 | `--head_refit --head_standardize` | F2+F3：加标准化 |
+| M4 | `--head_dropout 0.0 --head_refit --head_standardize` | F1+F2+F3 |
+| M5 | M4 + `--interface_consolidate` | 全方法（巩固需全程 5 任务） |
+
+严格单变量逐臂叠加；M1-M4 在 T0 短程（`--max_rounds 5`）可判（巩固在 T0 无旧任务、M5≡M4），M5 需全程。
+
+**Gate（预注册，不变）**：当前任务 corrected 准确率 ≥ D+1pp = GREEN；约束 BWT_corrected ≥ −2pp。种子 42 先行，GREEN 后 3 种子。主判读场：迭代场 cifar100（D=94.50）；主战场 ImageNet-R（headroom 证据地，D 参考 §21.5 corrected 口径 84.81，注意"vs 均值/一次 realization"措辞纪律）。
+
+**预注册预案**：M1 单独达到 GREEN → 组件一降级为"基线卫生"；M4 达标 M5 加巩固无增益 → 巩固组件只作旧任务保持约束手段（仍受 BWT ≥ −2pp 检验）。
+
+### 23.3 命令
+
+T0 短程归因（cifar，各臂，约 5 轮）：
+
+```bash
+# M0 官方基线（已有 D=94.50 可复用，无需重跑；如需对账用 §2 命令 + --max_rounds 5）
+
+# M1 F1 train端dropout
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_dropout 0.0 --max_rounds 5 --run_name cifar_a5v2_M1_drop0
+
+# M2 F2 后置refit
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --max_rounds 5 --run_name cifar_a5v2_M2_refit
+
+# M3 F2+F3 加标准化
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --head_standardize --max_rounds 5 --run_name cifar_a5v2_M3_refit_std
+
+# M4 F1+F2+F3
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_dropout 0.0 --head_refit --head_standardize --max_rounds 5 --run_name cifar_a5v2_M4_full_noconsol
+```
+
+全程臂（M5 全方法；M0-M4 全程版按需把 --max_rounds 去掉即可）：
+
+```bash
+# M5 全方法（巩固需全程 5 任务）
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_dropout 0.0 --head_refit --head_standardize --interface_consolidate \
+    --run_name cifar_a5v2_M5_full
+```
+
+ImageNet-R 版：`--data_name ImageNet-R --private_class_num 40 --surrogate_num 5`，其余参数同 §3，run_name 前缀换 `inr_a5v2_`。
+
+### 23.4 判读表
+
+| 判读项 | 口径 | 判据 |
+|---|---|---|
+| T0 短程归因 | `metrics/accuracy_matrix.csv` after_task=0 行（corrected 单次口径，§21.5 DIRECT PASS） | M0→M1→M2→M3→M4 逐步增量拆账：F1 = M1−M0，F2 = M2−M0，F3 = M3−M2，联合残差 = M4−M3−（M1−M0）的近似交互项 |
+| T0 headroom 对账 | 各臂 T0 AA vs 探针 mlp_local 96.93（CIFAR）/ 86.91（INR） | refit 臂若显著低于探针 → 查 23.6 已知偏差（输入差异 1536 vs 768、hidden 512 vs 256、augmentation） |
+| 全程 Gate | 当前任务 corrected（T4 时点）≥ D+1pp | GREEN 立项方法主张 |
+| 保持约束 | BWT_corrected ≥ −2pp | M5 vs M4 的旧任务列差 = 巩固组件净效应 |
+| 轨迹不变性 sanity | M2 与 M0 的 key/prompt checkpoint（如需） | 开关 ON 不改变表征侧（RNG 中立设计保证，抽查即可） |
+
+数据组织三级口径：分数据集、分种子、分任务（目录结构 §8 天然满足：`seed_{seed}/metrics/*`）。
+
+### 23.5 实现清单与单测
+
+实现（本次 commit）：
+1. `config/datasets_delay.py`：`--head_dropout`（默认 0.5）/ `--head_refit` / `--head_standardize` / `--interface_consolidate` 四开关；
+2. `Models/classification_head.py`：`Chead(label_num, dropout=0.5)` 参数化（默认=官方逐位一致）+ `StandardizedChead`（mu/sd buffer + Chead 形状 MLP）；
+3. `Models/Tail_Anchor.py`：dropout 透传；
+4. `Models/Client_DF.py`：refit 机制（特征缓存→readout 重训→heads 替换）、`_a5_joint_head` 轨迹保存/恢复（phase-2 前恢复）、巩固（边界轮旧任务全量 refit）、RNG 四流快照、checkpoint 存取（schema 仅 ON 臂新增 key，OFF 臂逐位不变）、`rebuild_client_head`（resume 时按 state keys 识别 Chead/StandardizedChead，外来 keys fail-closed）；
+5. `Models/Server_DF.py`：F3 fail-closed 组合校验 + RESUME_MUST_MATCH 增补四键（two-sided，老 checkpoint 兼容）。
+
+单测（`tests/test_a5v2_refit_switches.py`）：默认 OFF 逐位一致（Chead 构造 RNG 中性、legacy args 无属性容错）、refit 梯度隔离（key/anchor/prompt 无梯度且逐位不动，仅头变）、RNG 四流恢复、heads 存储替换语义 + joint 轨迹恢复、rebuild_client_head 三分支（Chead/StandardizedChead/外来 keys 拒绝）、fail-closed（standardize 单独用、resume 缺 a5 key）。
+
+```bash
+python -m unittest tests.test_a5v2_refit_switches -v
+```
+
+### 23.6 已知偏差与边界（如实报告）
+
+1. **输入差异**：探针 mlp_local 的 +4.04/+2.26 是 768 维 pre-anchor z_op 上取得的；refit 用 native 接口真实输入 x1（1536 维 anchor-concat，含 top-1 硬路由选 anchor）。若 M2/M3 仍显著低于探针，此为第一嫌疑——届时可加 `--refit_input feat` 臂（绕过 anchor，需另改 evaluate 路径，工作量另计）。
+2. **hidden 512 vs 探针 256**：为保持 heads 存储 = Chead schema（评测路径零改动）选 512；容量非三因素之一，若归因不干净再回头。
+3. **augmentation**：refit 特征来自带增强的 train split（与官方 protos 计算同数据流）；探针 npz 特征的增强状态以 extract_features.py 实际为准。臂内自洽，臂间对照时注意。
+4. **dropout(0.5) train 端是作者设计选择**：只作归因消融因素，不作方法主张（用户已敲定）。
+5. resume 的 diag 工具兼容性：部分诊断（compatibility_drift 等）对 StandardizedChead keys 可能 fail-closed 拒绝——预期行为，判读用 corrected metrics 口径即可。
