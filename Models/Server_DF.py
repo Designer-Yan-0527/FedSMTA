@@ -20,6 +20,34 @@ from runtime_utils import (module_state_or_none, clone_prompt_template,
                            rng_state_dict, restore_rng_state,
                            atomic_save_checkpoint, load_checkpoint_file)
 
+
+def rebuild_global_head(global_head_state, vit_head, nb_classes):
+    """Rebuild the training-time global_head structure matching the
+    checkpoint's saved state (the saved structure depends on whether
+    fed_avg_head() ran during training):
+
+      * official behavior: fed_avg_head() replaced global_head with a
+        deepcopy of clients[0].vit.head (a plain Linear) every round ->
+        checkpoint stores Linear keys {weight, bias};
+      * skip_fed_avg_head runs (HS-N arm): global_head keeps the __init__
+        Chead structure -> checkpoint stores head.0.* / head.3.* keys.
+
+    __init__ always creates a Chead, so the structure must be rebuilt
+    from the checkpoint before load_state_dict. Anything unrecognized
+    fails loud rather than silently misloading."""
+    gh_keys = set(global_head_state.keys())
+    if gh_keys == {"weight", "bias"}:
+        return deepcopy(vit_head)
+    if gh_keys == set(Chead(nb_classes).state_dict().keys()):
+        # exact key-set match against a template Chead: a truncated or
+        # foreign head.* state must not slip through this branch and
+        # misload later
+        return Chead(nb_classes)
+    raise RuntimeError(
+        "unrecognized global_head checkpoint structure: "
+        f"{sorted(gh_keys)}")
+
+
 class Server_DF(object):
 
     def __init__(self,id,origin_model,model_name,client_num,task_num,subset,class_mask,lr,global_epoch,local_epoch,batch_size,device,method,threshold,surrogate_data,test_data,args,model,run_manager=None):
@@ -886,12 +914,12 @@ class Server_DF(object):
         self.existing_class = set(checkpoint.get("existing_class", []))
 
         if checkpoint.get("global_head") is not None:
-            # During training fed_avg_head() replaces global_head with a
-            # deepcopy of clients[0].vit.head (a plain Linear) every round,
-            # so the checkpoint stores Linear keys {weight, bias}. __init__
-            # created a Chead here; rebuild the training-time structure
-            # before loading, otherwise the key sets do not match.
-            self.global_head = deepcopy(self.clients[0].vit.head)
+            # rebuild the training-time global_head structure matching the
+            # saved state (see rebuild_global_head), then load
+            self.global_head = rebuild_global_head(
+                checkpoint["global_head"],
+                self.clients[0].vit.head,
+                self.args.nb_classes)
             self.global_head.load_state_dict(checkpoint["global_head"])
         if checkpoint.get("server_model") is not None:
             self.model.load_state_dict(checkpoint["server_model"])
