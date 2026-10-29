@@ -198,11 +198,20 @@ def main():
 
     rows = []
     summaries = []
+    run_args = None
+    server = None
     for ckpt in ckpts:
         ckpt_path = resolve_checkpoint(run_dir, ckpt)
-        run_args, server = bootstrap_server(
-            run_dir, checkpoint=ckpt_path,
-            data_path=args_cli.data_path, device=args_cli.device)
+        # bootstrap 只做一次：Imagenet_R 全量解码进 RAM（~15GB 级），
+        # 每 checkpoint 重建一遍 server 会双份驻留 + 重复解码打满一核。
+        # load_checkpoint 覆盖恢复全部状态（模型/heads/prompts/splits/
+        # 四流 RNG，resume 幂等保证），第二个起直接复用 server。
+        if server is None:
+            run_args, server = bootstrap_server(
+                run_dir, checkpoint=ckpt_path,
+                data_path=args_cli.data_path, device=args_cli.device)
+        else:
+            server.load_checkpoint(ckpt_path)
         device = torch.device(run_args.device)
         completed_round = int(getattr(server, "start_round", 0)) - 1
         server.origin_model.to(device).eval()
