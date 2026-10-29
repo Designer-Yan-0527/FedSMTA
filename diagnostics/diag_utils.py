@@ -91,8 +91,11 @@ def resolve_checkpoint(run_dir, checkpoint=None):
         if ckpt.is_absolute():
             candidates = [ckpt]
         else:
-            # cwd-relative first, then run_dir-relative
-            candidates = [ckpt, run_dir / ckpt]
+            # cwd-relative first, then run_dir-relative, then the
+            # checkpoints/ subdir (bare checkpoint names like
+            # task_00_end.pth live there)
+            candidates = [ckpt, run_dir / ckpt,
+                          run_dir / "checkpoints" / ckpt]
     for cand in candidates:
         if cand.is_file():
             return str(cand.resolve())
