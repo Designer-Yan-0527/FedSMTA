@@ -932,9 +932,10 @@ python -m unittest tests.test_a5v2_refit_switches -v
 **M2' 臂命令**：
 
 ```bash
-# INR M2' 判据臂（feat 输入修复，T0 短程）
+# INR M2' 判据臂（feat 输入修复，T0 短程；划分复刻 inr_a5v2_M2_refit：
+# task_num 10 / private 20 / surrogate 默认 20——探针 +0.81/+0.92 即在此划分实测）
 python main.py datasets_delay --data_name ImageNet-R --data-path ./local_datasets \
-    --client_num 5 --task_num 10 --private_class_num 40 --surrogate_num 5 \
+    --client_num 5 --task_num 10 --private_class_num 20 \
     --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
     --head_refit --refit_input feat --max_rounds 5 --run_name inr_a5v2_M2_feat
 
@@ -946,6 +947,8 @@ python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets 
 ```
 
 **修订判据（预注册）**：INR M2' 的 r0/r1 允许 ≈baseline 或略输（早期联邦同步优势 ~1pp 预期内：baseline 日志数字 = fed_avg 广播头 5×池化，refit 头 = 纯本地小样本头）；**round 4（T0 边界）必须 ≥ inr_base_p40 corrected T0**（补测数字）——反超不成则 INR 上 M2 方法不成立、主战场退守 cifar。cifar M2' 预计不掉点（x1 三成本项在 cifar ≈0），若掉点则 feat 输入的通用性存疑，需复查。
+
+**划分混淆披露（2026-10-29 口径审计时发现，如实报告）**：inr_a5v2_M2_refit 与 inr_base_p40 的任务划分不同（M2：task_num 10 / private 20 / surrogate 20；base：task_num 5 / private 40 / surrogate 5）——探针判读（native 77.50 vs 广播头 ≥78.41 的联邦同步优势项）与"round 4 vs base corrected"对照均为跨划分比较，只作方向性参考。M2' 复刻 M2 划分（探针预测 +0.81/+0.92 的同划分验证），主判读 = M2' vs M2 同划分单变量差；若 M2' round 4 确认 feat 修复有效且需正式 Gate，再补 base 同划分（task_num 5 / private 40 / surrogate 5）的 M2' 臂对 base corrected。
 
 **M2 vs baseline 差距三层分解**（用户"可是不如 baseline"的定案回答）：
 1. 早期联邦同步优势（~1pp）：baseline 日志数字 = fed_avg 广播头（5×池化）；refit 头 = 纯本地 ~1k 行头；本地联训头 corrected 77.50 vs 广播头 ≥78.41（日志口径）。
