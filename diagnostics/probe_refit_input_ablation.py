@@ -247,11 +247,13 @@ def main():
                     zt = torch.tensor(x_te, dtype=torch.float32,
                                       device=device)
                     logits = joint(zt).cpu().numpy()
-                jmap = {int(c): i for i, c in enumerate(allowed)}
-                cols = [jmap[int(c)] for c in allowed]
-                # 联训头是 200 输出：mask 列限制
+                # 官方联训头与 hook 的 refit 头都是 nb_classes 全局 id 列
+                # 约定（evaluate()/refit 的 index_fill(-inf) mask 语义），
+                # mask 列 = allowed 的全局 id 本身；若误用 allowed 内
+                # 位置当列号（0..k-1）会读到别的类别的单元，anchor 全废
+                cols = [int(c) for c in allowed]
                 row["native"] = round(acc(
-                    [allowed[i] for i in logits[:, cols].argmax(1)], y_te), 2)
+                    [cols[i] for i in logits[:, cols].argmax(1)], y_te), 2)
 
                 # 内部效度锚点 2：checkpoint 里存的 refit 头 corrected
                 # （与日志 [A5-v2] 行的差应只剩 eval 端 dropout）
@@ -261,7 +263,7 @@ def main():
                 with torch.no_grad():
                     logits = saved(zt).cpu().numpy()
                 row["saved_refit"] = round(acc(
-                    [allowed[i] for i in logits[:, cols].argmax(1)], y_te), 2)
+                    [cols[i] for i in logits[:, cols].argmax(1)], y_te), 2)
 
                 # 六档配方：x1 / z_op × 配方
                 for name, hidden, drop, eps, lr, wd, std in RECIPES:
