@@ -1114,13 +1114,19 @@ class Client_DF(object):
             self.prompts = None
 
         # task-specific heads: template = deepcopy of current Tail_Anchor head
+        # resume 时 self.model 尚在 CPU（train()/evaluate() 才 .to(device)），
+        # deepcopy 出的模板也在 CPU -> 重建的 heads 落在 CPU；而它们是普通
+        # Python 属性，train() 的 model.to(device) 搬不动 -> 首个 phase-2 前
+        # 向 / evaluate 的 load_head 即崩（Tail_Anchor.head cpu vs cuda:0）。
+        # 在重建源头统一搬到 self.device（首跑时 heads 训练中在 CUDA 创建，
+        # 此 .to() 无操作，逐位不变）。
         heads = []
         for h_state in state.get("heads", []):
             if h_state is None:
                 heads.append(None)
             else:
                 heads.append(rebuild_client_head(
-                    h_state, deepcopy(self.model.get_head())))
+                    h_state, deepcopy(self.model.get_head())).to(self.device))
         self.heads = heads
 
         # A5-v2：joint-head 轨迹恢复，fail-closed（ON 臂 resume 从缺 key
@@ -1134,7 +1140,7 @@ class Client_DF(object):
                     "with a drifted joint-head trajectory (fail-closed; "
                     "re-run from scratch)" % self.id)
             self._a5_joint_head = rebuild_client_head(
-                jh, deepcopy(self.model.get_head()))
+                jh, deepcopy(self.model.get_head())).to(self.device)
 
         self.global_protos = state.get("global_protos")
         self.local_protos = state.get("local_protos")
