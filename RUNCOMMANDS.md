@@ -927,7 +927,7 @@ python -m unittest tests.test_a5v2_refit_switches -v
 2. **嫌疑 1（配方过拟合）r1 过阈**：Δ(x1_lt−x1_rf)=+1.32 —— 但**换 z 输入后配方敏感性消失**（z_rf/z_lt/z_pb 极差 ≤0.32）→ 配方过拟合计入 x1 的病，单变量修输入（z 替换）即可同时消两嫌疑。
 3. 预期涨点口径（探针直接实测，非 oracle 外推）：INR r0 +0.81 / r1 +0.92（z 臂 vs native/saved_refit 锚点）。
 
-**Gate 参照修正（口径审计）**：§23.2 中 D 参考 84.81 实为 **inr_a2_key_p40（A2 臂）** 的 reeval，非官方基线；M2' 继承 base 表征轨迹，对照物必须是 inr_base_p40 的 corrected T0（补测进行中：eval_mode_reeval --run_dir output/ImageNet-R/fedta/inr_base_p40/seed_42 --checkpoints task_00_end.pth）。Gate 精确参照以补测数字为准。
+**Gate 参照修正（口径审计）**：§23.2 中 D 参考 84.81 实为 **inr_a2_key_p40（A2 臂）** 的 reeval，非官方基线；对照物必须是 inr_base_p40 的 corrected T0。**补测定案（2026-10-29，eval_mode_reeval task_00_end.pth）：base corrected T0 = 84.8066（official 81.666，eval-dropout 折扣 +3.14pp）**——与 A2 臂的 84.81 数值几乎重合，口径缺口的实际影响 ≈0，Gate 参照数字维持 84.81 但来源已站住（base 臂）。
 
 **M2' 臂命令**：
 
@@ -946,7 +946,7 @@ python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets 
     --head_refit --refit_input feat --max_rounds 5 --run_name cifar_a5v2_M2_feat
 ```
 
-**修订判据（预注册）**：INR M2' 的 r0/r1 允许 ≈baseline 或略输（早期联邦同步优势 ~1pp 预期内：baseline 日志数字 = fed_avg 广播头 5×池化，refit 头 = 纯本地小样本头）；**round 4（T0 边界）必须 ≥ inr_base_p40 corrected T0**（补测数字）——反超不成则 INR 上 M2 方法不成立、主战场退守 cifar。cifar M2' 预计不掉点（x1 三成本项在 cifar ≈0），若掉点则 feat 输入的通用性存疑，需复查。
+**修订判据（预注册）**：INR M2' 的 r0/r1 允许 ≈baseline 或略输（早期联邦同步优势 ~1pp 预期内：baseline 日志数字 = fed_avg 广播头 5×池化，refit 头 = 纯本地小样本头）；**round 4（T0 边界）必须 ≥ inr_base_p40 corrected T0 = 84.81**——反超不成则 INR 上 M2 方法不成立、主战场退守 cifar。cifar M2' 预计不掉点（x1 三成本项在 cifar ≈0），若掉点则 feat 输入的通用性存疑，需复查。
 
 **划分混淆披露（2026-10-29 口径审计时发现，如实报告）**：inr_a5v2_M2_refit 与 inr_base_p40 的任务划分不同（M2：task_num 10 / private 20 / surrogate 20；base：task_num 5 / private 40 / surrogate 5）——探针判读（native 77.50 vs 广播头 ≥78.41 的联邦同步优势项）与"round 4 vs base corrected"对照均为跨划分比较，只作方向性参考。M2' 复刻 M2 划分（探针预测 +0.81/+0.92 的同划分验证），主判读 = M2' vs M2 同划分单变量差；若 M2' round 4 确认 feat 修复有效且需正式 Gate，再补 base 同划分（task_num 5 / private 40 / surrogate 5）的 M2' 臂对 base corrected。
 
