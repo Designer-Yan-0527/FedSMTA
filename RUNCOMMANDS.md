@@ -143,7 +143,7 @@ python diagnostics/analyze_class_retention.py \
     --run_dir <run_dir> \
     --old_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth \
     --new_ckpt checkpoints/task_04_end.pth \
-    --out_csv diagnostics_output/class_retention_4combo.csv
+    --out_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/class_retention_4combo.csv
 ```
 
 P 通道 = oo−co（聚合 prompt 漂移）、KA 通道 = oo−oc（本地 key/anchor 漂移）；public/private 由 manifest 自证（≥2 客户端持有 = public）；固定 shuffle 种子 `9700+100*cid+old_task`；样本加权。
@@ -151,7 +151,7 @@ P 通道 = oo−co（聚合 prompt 漂移）、KA 通道 = oo−oc（本地 key/
 ### 9.3.2 子机制判别探针（probe_channel_correlates.py）
 
 ```bash
-python diagnostics/probe_channel_correlates.py --csv diagnostics_output/class_retention_4combo.csv
+python diagnostics/probe_channel_correlates.py --csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/class_retention_4combo.csv
 ```
 
 消费 9.3.1 的 CSV，检验间接共适应 vs 协议结构性脆弱两候选子机制（判决：后者否证、前者修正版成立）。
@@ -162,9 +162,9 @@ python diagnostics/probe_channel_correlates.py --csv diagnostics_output/class_re
 python diagnostics/verify_slot_binding.py \
     --run_dir <run_dir> \
     --task_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth,checkpoints/task_04_end.pth \
-    --out_csv diagnostics_output/slot_binding.csv \
-    --out_slot_csv diagnostics_output/slot_binding_slots.csv \
-    --out_npz diagnostics_output/slot_binding_matrices.npz
+    --out_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/slot_binding.csv \
+    --out_slot_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/slot_binding_slots.csv \
+    --out_npz output/cifar100/fedta/cifar_base_p15_legacy/seed_42/slot_binding_matrices.npz
 ```
 
 绑定集中度 / 槽位共享 / 路由 2×2 分解 / 完整 class×slot 绑定矩阵。固定种子物化一份增强视图隔离增强噪声；无自动判决。
@@ -175,11 +175,11 @@ python diagnostics/verify_slot_binding.py \
 python diagnostics/collision_exposure_diagnostic.py \
     --run_dir <run_dir> \
     --task_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth,checkpoints/task_04_end.pth \
-    --binding_csv diagnostics_output/slot_binding.csv \
-    --binding_npz diagnostics_output/slot_binding_matrices.npz \
-    --combo_csv diagnostics_output/class_retention_4combo.csv \
-    --out_csv diagnostics_output/collision_exposure.csv \
-    --out_json diagnostics_output/collision_exposure.json
+    --binding_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/slot_binding.csv \
+    --binding_npz output/cifar100/fedta/cifar_base_p15_legacy/seed_42/slot_binding_matrices.npz \
+    --combo_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/class_retention_4combo.csv \
+    --out_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/collision_exposure.csv \
+    --out_json output/cifar100/fedta/cifar_base_p15_legacy/seed_42/collision_exposure.json
 ```
 
 E_future → d_key/d_anchor（含方向/范数分解）→ KA 链条检验；纯张量运算约 1 分钟。判决须过 (client,task) FE（Roadmap §3.7）。
@@ -188,10 +188,10 @@ E_future → d_key/d_anchor（含方向/范数分解）→ KA 链条检验；纯
 
 ```bash
 python diagnostics/analyze_landing_spots.py \
-    --binding_npz diagnostics_output/slot_binding_matrices.npz \
-    --damage_csv diagnostics_output/collision_exposure_local.csv \
-    --out_csv diagnostics_output/landing_spots.csv \
-    --out_json diagnostics_output/landing_spots.json
+    --binding_npz output/cifar100/fedta/cifar_base_p15_legacy/seed_42/slot_binding_matrices.npz \
+    --damage_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/collision_exposure_local.csv \
+    --out_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/landing_spots.csv \
+    --out_json output/cifar100/fedta/cifar_base_p15_legacy/seed_42/landing_spots.json
 ```
 
 集中坍缩/attractor 假说检验；秒级本地运行。
@@ -201,9 +201,9 @@ python diagnostics/analyze_landing_spots.py \
 ```bash
 python diagnostics/verify_tkr.py \
     --run_dir <run_dir> \
-    --out_prefix diagnostics_output/tkr_seed42
+    --out_prefix diagnostics_output/tkr/tkr_seed42
 # 或直接指定 train_log：
-python diagnostics/verify_tkr.py --train_log <path>/train_log.csv --global_epoch 5 --out_prefix diagnostics_output/tkr_seed42
+python diagnostics/verify_tkr.py --train_log <path>/train_log.csv --global_epoch 5 --out_prefix diagnostics_output/tkr/tkr_seed42
 ```
 
 按作者 issue 回复定义复算 TKR（分母 = round4 聚合全局模型、分子 = t>0 本地模型）。三种子复算结案：平均 96.4/98.4/96.1/89.6% 吻合论文 "around 98%"（Roadmap §3.8）。
@@ -214,7 +214,7 @@ python diagnostics/verify_tkr.py --train_log <path>/train_log.csv --global_epoch
 python diagnostics/ncm_probe.py \
     --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
     --checkpoints task_00_end.pth,task_04_end.pth \
-    --out_csv diagnostics_output/ncm_probe_inr_a2.csv \
+    --out_csv diagnostics_output/ncm_probe/ncm_probe_inr_a2.csv \
     --c2p "86.86,91.14"
 ```
 
@@ -233,8 +233,8 @@ python diagnostics/ncm_probe.py \
 python diagnostics/probe_oracle_headroom.py \
     --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
     --checkpoints task_00_end.pth,task_04_end.pth \
-    --features_dir diagnostics_output/ncm_inr_a2_seed42 \
-    --out_csv diagnostics_output/oracle_headroom_inr_a2.csv \
+    --features_dir diagnostics_output/ncm_probe/ncm_inr_a2_seed42 \
+    --out_csv diagnostics_output/oracle_headroom/oracle_headroom_inr_a2.csv \
     --c2p 86.86,91.14
 
 # CIFAR-100 cifar_hsn 臂（唯一有完整 checkpoint + 标准 metrics 的全协议 cifar run；
@@ -242,7 +242,7 @@ python diagnostics/probe_oracle_headroom.py \
 python diagnostics/probe_oracle_headroom.py \
     --run_dir output/cifar100/fedta/cifar_hsn/seed_42 \
     --checkpoints task_00_end.pth,task_04_end.pth \
-    --out_csv diagnostics_output/oracle_headroom_cifar_hsn.csv
+    --out_csv diagnostics_output/oracle_headroom/oracle_headroom_cifar_hsn.csv
 ```
 
 - **cifar 辅助读数的 caveat**：cifar_hsn 带 `skip_fed_avg_head=True`（HS-N 修复臂，非纯官方）。z_ref（冻结主干）读数不受任何影响；z_op 的 prompt 训练路径不含 vit.head，大概率等价官方但未验证。官方 D 臂（route_fix off）不可用于本探针：`max_rounds=1` 短程协议无 client CSV / accuracy_matrix / task_XX_end.pth，native 对账管线按设计 fail-closed 拒绝。Phase-0 官方全协议 cifar run 的 checkpoint 已清理，同样不可用。
@@ -328,7 +328,7 @@ python main.py --method fedta_a2 --a2_arm both --seed 42 --task_num 1 --global_e
 # A1 快照评估（纯推理，对 baseline 或 A2 run 均可）
 python diagnostics/a1_snapshot_eval.py \
     --run_dir output/cifar100/fedta/<run_name>/seed_42 \
-    --out_csv diagnostics_output/a1_snapshot_eval.csv
+    --out_csv output/cifar100/fedta/cifar_base_p15_legacy/seed_42/a1_snapshot_eval.csv
 ```
 
 - `--a2_arm` 仅在 `--method fedta_a2` 下生效；A2 checkpoint 含 a2_state，resume fail-closed
@@ -668,11 +668,11 @@ python diagnostics/probe_eval_dropout_causal.py \
     --task 0 --native_repeats 15 --eval_repeats 3
 ```
 
-预期：native ≈ 82.87 且重复间有波动；head_eval ≈ full_eval ≈ 84.81 且重复几乎一致。`CAUSAL_CONFIRMED` 判据：dropout 效应 ≥1pp、|head_eval−full_eval|≤0.5pp、native 有随机性、eval 重复稳定。产物 `diagnostics_output/eval_dropout_causal.{json,csv}`。
+预期：native ≈ 82.87 且重复间有波动；head_eval ≈ full_eval ≈ 84.81 且重复几乎一致。`CAUSAL_CONFIRMED` 判据：dropout 效应 ≥1pp、|head_eval−full_eval|≤0.5pp、native 有随机性、eval 重复稳定。产物 `diagnostics_output/misc/eval_dropout_causal.{json,csv}`。
 
 ### 21.2 Track E 全量 corrected-eval 只读重评（`eval_mode_reeval.py`，**条件放行**：21.1 结案后跑）
 
-对每个 `task_XX_end.pth`、每个 (client, 已见任务 k) 输出双口径 `official_compat_acc` / `corrected_eval_acc`，外加 R[t][k] 矩阵与 AA。**只读**：不覆盖 run_dir 内任何历史产物，输出仅落 `diagnostics_output/eval_mode_reeval.{csv,json}`。不预设"所有历史结果都涨 1-2pp"——逐 checkpoint 实测。corrected 口径复用 21.1 的 load_head 绕过修复，并做 fail-closed 校验：任一 checkpoint 的 corrected 评测若经 forward_pre_hook 在前向时刻检测到 head 仍处 train mode，打 WARNING 并计入 JSON 字段 `corrected_head_train_mode_failures`（判读时应为全 0，非 0 即修复未生效、该批 corrected 数字不可信）。
+对每个 `task_XX_end.pth`、每个 (client, 已见任务 k) 输出双口径 `official_compat_acc` / `corrected_eval_acc`，外加 R[t][k] 矩阵与 AA。**只读**：不覆盖 run_dir 内任何历史产物，输出仅落 `diagnostics_output/eval_mode_reeval/eval_mode_reeval.{csv,json}`。不预设"所有历史结果都涨 1-2pp"——逐 checkpoint 实测。corrected 口径复用 21.1 的 load_head 绕过修复，并做 fail-closed 校验：任一 checkpoint 的 corrected 评测若经 forward_pre_hook 在前向时刻检测到 head 仍处 train mode，打 WARNING 并计入 JSON 字段 `corrected_head_train_mode_failures`（判读时应为全 0，非 0 即修复未生效、该批 corrected 数字不可信）。
 
 **第三轮条件（2026-10-28）**：每个 corrected cell 目前只评一次。若 21.1 显示 corrected repeat spread 可忽略（`eval_repeat_spread_max` ≤0.05pp）→ 本命令直接放行，现有单次口径即可；若 corrected 仍有实质波动（>0.1pp）→ 单次 corrected 数字依赖某次随机 batch grouping，须先升级：**首选**官方兼容口径（保留 `shuffle=True`，corrected 每 cell 重复多次取均值，不改 batchwise routing 协议）；可另设 `shuffle=False` 固定 batch 口径作为第二严格确定性参照。升级完成并复审后再跑本命令。
 
@@ -692,13 +692,13 @@ B2 使用缓存好的 `z_op` 特征，不再经过 `Global_Prompt` 的 batchwise
 
 ```bash
 python diagnostics/probe_ssra_headroom.py \
-    --features diagnostics_output/ncm_inr_a2_seed42/features_ImageNet-R_task_00_end_promptcurrent.npz \
+    --features diagnostics_output/ncm_probe/ncm_inr_a2_seed42/features_ImageNet-R_task_00_end_promptcurrent.npz \
     --mode b2 \
     --bottlenecks 64 128 256 --scale_modes fixed learnable \
     --dropouts 0.0 0.2 --wds 1e-3
 ```
 
-产物 `diagnostics_output/ssra_b2_search.{json,csv}`。**模式语义（第二轮裁决同步）**：`--mode gate`（默认）已改为现行裁决——P0=85.00 是强线性参照，verdict 直接按 winner−P0 的 test-once delta 三档判定，native 对齐仅作信息项（不再 CALIBRATION_FAIL）；v2 逐位旧行为（含 CALIBRATION_FAIL）保留在 `--mode legacy_gate`，仅供历史复现，不再代表当前裁决。
+产物 `diagnostics_output/ssra/ssra_b2_search.{json,csv}`。**模式语义（第二轮裁决同步）**：`--mode gate`（默认）已改为现行裁决——P0=85.00 是强线性参照，verdict 直接按 winner−P0 的 test-once delta 三档判定，native 对齐仅作信息项（不再 CALIBRATION_FAIL）；v2 逐位旧行为（含 CALIBRATION_FAIL）保留在 `--mode legacy_gate`，仅供历史复现，不再代表当前裁决。
 
 ### 21.4 单测（Track E 切换语义 + B2 无 test 泄漏）
 
@@ -955,4 +955,40 @@ python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets 
 2. x1 路径 + 配方过拟合（−1.2~−1.5）：两嫌疑已证（上文判读），feat 臂修复对象。
 3. eval-dropout 口径：INR 上官方头（p=0.5）eval 被打 ~3pp 折扣（T0: 81.67→84.81），refit 头 p=0.1 受罚小 → 日志口径偏袒 M2，corrected 差距更大。
 
-**oracle 外推参考**（diagnostics_output/oracle_headroom_inr_a2.summary.json，inr_a2_key_p40）：T0 z_op 分解 mlp_local=86.91 > mlp_pooled=85.75 > native corrected=84.81；federated_premise=−1.16（INR 上跨 client 池化负收益 → "refit 头做 FedAvg"路线被 oracle 判死，不做）。
+**oracle 外推参考**（diagnostics_output/oracle_headroom/oracle_headroom_inr_a2.summary.json，inr_a2_key_p40）：T0 z_op 分解 mlp_local=86.91 > mlp_pooled=85.75 > native corrected=84.81；federated_premise=−1.16（INR 上跨 client 池化负收益 → "refit 头做 FedAvg"路线被 oracle 判死，不做）。
+
+## 24. 目录结构规范（2026-10-29 起，历史产物已按此归档）
+
+### 24.1 output/（训练产物，run_manager 固定四层）
+
+```
+output/<dataset>/<method>/<run_name>/seed_<seed>/
+├── args.json / command.txt / git_commit.txt
+├── checkpoints/   round_XXXX.pth / task_XX_end.pth / latest.pth
+├── metrics/       accuracy_matrix.csv / summary_metrics.csv / train_log.csv / ...
+└── logs/          train.log
+```
+
+- `<method>` = main.py 方法目录名（fedta / fedta_a2 / fedavg / fedprox / c2prompt / fedmgp ...）；
+- `run_name` 命名：`<数据集缩写>_<实验线>_<臂>[_<variant>]`，小写下划线；**划分敏感的臂必须带 `_pN` 后缀**标明 private_class_num（如 inr_base_p40 / inr_a2_key_p40），避免再出现 §23.7 披露的划分混淆；
+- legacy 例外（历史 run，只读保留，不再新增）：
+  - `output/cifar100/fedta/cifar_base_p15_legacy/seed_{42,1999,2025}/`——旧格式：csv 平铺在 run 根、**无 checkpoints/**（corrected 无法重评的根因）；
+  - `output/regression*/`——单测产物，与实验数据无关，禁止混入实验判读；
+- **正在跑的 run 目录禁止移动/改名**。
+
+### 24.2 diagnostics_output/（诊断产物，按产出脚本归档）
+
+```
+diagnostics_output/
+├── corrected_reeval/     # corrected 口径统一定案（每臂 *_corrected.csv/.json/.log）
+├── eval_mode_reeval/     # eval_mode_reeval.py 输出（含 a5v2 各臂历史）
+├── oracle_headroom/      # oracle 上限分解
+├── head_retrain_probe/   # 头重训探针
+├── refit_input_probe/    # refit 输入消融探针（INR 双探针判读数据）
+├── ncm_probe/            # NCM 探针 + 特征子目录
+├── ssra/  ├── tkr/  ├── features/  ├── misc/
+```
+
+- 规则：**一个诊断脚本一个家族目录**；文件名保留脚本默认名（不二次改名，保持 `--out_*` 兼容）；
+- 新诊断脚本必须支持 `--out_csv/--out_json` 并默认写入自己的家族目录，不允许平铺到根；
+- 判读引用路径一律以本节为准；本文档历史路径已于 2026-10-29 批量更新。
