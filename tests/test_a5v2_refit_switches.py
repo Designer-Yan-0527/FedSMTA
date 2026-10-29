@@ -408,6 +408,48 @@ class TestFailClosed(unittest.TestCase):
         self.assertTrue(_state_equal(client2._a5_joint_head.state_dict(),
                                      client._a5_joint_head.state_dict()))
 
+    def test_tail_anchor_state_uses_joint_head_when_on(self):
+        """修复回归：end-of-round evaluate 会把 model.head 装成 refit 头
+        （standardize 臂 = StandardizedChead，带 mean/std buffer）。ON 臂
+        checkpoint 的 tail_anchor_model 必须用联训头覆写 head.*，schema
+        保持 Chead 键集（否则后续 resume 严格 load_state_dict 拒载）。"""
+        client = _make_a5_client(head_refit=True)
+        client._a5_joint_head = deepcopy(client.model.get_head())
+        torch.manual_seed(11)
+        polluted = StandardizedChead(
+            200, torch.randn(1536), torch.rand(1536) + 0.5)
+        client.model.load_head(polluted)  # 模拟 evaluate 后的污染状态
+        state = client.state_dict_for_checkpoint()
+        tam = state['tail_anchor_model']
+        self.assertNotIn('head.mean', tam)
+        self.assertNotIn('head.std', tam)
+        jh = client._a5_joint_head.state_dict()
+        for k in jh:
+            self.assertTrue(torch.equal(tam['head.' + k], jh[k].cpu()), k)
+
+    def test_legacy_standardized_checkpoint_resume(self):
+        """修复回归：老版本（2026-10-29 修复前）standardize 臂 checkpoint 的
+        tail_anchor_model 混有 head.mean/head.std 污染键，ON 臂 resume 剔除
+        后可正常装载（联训头由 a5_joint_head 恢复）；缺 a5_joint_head 仍
+        fail-closed。"""
+        from runtime_utils import module_state_or_none
+        client = _make_a5_client(head_refit=True, head_standardize=True)
+        ms = module_state_or_none(client.model)
+        ms['head.mean'] = torch.zeros(1536)
+        ms['head.std'] = torch.ones(1536)
+        state = {'id': 0, 'task_id': 0, 'tail_anchor_model': ms,
+                 'prompts': None, 'heads': []}
+        # 缺 a5_joint_head -> fail-closed（在污染键剔除之后仍能命中）
+        with self.assertRaises(RuntimeError):
+            client.load_checkpoint_state(state)
+        # 补上 a5_joint_head -> 剔除污染键后成功装载
+        client._a5_joint_head = deepcopy(client.model.get_head())
+        state['a5_joint_head'] = module_state_or_none(client._a5_joint_head)
+        client2 = _make_a5_client(head_refit=True, head_standardize=True)
+        client2.load_checkpoint_state(state)
+        self.assertTrue(_state_equal(client2._a5_joint_head.state_dict(),
+                                     client._a5_joint_head.state_dict()))
+
 
 if __name__ == '__main__':
     unittest.main()

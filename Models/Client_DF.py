@@ -947,6 +947,20 @@ class Client_DF(object):
     # Phase 0: checkpoint state (round-boundary resume)
     # ------------------------------------------------------------------
 
+    def _a5_tail_anchor_state(self):
+        """tail_anchor_model checkpoint 状态。OFF 臂 = 官方原样；ON 臂把
+        head.* 键用联训头覆写（联训轨迹语义 + schema 兼容，见
+        state_dict_for_checkpoint 注释）。"""
+        ms = module_state_or_none(self.model)
+        if not self._a5_refit_or_consolidate or self._a5_joint_head is None:
+            return ms
+        joint_state = self._a5_joint_head.state_dict()
+        merged = {k: v for k, v in ms.items()
+                  if not k.startswith("head.")}
+        for k, v in joint_state.items():
+            merged["head." + k] = v.detach().cpu()
+        return merged
+
     def state_dict_for_checkpoint(self):
         heads_state = [module_state_or_none(h) for h in self.heads]
         state = {
@@ -954,7 +968,13 @@ class Client_DF(object):
             "task_id": self.task_id,
 
             # Tail_Anchor: key / anchor_pool / current Chead
-            "tail_anchor_model": module_state_or_none(self.model),
+            # A5-v2 ON 臂保存"联训轨迹"状态：训练结束时刻 model.head 可能
+            # 已被 end-of-round evaluate 装成 refit 头（standardize 臂为
+            # StandardizedChead，含 mean/std buffer，schema 与 Chead 不同，
+            # 直接存会破坏后续 load_state_dict 兼容性）。联训头独立存于
+            # _a5_joint_head，phase-2 前由 P4 恢复——这里的 head.* 键用联训
+            # 头覆写，保证 tail_anchor_model 始终 = 联训轨迹状态。
+            "tail_anchor_model": self._a5_tail_anchor_state(),
 
             "prompts": module_state_or_none(self.prompts),
 
@@ -1064,7 +1084,25 @@ class Client_DF(object):
         self.task_id = state["task_id"]
 
         # Tail_Anchor (key / anchor_pool / head)
-        self.model.load_state_dict(state["tail_anchor_model"])
+        # A5-v2 老版本 checkpoint（2026-10-29 修复前的 standardize 臂）在
+        # 保存时 model.head 仍是 refit 的 StandardizedChead，带
+        # head.mean/head.std buffer 键，严格 load_state_dict 会拒载。联训
+        # 轨迹头由 a5_joint_head 恢复、phase-2 前由 P4 装回，这里剔除
+        # 多余 head.* 键即可恢复兼容（仅 ON 臂；OFF 臂遇外来键保持报错）。
+        tam = state["tail_anchor_model"]
+        if self._a5_refit_or_consolidate:
+            expected = {k for k in self.model.state_dict()
+                         if k.startswith("head.")}
+            foreign = sorted(k for k in tam
+                            if k.startswith("head.") and k not in expected)
+            if foreign:
+                tam = {k: v for k, v in tam.items() if k not in set(foreign)}
+                state = dict(state)
+                state["tail_anchor_model"] = tam
+                print("[A5-v2] client %d resume: dropping foreign head keys "
+                      "from legacy checkpoint: %s (joint head restored "
+                      "from a5_joint_head)" % (self.id, foreign))
+        self.model.load_state_dict(tam)
 
         # prompts: deepcopy current vit prompt as template, then load state
         prompt_state = state.get("prompts")
