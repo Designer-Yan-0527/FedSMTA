@@ -36,10 +36,11 @@
   两者都不动                              → 双嫌疑皆弱，问题在别处
                                              （增强噪声 / 特征太生）
 
-用法（repo 根目录）：
+用法（repo 根目录；--checkpoints 需带 checkpoints/ 子目录前缀，
+resolve_checkpoint 不进子目录找）：
   python diagnostics/probe_refit_input_ablation.py \
       --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_refit/seed_42 \
-      --checkpoints round_0000.pth,round_0001.pth \
+      --checkpoints checkpoints/round_0000.pth,checkpoints/round_0001.pth \
       --out_csv diagnostics_output/refit_input_inr_m2.csv
 """
 
