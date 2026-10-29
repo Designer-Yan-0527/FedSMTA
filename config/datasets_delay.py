@@ -250,6 +250,20 @@ def get_args_parser(subparsers):
                                  '--head_refit; the current-task refit belongs to '
                                  '--head_refit (orthogonal switches). Absorbs the '
                                  'interface-drift headroom (RUNCOMMANDS Sec.22.2-4).')
+    subparsers.add_argument('--refit_input', default='x1', choices=['x1', 'feat'],
+                            help='A5-v2 Sec.23.6-1 verdict switch (default x1 = current '
+                                 'behavior, bit-identical): the input fed to the '
+                                 'refit/consolidation readout. x1 = the native 1536-d '
+                                 'anchor-concat interface; feat = the 768-d pre-anchor '
+                                 'z_op (vit output). Probe-verified on ImageNet-R '
+                                 '(2026-10-29): the anchor half of x1 costs ~1.2pp '
+                                 '(top-1 hard routing picks wrong anchors) and the '
+                                 'cifar-tuned recipe overfits it on ~1k-row clients. '
+                                 'feat heads are DEPLOYED as 1536-input modules with '
+                                 'the anchor-half weights hard-zeroed (x1[:, :768] IS '
+                                 'z_op), so evaluate/checkpoint/resume paths are '
+                                 'unchanged. Fail-closed: requires --head_refit or '
+                                 '--interface_consolidate.')
     subparsers.add_argument('--client_num', default=5, type=int,
                             help='the num of client')
     subparsers.add_argument('--task_num', default=5, type=int,

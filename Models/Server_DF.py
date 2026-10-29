@@ -110,6 +110,15 @@ class Server_DF(object):
                 "--head_standardize requires --head_refit or "
                 "--interface_consolidate (nothing to standardize; "
                 "fail-closed, RUNCOMMANDS Sec.23)")
+        # A5-v2 §23.6-1 fail-closed：refit_input 只作用于 refit/consolidation
+        # 的读出头；单独开启 = 无效配置，拒绝启动而非静默忽略
+        if str(getattr(args, 'refit_input', 'x1')) != 'x1' and not (
+                bool(getattr(args, 'head_refit', False))
+                or bool(getattr(args, 'interface_consolidate', False))):
+            raise SystemExit(
+                "--refit_input feat requires --head_refit or "
+                "--interface_consolidate (nothing to refit; "
+                "fail-closed, RUNCOMMANDS Sec.23.6-1)")
     def init_client(self):
         print('Initialize clients')
         for i in range(self.client_num):    #
@@ -796,7 +805,7 @@ class Server_DF(object):
         # A5-v2（RUNCOMMANDS §23）：跨 ON/OFF resume 会静默改变接口语
         # 义与 joint-head 轨迹管理；two-sided 检查保持老 checkpoint 兼容
         "head_dropout", "head_refit", "head_standardize",
-        "interface_consolidate",
+        "interface_consolidate", "refit_input",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):

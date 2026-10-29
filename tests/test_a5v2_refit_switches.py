@@ -70,13 +70,16 @@ def _task_dataset(task, n, seed):
 
 def _make_a5_client(head_refit=False, head_standardize=False,
                    interface_consolidate=False, head_dropout=0.5,
-                   task_id=0, legacy_args=False, seed=123, n_rows=24):
+                   task_id=0, legacy_args=False, seed=123, n_rows=24,
+                   refit_input=None):
     from Models.Client_DF import Client_DF
     kwargs = dict(nb_classes=20, seed=seed)
     if not legacy_args:
         kwargs.update(head_dropout=head_dropout, head_refit=head_refit,
                       head_standardize=head_standardize,
                       interface_consolidate=interface_consolidate)
+        if refit_input is not None:
+            kwargs['refit_input'] = refit_input
     args = types.SimpleNamespace(**kwargs)
     class_mask = [[2 * t, 2 * t + 1] for t in range(10)]
     train_data = [_task_dataset(t, n_rows, seed) for t in range(10)]
@@ -449,6 +452,99 @@ class TestFailClosed(unittest.TestCase):
         client2.load_checkpoint_state(state)
         self.assertTrue(_state_equal(client2._a5_joint_head.state_dict(),
                                      client._a5_joint_head.state_dict()))
+
+
+class TestRefitInputFeat(unittest.TestCase):
+    """A5-v2 §23.6-1 修复臂（--refit_input feat，INR 双探针诊断
+    2026-10-29 预注册判读的落地）：refit 输入 = 768 维 pre-anchor z_op，
+    部署为 1536 输入、锚半区权重硬置零的头——evaluate/checkpoint/resume
+    路径与 x1 臂完全同构（state keys 不变）。"""
+
+    def _hook_args(self, **flags):
+        base = dict(nb_classes=20, seed=7, head_refit=False,
+                    head_standardize=False, interface_consolidate=False,
+                    refit_input='x1')
+        base.update(flags)
+        return types.SimpleNamespace(**base)
+
+    def test_feat_head_zeroes_anchor_half(self):
+        """置零结构：feat 臂 first Linear 锚半区恒 0、z_op 半区非 0；
+        x1 臂（默认）锚半区正常训练不置零——两臂部署形式可区分。"""
+        client = _make_a5_client(head_refit=True, task_id=0)
+        client._a5_post_phase2_interface(
+            0, self._hook_args(head_refit=True, refit_input='feat'))
+        w = client.heads[0].head[0].weight
+        self.assertEqual(w.shape[1], 1536)
+        self.assertTrue(torch.equal(w[:, 768:], torch.zeros_like(w[:, 768:])))
+        self.assertFalse(torch.equal(w[:, :768], torch.zeros_like(w[:, :768])))
+        client2 = _make_a5_client(head_refit=True, task_id=0)
+        client2._a5_post_phase2_interface(
+            0, self._hook_args(head_refit=True))
+        w2 = client2.heads[0].head[0].weight
+        self.assertFalse(torch.equal(w2[:, 768:], torch.zeros_like(w2[:, 768:])))
+
+    def test_feat_head_deploy_equivalence(self):
+        """部署语义（evaluate 路径零改动的等价性）：head(x1) 只依赖
+        前 768 维（z_op），锚半区替换成任意噪声不改变 logits。对
+        Chead 与 StandardizedChead 两种部署形态都成立。"""
+        for standardize in (False, True):
+            client = _make_a5_client(head_refit=True, task_id=0)
+            client._a5_post_phase2_interface(
+                0, self._hook_args(head_refit=True, refit_input='feat',
+                                   head_standardize=standardize))
+            h = client.heads[0]
+            h.eval()
+            g = torch.Generator().manual_seed(5)
+            z = torch.randn(6, 768, generator=g).to(h.head[0].weight.device)
+            anchor = torch.randn(6, 768, generator=g).to(z.device)
+            with torch.no_grad():
+                out_anchor = h(torch.cat([z, anchor], dim=1))
+                out_zero = h(torch.cat([z, torch.zeros_like(anchor)], dim=1))
+            self.assertTrue(torch.equal(out_anchor, out_zero),
+                            'standardize=%s' % standardize)
+
+    def test_feat_head_state_keys_unchanged(self):
+        """schema 兼容：feat 臂头的 state keys 与 x1 臂同形——resume 的
+        rebuild_client_head 无需新分支。"""
+        cx = _make_a5_client(head_refit=True, task_id=0)
+        cx._a5_post_phase2_interface(0, self._hook_args(head_refit=True))
+        cf = _make_a5_client(head_refit=True, task_id=0)
+        cf._a5_post_phase2_interface(
+            0, self._hook_args(head_refit=True, refit_input='feat'))
+        self.assertEqual(set(cx.heads[0].state_dict().keys()),
+                         set(cf.heads[0].state_dict().keys()))
+
+    def test_refit_input_default_is_x1(self):
+        """legacy args（无 refit_input 键）与显式 'x1' 的 refit 头逐位
+        一致（getattr 默认路径）。"""
+        c1 = _make_a5_client(head_refit=True, task_id=0)
+        a1 = self._hook_args(head_refit=True)
+        del a1.refit_input  # legacy checkpoint / 旧 args
+        c2 = _make_a5_client(head_refit=True, task_id=0)
+        c1._a5_post_phase2_interface(0, a1)
+        c2._a5_post_phase2_interface(
+            0, self._hook_args(head_refit=True, refit_input='x1'))
+        self.assertTrue(_state_equal(c1.heads[0].state_dict(),
+                                     c2.heads[0].state_dict()))
+
+    def test_refit_input_feat_alone_refuses_to_start(self):
+        """fail-closed：--refit_input feat 无 refit/consolidation 时拒绝
+        启动（无作用对象）。"""
+        from Models.Server_DF import Server_DF
+        args = types.SimpleNamespace(nb_classes=20, refit_input='feat')
+        with self.assertRaises(SystemExit):
+            Server_DF('Server', None, 'Tail_Anchor', 1, 1, [None],
+                      [[0, 1]], 0.01, 5, 1, 16, 'cpu', 'fedta', 0.25,
+                      None, None, args, None)
+
+    def test_refit_input_feat_with_refit_starts(self):
+        from Models.Server_DF import Server_DF
+        args = types.SimpleNamespace(nb_classes=20, refit_input='feat',
+                                     head_refit=True)
+        server = Server_DF('Server', None, 'Tail_Anchor', 1, 1, [None],
+                            [[0, 1]], 0.01, 5, 1, 16, 'cpu', 'fedta', 0.25,
+                            None, None, args, None)
+        self.assertIsNotNone(server)
 
 
 if __name__ == '__main__':

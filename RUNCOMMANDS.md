@@ -901,8 +901,55 @@ python -m unittest tests.test_a5v2_refit_switches -v
 
 ### 23.6 已知偏差与边界（如实报告）
 
-1. **输入差异**：探针 mlp_local 的 +4.04/+2.26 是 768 维 pre-anchor z_op 上取得的；refit 用 native 接口真实输入 x1（1536 维 anchor-concat，含 top-1 硬路由选 anchor）。若 M2/M3 仍显著低于探针，此为第一嫌疑——届时可加 `--refit_input feat` 臂（绕过 anchor，需另改 evaluate 路径，工作量另计）。
+1. **输入差异**：探针 mlp_local 的 +4.04/+2.26 是 768 维 pre-anchor z_op 上取得的；refit 用 native 接口真实输入 x1（1536 维 anchor-concat，含 top-1 硬路由选 anchor）。若 M2/M3 仍显著低于探针，此为第一嫌疑——**2026-10-29 已定案为 INR 上的实际病灶（判读见下），`--refit_input feat` 臂已落地**：训练输入 = z_op⊕0 垫零成 1536，训练后 first Linear 锚半区权重硬置零 → 部署语义 head(x1) 功能上 = z_op 头（x1[:, :768] 即 z_op），evaluate/checkpoint/resume 路径与 x1 臂完全同构（state keys 不变），无需另改 evaluate 路径。fail-closed：必须与 --head_refit 或 --interface_consolidate 联用。
 2. **hidden 512 vs 探针 256**：为保持 heads 存储 = Chead schema（评测路径零改动）选 512；容量非三因素之一，若归因不干净再回头。
 3. **augmentation**：refit 特征来自带增强的 train split（与官方 protos 计算同数据流）；探针 npz 特征的增强状态以 extract_features.py 实际为准。臂内自洽，臂间对照时注意。
 4. **dropout(0.5) train 端是作者设计选择**：只作归因消融因素，不作方法主张（用户已敲定）。
 5. resume 的 diag 工具兼容性：部分诊断（compatibility_drift 等）对 StandardizedChead keys 可能 fail-closed 拒绝——预期行为，判读用 corrected metrics 口径即可。
+
+### 23.7 §23.6-1 修复臂（M2'）落地与判读定案（2026-10-29）
+
+**INR 双探针诊断判读**（probe_refit_input_ablation.py，锚点列修复后，corrected 口径，client 均值，探针直接实测）：
+
+| 臂 | r0 | r1 |
+|---|---|---|
+| native（本地联训头） | 77.50 | 77.45 |
+| saved_refit（hook 落盘头） | 77.96 | 79.35 |
+| x1_rf（x1 配方） | 78.67 | 79.09 |
+| z_rf（z 配方） | 78.77 | 80.27 |
+| x1_lt（x1_light 轻量配方） | 78.90 | 80.41 |
+| z_lt（z_light 轻量配方） | 79.23 | 80.33 |
+| x1_pb（x1_probe256 探针配方） | 79.27 | 79.39 |
+| z_pb（z_probe256 探针配方） | 79.41 | 80.59 |
+
+判读结论（预注册判据兑现）：
+1. **嫌疑 2（x1 路径）r1 过阈**：Δ(z_rf−x1_rf)=+1.18 —— refit 头吃进的 1536 维 anchor-concat（含 top-1 硬路由）在 INR 200 类上是污染源；r0 不动（+0.10，随训练轮次激活）。
+2. **嫌疑 1（配方过拟合）r1 过阈**：Δ(x1_lt−x1_rf)=+1.32 —— 但**换 z 输入后配方敏感性消失**（z_rf/z_lt/z_pb 极差 ≤0.32）→ 配方过拟合计入 x1 的病，单变量修输入（z 替换）即可同时消两嫌疑。
+3. 预期涨点口径（探针直接实测，非 oracle 外推）：INR r0 +0.81 / r1 +0.92（z 臂 vs native/saved_refit 锚点）。
+
+**Gate 参照修正（口径审计）**：§23.2 中 D 参考 84.81 实为 **inr_a2_key_p40（A2 臂）** 的 reeval，非官方基线；M2' 继承 base 表征轨迹，对照物必须是 inr_base_p40 的 corrected T0（补测进行中：eval_mode_reeval --run_dir output/ImageNet-R/fedta/inr_base_p40/seed_42 --checkpoints task_00_end.pth）。Gate 精确参照以补测数字为准。
+
+**M2' 臂命令**：
+
+```bash
+# INR M2' 判据臂（feat 输入修复，T0 短程）
+python main.py datasets_delay --data_name ImageNet-R --data-path ./local_datasets \
+    --client_num 5 --task_num 10 --private_class_num 40 --surrogate_num 5 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --max_rounds 5 --run_name inr_a5v2_M2_feat
+
+# cifar M2' 对照臂（验证 feat 输入在 cifar 上不掉点）
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --max_rounds 5 --run_name cifar_a5v2_M2_feat
+```
+
+**修订判据（预注册）**：INR M2' 的 r0/r1 允许 ≈baseline 或略输（早期联邦同步优势 ~1pp 预期内：baseline 日志数字 = fed_avg 广播头 5×池化，refit 头 = 纯本地小样本头）；**round 4（T0 边界）必须 ≥ inr_base_p40 corrected T0**（补测数字）——反超不成则 INR 上 M2 方法不成立、主战场退守 cifar。cifar M2' 预计不掉点（x1 三成本项在 cifar ≈0），若掉点则 feat 输入的通用性存疑，需复查。
+
+**M2 vs baseline 差距三层分解**（用户"可是不如 baseline"的定案回答）：
+1. 早期联邦同步优势（~1pp）：baseline 日志数字 = fed_avg 广播头（5×池化）；refit 头 = 纯本地 ~1k 行头；本地联训头 corrected 77.50 vs 广播头 ≥78.41（日志口径）。
+2. x1 路径 + 配方过拟合（−1.2~−1.5）：两嫌疑已证（上文判读），feat 臂修复对象。
+3. eval-dropout 口径：INR 上官方头（p=0.5）eval 被打 ~3pp 折扣（T0: 81.67→84.81），refit 头 p=0.1 受罚小 → 日志口径偏袒 M2，corrected 差距更大。
+
+**oracle 外推参考**（diagnostics_output/oracle_headroom_inr_a2.summary.json，inr_a2_key_p40）：T0 z_op 分解 mlp_local=86.91 > mlp_pooled=85.75 > native corrected=84.81；federated_premise=−1.16（INR 上跨 client 池化负收益 → "refit 头做 FedAvg"路线被 oracle 判死，不做）。

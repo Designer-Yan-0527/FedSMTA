@@ -608,11 +608,16 @@ class Client_DF(object):
         random.setstate(snap["python"])
         np.random.set_state(snap["numpy"])
 
-    def _a5_collect_head_inputs(self, task_id):
-        """head 真实输入 x1 的只读缓存：task 的 train split、当前接口状态
+    def _a5_collect_head_inputs(self, task_id, feat_only=False):
+        """refit 特征缓存的只读收集：task 的 train split、当前接口状态
         （vit 用当前任务 prompt = native evaluate 的 task_id=self.task_id
-        语义；model 前向取 x1），no_grad + 顺序 loader，test split 永不
-        触碰。与官方 proto 收集同数据流（train split 带增强）。"""
+        语义），no_grad + 顺序 loader，test split 永不触碰。与官方 proto
+        收集同数据流（train split 带增强）。
+          feat_only=False（默认，x1 臂）：再过 model 前向取 head 真实
+        输入 x1（1536 维 anchor-concat）；
+          feat_only=True（--refit_input feat，§23.6-1 修复臂）：直接取
+        vit 输出 z_op（768 维 pre-anchor），不过 model 前向——无 key
+        路由、无 anchor 混入（INR 双探针诊断 2026-10-29 判读的病灶）。"""
         if task_id not in self.data_split_indices:
             raise RuntimeError(
                 "client %d: task %d has no recorded train split (seen "
@@ -634,8 +639,11 @@ class Client_DF(object):
                     cls_features = output['pre_logits']
                 output = self.vit(input, task_id=self.task_id,
                                   cls_features=cls_features, train=True)
-                _, x1, _ = self.model(output['feat'].to(self.device),
-                                      target)
+                if feat_only:
+                    x1 = output['feat'].to(self.device)
+                else:
+                    _, x1, _ = self.model(output['feat'].to(self.device),
+                                          target)
             xs.append(x1)
             ys.append(target)
         if not xs:
@@ -643,12 +651,20 @@ class Client_DF(object):
         return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
 
     def _a5_refit_one_head(self, task_id, round_id, args):
-        """readout-only refit：在缓存 (x1, y) 上重训一个 Chead 形状读出头
+        """readout-only refit：在缓存特征上重训一个 Chead 形状读出头
         （masked CE 同 phase-2 口径，mask 用该任务 class_mask 对
-        nb_classes 取补；标准化按 --head_standardize）。返回新头模块；
-        train split 为空（协议现实）时返回 None = 保留现有头。梯度只到
-        读出头——特征已缓存、no_grad 计算，key/anchor/prompt 不在图中。"""
-        x1, y = self._a5_collect_head_inputs(task_id)
+        nb_classes 取补；标准化按 --head_standardize；输入路径按
+        --refit_input）。返回新头模块；train split 为空（协议现实）时
+        返回 None = 保留现有头。梯度只到读出头——特征已缓存、no_grad
+        计算，key/anchor/prompt 不在图中。
+
+        §23.6-1 feat 臂（--refit_input feat）：收集 768 维 z_op，训练
+        输入 = z_op ⊕ 0（垫零成 1536 形状，锚半区恒 0 → 其一阶权重梯度
+        恒 0）；训练后把 first Linear 的锚半区权重硬置零——部署语义：
+        head(x1) 功能上 = z_op 头（x1[:, :768] 即 z_op），evaluate/
+        checkpoint/resume 路径与 x1 臂完全同构（state keys 不变）。"""
+        refit_feat = (str(getattr(args, 'refit_input', 'x1')) == 'feat')
+        x1, y = self._a5_collect_head_inputs(task_id, feat_only=refit_feat)
         if x1 is None:
             return None
         label_num = self.model.nb_class
@@ -657,14 +673,27 @@ class Client_DF(object):
         not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
         torch.manual_seed(a5_stable_seed(
             args.seed, 'a5refit', self.id, task_id, round_id))
+        half = x1.shape[1] if refit_feat else None
         if bool(getattr(args, 'head_standardize', False)):
-            mean = x1.mean(dim=0)
-            std = x1.std(dim=0) + 1e-8
+            if refit_feat:
+                # 标准化只定义在 z_op 半区；锚半区统计量置恒等
+                # （mean=0/std=1），部署时其贡献被置零权重消掉
+                mean = torch.cat([x1.mean(dim=0),
+                                  torch.zeros(half, device=x1.device,
+                                               dtype=x1.dtype)])
+                std = torch.cat([x1.std(dim=0) + 1e-8,
+                                 torch.ones(half, device=x1.device,
+                                            dtype=x1.dtype)])
+            else:
+                mean = x1.mean(dim=0)
+                std = x1.std(dim=0) + 1e-8
             head = _A5StandardizedChead(label_num, mean, std,
                                        hidden=A5_REFIT_HIDDEN,
                                        dropout=A5_REFIT_DROPOUT)
         else:
             head = Chead(label_num, dropout=A5_REFIT_DROPOUT)
+        if refit_feat:
+            x1 = torch.nn.functional.pad(x1, (0, half))
         head.to(self.device)
         head.train()
         opt = torch.optim.Adam(head.parameters(), lr=A5_REFIT_LR,
@@ -683,10 +712,14 @@ class Client_DF(object):
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
+        if refit_feat:
+            with torch.no_grad():
+                head.head[0].weight[:, half:] = 0.0
         print('[A5-v2] client %d task %d round %d: refit head on %d train '
-              'rows (standardize=%s)'
+              'rows (standardize=%s, input=%s)'
               % (self.id, task_id, round_id, n,
-                 bool(getattr(args, 'head_standardize', False))))
+                 bool(getattr(args, 'head_standardize', False)),
+                 'feat' if refit_feat else 'x1'))
         return head
 
     def _a5_post_phase2_interface(self, round, args):
