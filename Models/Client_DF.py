@@ -155,6 +155,26 @@ class Client_DF(object):
             self._a2_anchor_snapshot = None   # frozen anchor rows (arm anchor/both)
             self._a2_task_id = None           # task the current protection belongs to
 
+        # PSC (--psc, RUNCOMMANDS Sec.25): prompt-space consolidation state.
+        # Deliberately INDEPENDENT of the fedta_a2 method gate — PSC works
+        # on the frozen fedta baseline (and arms built on it). Attributes are
+        # only created when --psc is on; the baseline __init__ is untouched.
+        self._psc_on = bool(getattr(args, 'psc', False))
+        if self._psc_on:
+            self._psc_core_slots = set()       # broadcast by the server each round
+            self._psc_residual_slots = None     # LongTensor: rows frozen this task
+            self._psc_key_snapshot = None      # prompt_key rows (residual only)
+            self._psc_prompt_snapshot = None   # prompt content rows (residual only)
+            self._psc_task_id = None           # task the current freeze belongs to
+            # laziness evidence (A2 combo lesson): a frozen row that is never
+            # routed to is a no-op freeze. These counters make the residual
+            # rows' routing traffic visible per round (read-only, detached,
+            # RNG-free; logged at the end of train()).
+            self._psc_hit_batches = 0
+            self._psc_hit_samples = 0
+            self._psc_total_samples = 0
+            self._psc_hit_rows = set()
+
         self.head = Chead(args.nb_classes)
 
         # A5-v2（RUNCOMMANDS §23）：joint-head 轨迹 + 开关旗标（args 派
@@ -208,6 +228,12 @@ class Client_DF(object):
             # key / anchor state. No-op for task 0 (empty protection set).
             if self.method == 'fedta_a2':
                 self._a2_init_task_protection(args)
+            # PSC: entering a new task -> recompute the old-task emergent
+            # prompt-row support under the CURRENT (post-consolidation
+            # broadcast) key and freeze the residual rows (support minus
+            # core). No-op for task 0 (empty support).
+            if self._psc_on:
+                self._psc_init_task_protection(args)
 
     def _a2_init_task_protection(self, args):
         """A2: compute the protected slot set and row snapshots at task start.
@@ -319,6 +345,182 @@ class Client_DF(object):
             self.model.key.data[self._a2_protected_slots] = self._a2_key_snapshot
         if self.a2_arm in ('anchor', 'both') and self._a2_anchor_snapshot is not None:
             self.model.anchor_pool.data[self._a2_protected_slots] = self._a2_anchor_snapshot
+
+    # ------------------------------------------------------------------
+    # PSC (--psc, RUNCOMMANDS Sec.25): residual-row freeze on the PROMPT
+    # interface. Reuses the A2 machinery (task-start snapshot + post-step
+    # restore == freeze + weight-decay exemption) but with a different row
+    # set and a different interface: prompt_key rows + prompt content rows
+    # of the ViT Global_Prompt, instead of the Tail_Anchor key/anchor rows.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _psc_l2_normalize(x, dim, epsilon=1e-12):
+        """Global_Prompt.l2_normalize, replicated locally so the PSC paths do
+        not depend on the prompt module object being loaded at call time."""
+        square_sum = torch.sum(x ** 2, dim=dim, keepdim=True)
+        x_inv_norm = torch.rsqrt(
+            torch.maximum(square_sum, torch.tensor(epsilon, device=x.device)))
+        return x * x_inv_norm
+
+    def _psc_prompt_top1(self, cls_features, prompt_key):
+        """Per-sample top-1 routing destinations on the prompt interface
+        (l2-normalized cls_features vs l2-normalized prompt_key rows) — the
+        same query space Global_Prompt.forward uses (embedding_key='cls').
+        Read-only, detached, RNG-free. Note: with the official
+        batchwise_prompt=True + top_k=1 the training forward routes each
+        batch by majority vote; the per-sample top-1 union is the D0-style
+        emergent-support definition (same convention as A2, applied to the
+        prompt interface)."""
+        x_norm = self._psc_l2_normalize(cls_features.detach(), dim=1)
+        key_norm = self._psc_l2_normalize(prompt_key.detach(), dim=1)
+        similarity = torch.matmul(x_norm, key_norm.t())
+        return torch.argmax(similarity, dim=1)
+
+    def _psc_init_task_protection(self, args):
+        """PSC: at task start, compute the old-task emergent prompt-row
+        support = union over completed tasks t' < task_id of the per-sample
+        top-1 prompt destinations of their train-split cls features under
+        the CURRENT prompt key (= the post-consolidation broadcast). Rows in
+        the support EXCEPT the server-broadcast core rows are the residual
+        set: their prompt_key + prompt content rows are snapshotted once and
+        restored after every phase-1 optimizer step for the whole task, so
+        old-task discriminative directions are locked while core rows keep
+        taking cross-task training signal.
+
+        The feature pass is RNG-neutral (A2 convention): sequential loader +
+        four-stream RNG snapshot/restore; only original_model is touched
+        (the routing query is its pre_logits — no ViT forward needed)."""
+        self._psc_task_id = self.task_id
+        completed = [t for t in range(self.task_id)
+                     if t in self.data_split_indices]
+        if not completed or self.prompts is None:
+            self._psc_residual_slots = None
+            self._psc_key_snapshot = None
+            self._psc_prompt_snapshot = None
+            if self.task_id == 0:
+                print(f'[PSC] client {self.id} task 0: no old tasks, '
+                      f'no residual freeze')
+            return
+
+        rng_state = {
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda_all": (torch.cuda.get_rng_state_all()
+                               if torch.cuda.is_available() else None),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+        }
+        orig_was_training = self.original_model.training
+        try:
+            self.original_model.eval()
+            self.original_model.to(self.device)
+            prompt_key = self.prompts.prompt_key.detach().to(self.device)
+
+            hit_rows = []
+            for t in completed:
+                dataset = Subset(self.train_data[t],
+                                 self.data_split_indices[t]["train"])
+                loader = DataLoader(dataset, batch_size=16, num_workers=0,
+                                    shuffle=False)
+                feats = []
+                for input, _target in loader:
+                    input = input.to(self.device, non_blocking=True)
+                    with torch.no_grad():
+                        cls_features = self.original_model(input)['pre_logits']
+                    feats.append(cls_features.to(self.device))
+                if not feats:
+                    continue
+                hit_rows.append(
+                    self._psc_prompt_top1(torch.cat(feats, dim=0),
+                                          prompt_key))
+
+            if hit_rows:
+                support = torch.unique(torch.cat(hit_rows))
+            else:
+                support = torch.empty(0, dtype=torch.long,
+                                     device=self.device)
+            core = torch.tensor(sorted(self._psc_core_slots),
+                               dtype=torch.long, device=self.device) \
+                if self._psc_core_slots else None
+            if core is not None and support.numel():
+                mask = ~torch.isin(support, core)
+                residual = support[mask]
+            else:
+                residual = support
+
+            self._psc_residual_slots = (residual.to(self.device)
+                                         if residual.numel() else None)
+            if self._psc_residual_slots is not None:
+                rows = self._psc_residual_slots
+                self._psc_key_snapshot = (
+                    self.prompts.prompt_key.detach()[rows].clone())
+                self._psc_prompt_snapshot = (
+                    self.prompts.prompt.detach()[rows].clone())
+            else:
+                self._psc_key_snapshot = None
+                self._psc_prompt_snapshot = None
+            n_support = int(support.numel())
+            n_res = 0 if self._psc_residual_slots is None \
+                else int(self._psc_residual_slots.numel())
+            print(f'[PSC] client {self.id} task {self.task_id}: old-task '
+                  f'support {n_support}/{prompt_key.shape[0]} rows, core '
+                  f'{len(self._psc_core_slots)}, residual frozen '
+                  f'{n_res}/{prompt_key.shape[0]} rows')
+        finally:
+            self.original_model.train(orig_was_training)
+            torch.set_rng_state(rng_state["torch_cpu"])
+            if rng_state["torch_cuda_all"] is not None:
+                torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+
+    def _psc_post_step_restore(self):
+        """PSC: restore residual prompt rows after a phase-1 optimizer step.
+        Only called when --psc is on; phase-2 (Tail_Anchor optimizer) never
+        touches the ViT prompt pool, so no phase-2 hook is needed."""
+        if (self._psc_residual_slots is None
+                or self._psc_task_id != self.task_id):
+            return
+        prompts = self.vit.get_prompts()
+        prompts.prompt_key.data[self._psc_residual_slots] = \
+            self._psc_key_snapshot
+        prompts.prompt.data[self._psc_residual_slots] = \
+            self._psc_prompt_snapshot
+
+    def _psc_count_route_hits(self, cls_features):
+        """PSC laziness evidence: count how much routing traffic the frozen
+        residual rows actually receive from the CURRENT task's batches
+        (per-sample top-1, detached, RNG-free). A2 combo lesson: a freeze
+        whose rows are never routed to is a silent no-op — these counters
+        make that visible in the round log."""
+        if (self._psc_residual_slots is None
+                or self._psc_task_id != self.task_id):
+            return
+        top1 = self._psc_prompt_top1(
+            cls_features, self.vit.get_prompts().prompt_key)
+        rows = self._psc_residual_slots
+        hit = (top1.unsqueeze(1) == rows.unsqueeze(0)).any(dim=1)
+        self._psc_hit_batches += 1
+        self._psc_hit_samples += int(hit.sum().item())
+        self._psc_total_samples += int(top1.numel())
+        self._psc_hit_rows.update(
+            int(r) for r in top1[hit].cpu().tolist())
+
+    def _psc_log_round(self, round):
+        """PSC: per-round residual traffic log + counter reset."""
+        n_res = 0 if self._psc_residual_slots is None \
+            else int(self._psc_residual_slots.numel())
+        if n_res == 0:
+            return
+        print(f'[PSC] client {self.id} task {self.task_id} round {round}: '
+              f'residual rows hit by {self._psc_hit_samples}/'
+              f'{self._psc_total_samples} samples '
+              f'({len(self._psc_hit_rows)}/{n_res} distinct rows, '
+              f'laziness check)')
+        self._psc_hit_batches = 0
+        self._psc_hit_samples = 0
+        self._psc_total_samples = 0
+        self._psc_hit_rows = set()
 
     def _phase2_train_step(self, input, target, round, args, criterion,
                            optimizer):
@@ -447,6 +649,10 @@ class Client_DF(object):
                         output = self.original_model(input)
                         cls_features = output['pre_logits']
                 output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True)
+                # PSC: laziness evidence — count current-task routing
+                # traffic into the frozen residual rows (read-only).
+                if self._psc_on:
+                    self._psc_count_route_hits(cls_features)
                 # pre, output_mixed, pull_off2 = self.model(output['feat'].to(self.device), target.to(self.device))
                 # logits = pre
                 logits = output['logits']
@@ -499,6 +705,11 @@ class Client_DF(object):
                 loss.backward()
                 # torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip_grad)
                 optimizer.step()
+                # PSC: restore residual prompt rows after the phase-1
+                # optimizer step (post-step restore == freeze + weight-decay
+                # exemption; the official optimizer is never modified).
+                if self._psc_on:
+                    self._psc_post_step_restore()
 
         ###evaluate###
 
@@ -522,6 +733,9 @@ class Client_DF(object):
                 self._phase2_train_step(input, target, round, args,
                                         criterion, optimizer)
 
+        # PSC: per-round residual-row traffic log (laziness evidence)
+        if self._psc_on:
+            self._psc_log_round(round)
 
         target_list = []
         feature_list = []
@@ -1035,7 +1249,77 @@ class Client_DF(object):
         if self._a5_refit_or_consolidate:
             state["a5_joint_head"] = module_state_or_none(self._a5_joint_head)
 
+        # PSC（--psc，RUNCOMMANDS Sec.25）：residual 行冻结状态。schema 仅
+        # ON 臂新增 key（frozen 基线 checkpoint 逐位不变）。必须存 task-start
+        # 快照：mid-task resume 时按 D0 支持重算会从已漂移的 key 得到错误
+        # 的 residual 集合。
+        if self._psc_on:
+            state["psc_state"] = self._psc_state_for_checkpoint()
+
         return state
+
+    def _psc_state_for_checkpoint(self):
+        """Serialize PSC freeze state (only called when --psc is on)."""
+        return {
+            "task_id": self._psc_task_id,
+            "core_slots": sorted(self._psc_core_slots),
+            "residual_slots": (None if self._psc_residual_slots is None
+                               else self._psc_residual_slots.cpu().tolist()),
+            "key_snapshot": (None if self._psc_key_snapshot is None
+                             else self._psc_key_snapshot.detach().cpu()),
+            "prompt_snapshot": (None if self._psc_prompt_snapshot is None
+                                else self._psc_prompt_snapshot.detach().cpu()),
+        }
+
+    def _psc_load_checkpoint_state(self, state):
+        """Restore PSC freeze state, FAIL-CLOSED (A2 convention).
+
+        A --psc resume from a checkpoint without psc_state would silently
+        continue as an unprotected run (wrong arm semantics, wrong science)
+        — refuse instead. Also cross-checked against the server-side
+        psc_state on the Server_DF loader.
+        """
+        if not self._psc_on:
+            return
+        psc = state.get("psc_state")
+        if not psc:
+            raise RuntimeError(
+                f"client {self.id}: --psc resume requires psc_state in the "
+                f"checkpoint, got "
+                f"{'missing key' if 'psc_state' not in state else 'None/empty'}"
+                f" — refusing to silently continue without the residual "
+                f"freeze (fail-closed; re-run from scratch or use a --psc "
+                f"checkpoint)")
+        if psc.get("task_id") != state.get("task_id"):
+            raise RuntimeError(
+                f"client {self.id}: PSC freeze task_id "
+                f"({psc.get('task_id')}) != checkpoint task_id "
+                f"({state.get('task_id')}); corrupted psc_state")
+        self._psc_task_id = psc.get("task_id")
+        self._psc_core_slots = set(psc.get("core_slots", []))
+        slots = psc.get("residual_slots")
+        self._psc_residual_slots = (
+            None if slots is None
+            else torch.tensor(slots, dtype=torch.long,
+                              device=self.device))
+        key_snap = psc.get("key_snapshot")
+        prompt_snap = psc.get("prompt_snapshot")
+        if slots is not None:
+            n = len(slots)
+            if key_snap is None or key_snap.shape[0] != n:
+                raise RuntimeError(
+                    f"client {self.id}: psc_state requires a key_snapshot "
+                    f"with {n} rows, got "
+                    f"{'None' if key_snap is None else key_snap.shape[0]}")
+            if prompt_snap is None or prompt_snap.shape[0] != n:
+                raise RuntimeError(
+                    f"client {self.id}: psc_state requires a "
+                    f"prompt_snapshot with {n} rows, got "
+                    f"{'None' if prompt_snap is None else prompt_snap.shape[0]}")
+        self._psc_key_snapshot = (None if key_snap is None
+                                  else key_snap.to(self.device))
+        self._psc_prompt_snapshot = (None if prompt_snap is None
+                                      else prompt_snap.to(self.device))
 
     def _a2_state_for_checkpoint(self):
         """Serialize A2 protection state; always a dict for fedta_a2,
@@ -1191,6 +1475,10 @@ class Client_DF(object):
         # Phase 4 A2: restore protection snapshot AFTER task_id is restored,
         # so update_data() does not recompute it mid-task.
         self._a2_load_checkpoint_state(state)
+
+        # PSC: same discipline — restore the residual freeze AFTER task_id
+        # is restored, so update_data() does not recompute it mid-task.
+        self._psc_load_checkpoint_state(state)
 
     def rebuild_data_from_indices(self):
         """Rebuild test_loader[0..task_id] and the current traindata from the

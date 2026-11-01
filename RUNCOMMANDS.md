@@ -992,3 +992,98 @@ diagnostics_output/
 - 规则：**一个诊断脚本一个家族目录**；文件名保留脚本默认名（不二次改名，保持 `--out_*` 兼容）；
 - 新诊断脚本必须支持 `--out_csv/--out_json` 并默认写入自己的家族目录，不允许平铺到根；
 - 判读引用路径一律以本节为准；本文档历史路径已于 2026-10-29 批量更新。
+
+## 25. PSC：prompt 子空间巩固（2026-11-01 预注册，已开工）
+
+> 结构级创新（用户定案：非修复级、须与 M2' 正交可叠加、不破坏时间/空间保留率）。用户 2026-11-01 批准执行顺序：改代码 → 短程判据臂（用户跑）→ t1 边界 oracle refit 探针（我读 checkpoint 跑）。
+
+### 25.1 方法定义（实现即本节，代码为准）
+
+**动机与对象**：prompt 池（`--size 100`，cls-key 硬路由 top-1）中，跨任务/跨客户端长期承载相似语义的行被反复训练拉扯——旧任务的判别方向在后续任务训练中被覆盖。PSC 把池行显式分为两类：**core 行**（跨任务继续吃训练信号，承载公共方向）与 **per-task residual 行**（冻结锁旧任务判别方向，承载差异方向）。
+
+**轮流程**（基座逐位不动，全部挂在既有轮序上）：
+
+1. server 广播池（官方不变）+ 广播 core 行集合（`_psc_core_slots`，幂等）；
+2. 客户端 task 开始（`update_data`）时计算旧任务 emergent 支撑：全部旧任务 t'<t 的 train split 过 `original_model` 取 cls features → 在**当前** key 下 per-sample top-1 路由并集 = S_old；residual = S_old − core（A2 机器同构，行集合换成 prompt 接口行）；四流 RNG 快照后冻结 residual 行的 prompt_key + prompt 内容；
+3. 本地 phase-1/phase-2 照常训练；phase-1 每次 `optimizer.step()` 后把 residual 行恢复快照值（复用 A2 post-step restore 机器）；phase-2 与 BGPS/SIKF 不动；
+4. M2' refit 原样叠加（正交：M2' 动 heads[] 读出头，PSC 动 prompt 行 + 路由 key）；
+5. 上传对象零新增（官方四件套），server 照常 kd_fusion；
+6. **仅在任务边界融合轮**（`round_i % global_epoch == ge-2`，即每 task 最后一次融合；提交后广播恰为新 task 起点）执行 `consolidate_prompts()`。
+
+**合并语义（"公共方向入 core、差异方向入 residual、只合并不删除"）**：对候选对 (i,j), i<j：row i := (i+j)/2（prompt_key 与 prompt 内容都取平均）并标记为 core 行；**row j 原值不动**——旧任务路由到 j 的流量零扰动，差异方向保留在 residual 行中；无行删除 → span 不变性。已合并的行对不重复合并；共享行的对跳过（防 drift 滚回间接撤销先前已提交合并）。
+
+**测量协议（server 侧，RNG 中立）**：每次融合轮后，surrogate 数据上**全部已见类**并集（注意：非 kd_fusion 的当前类口径）做一次路由 pass（四流快照/恢复、shuffle=False、num_workers=0），得每行 top-1 邻域质心；行对相似度 = 质心余弦（O(P²)）。候选门：**连续 `--psc_streak` 个融合轮**相似度 ≥ `--psc_tau`（本轮无法测量的对——行已转 core 或邻域 <2——streak 必须重置，"连续"语义严格）；边界轮按 (sim, streak) 排序取 ≤ `--psc_max_merge` 对。
+
+**drift 滚回门**：合并前后各测一次 per-sample top-1；变化中**非纯 i↔j 交换**（既抓"离开对"也抓"被偷流量"，对称定义）的比例 > `--psc_drift` → 恢复行 i、streak 清零、该对滚回不提交。
+
+**惰性证据日志（A2 组合臂教训，判读必查）**：客户端 phase-1 每批次统计 residual 行 top-1 命中（样本数/去重行数），轮末打印 `[PSC] ... (laziness check)`——冻结行若从不被路由到 = 无效冻结，判读时以此为否决证据。
+
+**fail-closed**：`--psc` 与 `--method fedta_a2` 互斥（A2 已判死，惰性保护教训）、与 `--route_fix` 互斥；`--psc_max_merge < 0` 拒绝启动；resume 时 ON 臂缺 `psc_state`（server 侧 core_slots/pair_streak/merged_pairs；client 侧 task_id/core_slots/residual_slots/key_snapshot/prompt_snapshot）双侧拒绝；`RESUME_MUST_MATCH` 增补 `psc/psc_tau/psc_streak/psc_max_merge/psc_drift` 五键（跨 ON/OFF 与跨参数 resume 均拒绝）。checkpoint schema 仅 ON 臂新增 `psc_state` key，frozen 基线逐位不变。
+
+**默认参数（首次注册即默认）**：`--psc_tau 0.95` / `--psc_streak 3` / `--psc_max_merge 2` / `--psc_drift 0.05`。
+
+### 25.2 短程判据臂（预注册）
+
+双臂对照 + 探针天花板比较。PSC 机制需 ≥2 任务才有旧任务 residual（task-0 内同任务合并除外），判据臂 = t0+t1 两任务（`--max_rounds 10`）：
+
+```bash
+# cifar 臂 A：M2' + PSC
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --psc --max_rounds 10 \
+    --run_name cifar_psc_M2p_psc_t1
+
+# cifar 臂 B：M2' 对照（同协议去 --psc）
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --max_rounds 10 \
+    --run_name cifar_psc_M2p_ctrl_t1
+
+# cifar 安全臂（可选，先行）：T0 单任务，验证 PSC 在 T0 近 no-op 不掉点
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --psc --max_rounds 5 \
+    --run_name cifar_psc_M2p_psc_t0
+
+# INR 臂 A/B：划分复刻 inr_a5v2_M2_feat（task_num 10 / private 20 / surrogate 默认 20）
+python main.py datasets_delay --data_name ImageNet-R --data-path ./local_datasets \
+    --client_num 5 --task_num 10 --private_class_num 20 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --psc --max_rounds 10 \
+    --run_name inr_psc_M2p_psc_t1
+# INR 臂 B = 同上去掉 --psc，--run_name inr_psc_M2p_ctrl_t1
+```
+
+全轨迹臂（GREEN 后再跑，2×2：PSC-only / PSC+M2'，同 §2/§3 模板去 `--max_rounds`）。
+
+### 25.3 判读表（预注册）
+
+| 判读项 | 口径 | 判据 |
+|---|---|---|
+| T0 安全 | 安全臂 T0 边界 corrected vs 已有 M2' T0（cifar_a5v2_M2_feat） | 差 ≥ −0.3pp（PSC 在 T0 至多同任务内合并，预期近 no-op；跌破则查合并日志是否 task-0 行被误并） |
+| t0 段不掉（A vs B） | 两臂 round 4（T0 边界）corrected AA | 差 ≥ −0.3pp（A2 教训：掉点即 RED，机制有反作用） |
+| 惰性证据 | A 臂 train.log `[PSC] ... laziness check` | task 1 各轮 residual 行命中样本数 > 0；恒 0 → 冻结无效，RED（不许以"无害"名义放行） |
+| 探针天花板（主判读） | 两臂 t1 边界 checkpoint（round_0009）oracle refit 探针（§21 head_retrain 家族，corrected） | A 臂天花板 ≥ B 臂 + 0.3pp → GREEN（合并应释放 core 容量给新任务、residual 锁旧方向 → 新任务天花板更高且旧任务不掉） |
+| t1 段直接效应 | 两臂 round 9 corrected AA | A − B 作参考量级（非 Gate；短程两任务效应 < 全轨迹） |
+
+预注册预案：天花板 GREEN 但 t1 直接效应 ≈0 → 照跑全轨迹 2×2（短程不敏感属预期，机制红利在长任务流）；天花板 RED → PSC 判死，只保留 §25.5 披露。
+
+### 25.4 实现清单与单测（本次 commit）
+
+1. `config/datasets_delay.py`：`--psc` + `--psc_tau/--psc_streak/--psc_max_merge/--psc_drift` 五参数（各带 help）；
+2. `Models/Client_DF.py`：task-start 冻结（`_psc_init_task_protection`：旧任务支撑集 + residual 行四流快照）、phase-1 post-step restore（`_psc_post_step_restore`，复用 A2 机器）、惰性计数（`_psc_count_route_hits`/`_psc_log_round`，只挂钩主流 train()，train_only_prompts 故意不挂）、checkpoint `psc_state`（ON 臂新增，OFF 逐位不变）+ fail-closed load；
+3. `Models/Server_DF.py`：`consolidate_prompts()`（边界轮 streak 候选 → 快照 → 逐对合并 → drift 门滚回 → 提交）、`_psc_surrogate_routing`（RNG 中立测量 pass，全部已见类）、`_psc_seen_classes`、core 集合每轮广播、F3 互斥/参数校验、RESUME_MUST_MATCH +5 键、checkpoint 存取 + fail-closed resume；
+4. `tests/test_psc_consolidation.py`（6 测试全 PASS）：T1 streak+边界合并提交、T2 drift 滚回、T3 max_merge+共享行排除、T4 邻域萎缩 streak 重置、T5 客户端冻结 restore/top1 尺度不变/stale-task no-op、T6 merge-only 不变量（j 行原值保留）；
+5. 回归：test_a5v2_refit_switches（修复 TestRefitInputFeat 漏 skipUnless 的 3 个 CUDA 测试）/test_route_ablation_switches/test_track_e_and_b2/test_global_head_rebuild/test_diag_utils_compat 全绿。
+
+### 25.5 已知边界与诚实披露
+
+1. 相似度是 surrogate 代理测量（cls features 上 top-1 邻域质心余弦），非各 client 真任务分布；τ=0.95 高阈值 + streak=3 + drift 滚回三重防假合并，但残余风险如实声明；
+2. 超参敏感性（τ/K/max_merge/δ）不在本判据臂范围，GREEN 后如需再议消融；
+3. 合并只动 prompt_key/prompt 两张表，anchor/表征侧与官方逐位一致；RNG 中立设计下 OFF = 逐位 no-op（单测覆盖），ON 时表征侧差异 100% 归因于 residual 冻结 + 边界合并；
+4. PSC 与 A2/route_fix 互斥是设计决定（A2 判死；route_fix 是修复级）——不是能力缺失；
+5. residual 冻结会让旧任务方向在 t1 内不被新任务训练覆写，但若 S_old 支撑集随任务数增长逼近全池，residual 比例会膨胀（core 容量被挤占）——探针天花板判读正是对这一点的直接检验；
+6. 结果阶梯参照（全轨迹 corrected 终值，本判据臂的直接背景）：cifar base 75.04 / M2' 93.08 / oracle 96.21；INR base 77.12 / M2' 81.93 / oracle 84.82——PSC 的主张空间 = M2' 与 oracle 之间的差距部分归因于 prompt 池方向覆写。

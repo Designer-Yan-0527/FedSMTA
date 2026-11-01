@@ -454,11 +454,13 @@ class TestFailClosed(unittest.TestCase):
                                      client._a5_joint_head.state_dict()))
 
 
+@unittest.skipUnless(_CUDA, "Tail_Anchor.forward hardcodes .to('cuda')")
 class TestRefitInputFeat(unittest.TestCase):
     """A5-v2 §23.6-1 修复臂（--refit_input feat，INR 双探针诊断
     2026-10-29 预注册判读的落地）：refit 输入 = 768 维 pre-anchor z_op，
     部署为 1536 输入、锚半区权重硬置零的头——evaluate/checkpoint/resume
-    路径与 x1 臂完全同构（state keys 不变）。"""
+    路径与 x1 臂完全同构（state keys 不变）。与 TestRefitIsolationRngNeutral
+    同理：这些 hook 级测试经真实 Tail_Anchor 前向，需要 CUDA（repo 在 GPU 跑）。"""
 
     def _hook_args(self, **flags):
         base = dict(nb_classes=20, seed=7, head_refit=False,

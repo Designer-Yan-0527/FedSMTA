@@ -264,6 +264,58 @@ def get_args_parser(subparsers):
                                  'z_op), so evaluate/checkpoint/resume paths are '
                                  'unchanged. Fail-closed: requires --head_refit or '
                                  '--interface_consolidate.')
+    # ------------------------------------------------------------------
+    # PSC: prompt-space consolidation (RUNCOMMANDS Sec.25). Structural
+    # innovation: the prompt pool is split into CORE rows (cross-task /
+    # cross-client, keep taking training signal) + per-task RESIDUAL rows
+    # (old-task discriminative directions, frozen during later tasks via
+    # A2-style post-step restore). The server merges functionally
+    # redundant rows into shared core directions at task-boundary fusion
+    # rounds (surrogate routing-neighborhood similarity, K-round streak,
+    # per-round cap, drift rollback gate). Default OFF = official,
+    # bit-identical.
+    # ------------------------------------------------------------------
+    subparsers.add_argument('--psc', action='store_true',
+                            help='PSC prompt-space consolidation (default OFF = '
+                                 'official, bit-identical): (1) client side, at '
+                                 'task start the old-task emergent prompt-row '
+                                 'support (union of per-sample top-1 routing '
+                                 'destinations of completed tasks train splits '
+                                 'under the current prompt key) is computed; '
+                                 'rows in that support EXCEPT core rows are '
+                                 'frozen for the whole task via post-step restore '
+                                 '(A2 machinery, different row set: prompt_key '
+                                 'rows + prompt content rows, independent of the '
+                                 'fedta_a2 method gate); (2) server side, at '
+                                 'every SIKF fusion round the row-pair functional '
+                                 'similarity (routing-neighborhood centroid '
+                                 'cosine on surrogate data) is measured, and at '
+                                 'task-boundary fusion rounds pairs that stayed '
+                                 '>= --psc_tau for >= --psc_streak consecutive '
+                                 'fusion rounds are merged (common direction -> '
+                                 'core row, the residual row keeps its value; '
+                                 'merge-only, no deletion), capped at '
+                                 '--psc_max_merge pairs per round with a '
+                                 'top-1-routing drift rollback gate '
+                                 '(--psc_drift). See RUNCOMMANDS.md Sec.25.')
+    subparsers.add_argument('--psc_tau', default=0.95, type=float,
+                            help='PSC row-pair functional-similarity threshold: '
+                                 'cosine between routing-neighborhood centroids '
+                                 'on surrogate data. A pair is a merge candidate '
+                                 'when its similarity stays >= tau for '
+                                 '--psc_streak consecutive fusion rounds.')
+    subparsers.add_argument('--psc_streak', default=3, type=int,
+                            help='PSC K: consecutive fusion rounds a pair must '
+                                 'stay >= --psc_tau before it becomes a merge '
+                                 'candidate at the task-boundary fusion round.')
+    subparsers.add_argument('--psc_max_merge', default=2, type=int,
+                            help='PSC per-round merge cap (pairs merged per '
+                                 'task-boundary fusion round, <=2 by design).')
+    subparsers.add_argument('--psc_drift', default=0.05, type=float,
+                            help='PSC rollback gate: a merge is rolled back when '
+                                 'the fraction of surrogate samples whose top-1 '
+                                 'prompt row moves OUT of the merged pair '
+                                 'exceeds this threshold.')
     subparsers.add_argument('--client_num', default=5, type=int,
                             help='the num of client')
     subparsers.add_argument('--task_num', default=5, type=int,

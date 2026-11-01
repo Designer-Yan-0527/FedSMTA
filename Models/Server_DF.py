@@ -119,6 +119,32 @@ class Server_DF(object):
                 "--refit_input feat requires --head_refit or "
                 "--interface_consolidate (nothing to refit; "
                 "fail-closed, RUNCOMMANDS Sec.23.6-1)")
+
+        # PSC fail-closed（RUNCOMMANDS Sec.25）：未验证组合拒绝启动，
+        # 不允许静默跑出不可判读的臂
+        if bool(getattr(args, 'psc', False)):
+            if self.method == 'fedta_a2':
+                raise SystemExit(
+                    "--psc is mutually exclusive with --method fedta_a2 "
+                    "(A2 is a judged-dead arm; the A2+PSC combination was "
+                    "never validated; fail-closed, RUNCOMMANDS Sec.25)")
+            if bool(getattr(args, 'route_fix', False)):
+                raise SystemExit(
+                    "--psc is mutually exclusive with --route_fix "
+                    "(soft-routing weights change the merge/neighborhood "
+                    "semantics; the combination was never validated; "
+                    "fail-closed, RUNCOMMANDS Sec.25)")
+            if int(getattr(args, 'psc_max_merge', 2)) < 0:
+                raise SystemExit(
+                    "--psc_max_merge must be >= 0 (got "
+                    f"{args.psc_max_merge}; fail-closed, RUNCOMMANDS Sec.25)")
+
+        # PSC server-side consolidation state（--psc OFF 时全部闲置，
+        # 官方轨迹逐位不变）
+        self.psc_on = bool(getattr(args, 'psc', False))
+        self._psc_core_slots = []     # sorted row ids designated CORE
+        self._psc_pair_streak = {}    # "i|j" -> consecutive similar fusion rounds
+        self._psc_merged_pairs = []   # "i|j" already merged (never re-merge)
     def init_client(self):
         print('Initialize clients')
         for i in range(self.client_num):    #
@@ -246,6 +272,19 @@ class Server_DF(object):
                         _src.prompt_key)
             if _fusion_ran:
                 self.kd_fusion_prompt(self.thisclients, round_i=i)
+                # PSC: consolidation only runs on fusion rounds (self.prompt
+                # is fresh); merges commit at task-boundary fusion rounds
+                # (rounds i%ge==ge-2, the LAST fusion of a task), so the
+                # merged broadcast is exactly what the next task starts
+                # from and the task-start freeze snapshots are coherent.
+                if self.psc_on:
+                    self.consolidate_prompts(i)
+            # PSC: broadcast the core-row set every round (idempotent; the
+            # clients consume it at task start via _psc_init_task_protection)
+            if self.psc_on:
+                _psc_core = set(self._psc_core_slots)
+                for j in range(self.client_num):
+                    self.clients[j]._psc_core_slots = _psc_core
             if self.route_audit_logger is not None and self.prompt is not None:
                 self.route_audit_logger.log_key_snapshot(
                     i, "post_fusion", None, self.prompt.prompt_key,
@@ -766,7 +805,240 @@ class Server_DF(object):
             print('prompt fusion complete')
         return my_result
 
+    # ------------------------------------------------------------------
+    # PSC (--psc, RUNCOMMANDS Sec.25): server-side prompt consolidation.
+    # The fused broadcast prompt's rows are merged into shared CORE
+    # directions when they are functionally redundant, so later tasks
+    # reuse the common directions (core rows keep training) while the
+    # old-task nuance stays locked in the residual rows (frozen at the
+    # clients via the A2-style post-step restore).
+    # ------------------------------------------------------------------
 
+    @staticmethod
+    def _psc_l2_rows(key):
+        """Global_Prompt.l2_normalize semantics, row-wise (the routing
+        normalizes both the query and the key rows)."""
+        sq = torch.sum(key ** 2, dim=1, keepdim=True)
+        return key * torch.rsqrt(
+            torch.maximum(sq, torch.tensor(1e-12, device=key.device)))
+
+    def _psc_seen_classes(self):
+        """Union of class masks of all clients over all SEEN tasks
+        (t <= current task_id) — the surrogate universe for the PSC
+        neighborhood measurement. Old-task rows must be measured on
+        old-task queries, so this is NOT restricted to the current task
+        (unlike the kd_fusion loader, which only loads current-task
+        classes)."""
+        classes = set()
+        for mask_per_client in self.class_mask:
+            for t in range(self.task_id + 1):
+                classes |= set(mask_per_client[t])
+        return sorted(classes)
+
+    def _psc_surrogate_routing(self):
+        """One RNG-neutral surrogate pass under the CURRENT fused prompt:
+        per-sample top-1 prompt routing (l2-normalized cls features vs
+        l2-normalized prompt_key rows, per-sample top-1 = the D0-style
+        support convention) + per-row neighborhood centroids of the
+        routing queries. Read-only w.r.t. the prompt.
+
+        RNG-neutral: the official kd_fusion loader legitimately consumes
+        the RNG stream (shuffle=True); this measurement pass must NOT
+        shift it (four-stream snapshot/restore, sequential loader,
+        no workers)."""
+        if self.prompt is None:
+            return None
+        prompt = self.prompt
+        P = prompt.prompt_key.shape[0]
+        rng_state = rng_state_dict()
+        orig_was_training = self.origin_model.training
+        try:
+            self.origin_model.eval()
+            self.origin_model.to(self.device)
+            self.surrogate_data.getTrainData(self._psc_seen_classes())
+            loader = DataLoader(self.surrogate_data,
+                                batch_size=self.batch_size,
+                                shuffle=False, num_workers=0)
+            feats = []
+            for _index, x, _y in loader:
+                x = x.to(self.device, non_blocking=True)
+                with torch.no_grad():
+                    cf = self.origin_model(x)['pre_logits']
+                feats.append(cf.to(self.device))
+            if not feats:
+                return None
+            cf = torch.cat(feats, dim=0)
+        finally:
+            self.origin_model.train(orig_was_training)
+            restore_rng_state(rng_state)
+
+        key_norm = self._psc_l2_rows(prompt.prompt_key.detach())
+        x_norm = self._psc_l2_rows(cf)
+        similarity = torch.matmul(x_norm, key_norm.t())
+        top1 = torch.argmax(similarity, dim=1)
+        counts = torch.zeros(P, dtype=torch.long, device=cf.device)
+        counts.scatter_add_(0, top1, torch.ones_like(top1))
+        centroids = torch.zeros(P, cf.shape[1], device=cf.device)
+        centroids.index_add_(0, top1, cf)
+        nonempty = counts > 0
+        centroids[nonempty] = (
+            centroids[nonempty]
+            / counts[nonempty].unsqueeze(1).float())
+        return {
+            "x_norm": x_norm,
+            "top1": top1,
+            "counts": counts,
+            "centroids": centroids,
+            "n_samples": int(top1.numel()),
+        }
+
+    def consolidate_prompts(self, round_i):
+        """PSC consolidation step (called right after kd_fusion on fusion
+        rounds, RUNCOMMANDS Sec.25).
+
+        Every fusion round: measure the row-pair functional similarity —
+        cosine between routing-neighborhood centroids on the surrogate
+        seen-class queries — and maintain the consecutive-round streaks.
+
+        Task-boundary fusion rounds (round_i % global_epoch == ge-2, the
+        LAST fusion of a task, so the merged broadcast is exactly what the
+        next task starts from): pairs whose streak >= --psc_streak AND
+        whose current similarity >= --psc_tau are merge candidates.
+        Merging a pair (i, j), i < j: row i becomes a CORE row carrying
+        the common direction (prompt_key[i] and prompt[i] := average of
+        the two rows) while the residual row j keeps its EXACT value
+        (merge-only, no deletion: old-task traffic routed to j is
+        untouched; the difference direction stays in the residual row).
+        Each merge is gated by a top-1-routing drift check on the same
+        surrogate queries: the fraction of samples whose top-1 row changed
+        in a way that is NOT a pure i<->j swap must stay <= --psc_drift,
+        otherwise the merge is rolled back from the pre-merge snapshot.
+        At most --psc_max_merge pairs commit per round; pairs sharing a
+        row with an already-committed merge are skipped (a later rollback
+        must never undo an earlier committed merge)."""
+        is_boundary = (round_i % self.global_epoch
+                       == self.global_epoch - 2)
+        meas = self._psc_surrogate_routing()
+        if meas is None:
+            print(f'[PSC] round {round_i}: no surrogate queries, '
+                  f'consolidation skipped')
+            return
+        prompt = self.prompt
+        P = prompt.prompt_key.shape[0]
+        tau = float(getattr(self.args, 'psc_tau', 0.95))
+        streak_k = int(getattr(self.args, 'psc_streak', 3))
+        max_merge = int(getattr(self.args, 'psc_max_merge', 2))
+        drift_gate = float(getattr(self.args, 'psc_drift', 0.05))
+        # singleton neighborhoods carry no usable moment information
+        MIN_NEIGHBORHOOD = 2
+
+        core = set(self._psc_core_slots)
+        merged = set(self._psc_merged_pairs)
+        counts = meas["counts"]
+        # rows with measurable neighborhoods; core rows are never merge
+        # candidates (the shared basis must not be re-averaged)
+        measurable = [r for r in range(P)
+                      if r not in core and int(counts[r]) >= MIN_NEIGHBORHOOD]
+
+        # ---- streak update (every fusion round) ----
+        cent = meas["centroids"]
+        cent_norm = cent / (cent.norm(dim=1, keepdim=True) + 1e-12)
+        gram = cent_norm @ cent_norm.t()
+        n_similar = 0
+        measured_keys = set()
+        for a in range(len(measurable)):
+            i = measurable[a]
+            for b in range(a + 1, len(measurable)):
+                j = measurable[b]
+                key = f"{i}|{j}"
+                if key in merged:
+                    continue
+                measured_keys.add(key)
+                if float(gram[i, j]) >= tau:
+                    self._psc_pair_streak[key] = \
+                        self._psc_pair_streak.get(key, 0) + 1
+                    n_similar += 1
+                else:
+                    self._psc_pair_streak.pop(key, None)
+        # "consecutive" semantics: a pair that could not be measured this
+        # round (row became core / neighborhood shrank below the minimum)
+        # breaks the streak — drop stale entries so an old count can never
+        # resurrect a candidate after a gap
+        for stale in [k for k in self._psc_pair_streak
+                      if k not in measured_keys]:
+            self._psc_pair_streak.pop(stale, None)
+
+        if not is_boundary:
+            print(f'[PSC] round {round_i}: {len(measurable)} measurable '
+                  f'rows, {n_similar} pairs over tau, '
+                  f'{len(self._psc_pair_streak)} active streaks '
+                  f'(merge decision only at task-boundary fusion rounds)')
+            return
+
+        # ---- merge decision (task-boundary fusion round only) ----
+        candidates = []
+        for key, streak in self._psc_pair_streak.items():
+            if streak < streak_k:
+                continue
+            i_s, j_s = key.split('|')
+            sim = float(gram[int(i_s), int(j_s)])
+            if sim >= tau:
+                candidates.append((sim, key))
+        candidates.sort(reverse=True)
+        print(f'[PSC] round {round_i} (task-boundary fusion): '
+              f'{len(candidates)} merge candidates '
+              f'(streak>={streak_k}, sim>={tau}), cap {max_merge}')
+        if not candidates or max_merge <= 0:
+            return
+
+        # pre-merge snapshot (rollback target)
+        snap_key = prompt.prompt_key.detach().clone()
+        snap_prompt = prompt.prompt.detach().clone()
+
+        x_norm = meas["x_norm"]
+        committed = 0
+        used_rows = set()
+        for sim, key in candidates:
+            if committed >= max_merge:
+                break
+            i, j = (int(v) for v in key.split('|'))
+            if i in used_rows or j in used_rows:
+                continue
+            # pre-merge top-1 for THIS merge (earlier committed merges
+            # this round are part of the accepted state)
+            key_norm = self._psc_l2_rows(prompt.prompt_key.detach())
+            top1_pre = torch.argmax(x_norm @ key_norm.t(), dim=1)
+            # apply merge: common direction -> core row i; residual row j
+            # keeps its value (merge-only, no deletion)
+            prompt.prompt_key.data[i] = 0.5 * (
+                prompt.prompt_key.data[i] + prompt.prompt_key.data[j])
+            prompt.prompt.data[i] = 0.5 * (
+                prompt.prompt.data[i] + prompt.prompt.data[j])
+            key_norm = self._psc_l2_rows(prompt.prompt_key.detach())
+            top1_post = torch.argmax(x_norm @ key_norm.t(), dim=1)
+            # drift = top-1 changes that are NOT pure i<->j swaps (leaving
+            # the pair breaks old-task routing; entering the pair steals
+            # traffic from other rows)
+            changed = top1_pre != top1_post
+            in_pair_pre = (top1_pre == i) | (top1_pre == j)
+            in_pair_post = (top1_post == i) | (top1_post == j)
+            drift = float((changed & ~(in_pair_pre & in_pair_post))
+                          .float().mean())
+            if drift > drift_gate:
+                prompt.prompt_key.data[i] = snap_key[i]
+                prompt.prompt.data[i] = snap_prompt[i]
+                self._psc_pair_streak.pop(key, None)
+                print(f'[PSC] round {round_i}: merge {key} ROLLED BACK '
+                      f'(drift {drift:.4f} > {drift_gate})')
+                continue
+            self._psc_core_slots = sorted(set(self._psc_core_slots) | {i})
+            self._psc_merged_pairs.append(key)
+            self._psc_pair_streak.pop(key, None)
+            used_rows.update((i, j))
+            committed += 1
+            print(f'[PSC] round {round_i}: merged pair {key} '
+                  f'(sim {sim:.4f}, drift {drift:.4f}) -> core row {i}; '
+                  f'core rows now {len(self._psc_core_slots)}')
 
     def start(self):
         self.init_client()
@@ -806,6 +1078,9 @@ class Server_DF(object):
         # 义与 joint-head 轨迹管理；two-sided 检查保持老 checkpoint 兼容
         "head_dropout", "head_refit", "head_standardize",
         "interface_consolidate", "refit_input",
+        # PSC（RUNCOMMANDS §25）：跨 ON/OFF 或跨参数 resume 会静默改变
+        # 巩固/冻结语义；two-sided 检查保持老 checkpoint 兼容
+        "psc", "psc_tau", "psc_streak", "psc_max_merge", "psc_drift",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):
@@ -872,6 +1147,18 @@ class Server_DF(object):
 
             "args": vars(self.args),
         }
+
+        # PSC（--psc，RUNCOMMANDS §25）：server 端巩固状态（core 行集合 /
+        # 连续轮 streak / 已合并对）。schema 仅 ON 臂新增 key（frozen 基线
+        # checkpoint 逐位不变）。streak 必须存：mid-task resume 后跨边界轮
+        # 的合并决策依赖 task 内已积累的连续计数。
+        if self.psc_on:
+            checkpoint["psc_state"] = {
+                "core_slots": list(self._psc_core_slots),
+                "pair_streak": dict(self._psc_pair_streak),
+                "merged_pairs": list(self._psc_merged_pairs),
+            }
+        return checkpoint
 
     def maybe_save_checkpoint(self, round_id):
         if self.run_manager is None:
@@ -965,6 +1252,26 @@ class Server_DF(object):
         for client_state in checkpoint.get("clients", []):
             cid = client_state["id"]
             self.clients[cid].load_checkpoint_state(client_state)
+
+        # PSC server-side consolidation state, FAIL-CLOSED (Sec.25): a --psc
+        # resume from a checkpoint without psc_state would silently restart
+        # consolidation from an empty core/streak state — refuse instead.
+        if self.psc_on:
+            psc = checkpoint.get("psc_state")
+            if not psc:
+                raise RuntimeError(
+                    "--psc resume requires the server psc_state in the "
+                    "checkpoint, got "
+                    f"{'missing key' if 'psc_state' not in checkpoint else 'None/empty'}"
+                    " — refusing to silently restart consolidation from an "
+                    "empty state (fail-closed; re-run from scratch or use "
+                    "a --psc checkpoint)")
+            self._psc_core_slots = list(psc.get("core_slots", []))
+            self._psc_pair_streak = dict(psc.get("pair_streak", {}))
+            self._psc_merged_pairs = list(psc.get("merged_pairs", []))
+            print(f"[PSC] resume: core rows {len(self._psc_core_slots)}, "
+                  f"active streaks {len(self._psc_pair_streak)}, merged "
+                  f"pairs {len(self._psc_merged_pairs)}")
 
         # RNG state must be restored LAST: model creation and split rebuild
         # above must not consume the restored random stream.
