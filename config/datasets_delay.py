@@ -356,6 +356,13 @@ def get_args_parser(subparsers):
                             help='Stop after N global rounds (0 = full task_num*global_epoch). '
                                  'Engineering-only switch for the resume regression test; '
                                  'does not change per-round training logic.')
+    subparsers.add_argument('--fusion_probe_dump', default='', type=str,
+                            help='Diagnostics only (RUNCOMMANDS Sec.26): dump every chosen '
+                                 'client\'s post-local-training prompt pool right BEFORE the '
+                                 'SIKF fusion and the fused server pool right AFTER it (one '
+                                 '.pt per fusion round into DIR). Read-only probe: '
+                                 'RNG-snapshot guarded, no parameter is touched. '
+                                 'Empty = off = bit-identical official path.')
     subparsers.add_argument('--no_instrumentation', action='store_true',
                             help='Disable the Phase-0 observer instrumentation '
                                  '(train_log.csv local-phase evaluation, full '

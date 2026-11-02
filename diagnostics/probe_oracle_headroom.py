@@ -149,16 +149,24 @@ class HeadHandle(object):
 
 
 def fit_head(z_tr, y_tr, classes, *, seed, hidden, epochs, lr, wd, dropout,
-             batch_size, device="cpu"):
+             batch_size, device="cpu", standardize=True):
     """Train a supervised head on (z_tr, y_tr) with global class ids in
     `classes` (output unit per class). Standardization stats are fit on
     the TRAIN rows only (fit on anything else would leak eval rows into
-    the probe). Returns a HeadHandle; deterministic under `seed`."""
+    the probe). Returns a HeadHandle; deterministic under `seed`.
+    standardize=False (default True = sealed mlp_local semantics, bit
+    unchanged for every existing caller): identity stats (mu=0/sd=1),
+    added for the §27.6 recipe-separation probe only."""
     z_tr = np.asarray(z_tr, dtype=np.float32)
     y_tr = np.asarray(y_tr, dtype=np.int64)
-    mu = z_tr.mean(axis=0)
-    sd = z_tr.std(axis=0) + 1e-8
-    z = (z_tr - mu) / sd
+    if standardize:
+        mu = z_tr.mean(axis=0)
+        sd = z_tr.std(axis=0) + 1e-8
+        z = (z_tr - mu) / sd
+    else:
+        mu = np.zeros(z_tr.shape[1], dtype=np.float32)
+        sd = np.ones(z_tr.shape[1], dtype=np.float32)
+        z = z_tr
     n, d = z.shape
     remap = {int(c): i for i, c in enumerate(classes)}
     yt = torch.tensor([remap[int(c)] for c in y_tr], dtype=torch.long,

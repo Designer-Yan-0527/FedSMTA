@@ -1048,13 +1048,14 @@ python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets 
     --head_refit --refit_input feat --psc --max_rounds 5 \
     --run_name cifar_psc_M2p_psc_t0
 
-# INR 臂 A/B：划分复刻 inr_a5v2_M2_feat（task_num 10 / private 20 / surrogate 默认 20）
+# INR 臂 A：M2' + PSC（划分复刻 p40 家族：inr_base_p40 / inr_a5v2_M2_feat_p40 /
+# inr_hsn_p40——t10/p20 的 inr_a5v2_M2_feat 是已废弃的 crash run，禁用作对照）
 python main.py datasets_delay --data_name ImageNet-R --data-path ./local_datasets \
-    --client_num 5 --task_num 10 --private_class_num 20 \
+    --client_num 5 --task_num 5 --private_class_num 40 --surrogate_num 5 \
     --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
     --head_refit --refit_input feat --psc --max_rounds 10 \
-    --run_name inr_psc_M2p_psc_t1
-# INR 臂 B = 同上去掉 --psc，--run_name inr_psc_M2p_ctrl_t1
+    --run_name inr_psc_M2p_p40_psc_t1
+# INR 臂 B = 同上去掉 --psc，--run_name inr_psc_M2p_p40_ctrl_t1
 ```
 
 全轨迹臂（GREEN 后再跑，2×2：PSC-only / PSC+M2'，同 §2/§3 模板去 `--max_rounds`）。
@@ -1087,3 +1088,291 @@ python main.py datasets_delay --data_name ImageNet-R --data-path ./local_dataset
 4. PSC 与 A2/route_fix 互斥是设计决定（A2 判死；route_fix 是修复级）——不是能力缺失；
 5. residual 冻结会让旧任务方向在 t1 内不被新任务训练覆写，但若 S_old 支撑集随任务数增长逼近全池，residual 比例会膨胀（core 容量被挤占）——探针天花板判读正是对这一点的直接检验；
 6. 结果阶梯参照（全轨迹 corrected 终值，本判据臂的直接背景）：cifar base 75.04 / M2' 93.08 / oracle 96.21；INR base 77.12 / M2' 81.93 / oracle 84.82——PSC 的主张空间 = M2' 与 oracle 之间的差距部分归因于 prompt 池方向覆写。
+
+## 26. Fusion 侵蚀探针（候选方向 A/B 立项判据，2026-11-02 预注册）
+
+### 26.0 背景与机制空洞（代码 + 普查事实）
+
+- 普查（diagnostics_output/row_usage/）：cifar 路由坍缩到 1–2 共享行（跨客户端 Jaccard 0.47–1.0）；INR 行使用按数据自然分区（跨任务 Jaccard 0.13–0.19，跨客户端 0.125–0.22）。capacity opening 因 INR 侧不满足"Jaccard ≥0.5"不立项（§25.3 预注册普查判据的换方向分支）。
+- 代码事实：`kd_fusion_prompt` 学生 = `deepcopy(clients[thisclients[0]].prompts)`（thisclients 每轮全 5 客户端 → **锚定恒为 client 0**），蒸馏 surrogate **只装当前任务类**（L736 current_class），融合后广播对所有客户端**全池整体替换**（`get_global_proto_and_head`）。旧任务功能在融合中无信号路径（仅从锚定者被动 deepcopy 继承）。
+- 候选 A（按行归属融合）：非锚定客户端本地训练更新的行每轮被广播清零（其行在锚定者副本中 = 上一轮广播态）。INR 侧机制，cifar 预期退化 ≈ 无损。
+- 候选 B（轨迹感知融合）：融合蒸馏对旧任务零约束，10 epoch Adam(+wd) 只受当前任务压力 → 旧任务功能被侵蚀，逐轮累积。cifar 3.6pp 轨迹损失（边界 96.7 → 终局 93.08）与 INR 2.9pp 的共同空洞。PSC 教训（冻结参数饿死适应）的反命题：保输出不保参数。
+
+### 26.1 探针设计
+
+Resume M2' 全轨迹 run 一个融合轮（round 20 = task 4 首轮，旧任务 0–3），`--fusion_probe_dump` 在融合前后各 dump 一次池（纯读，RNG 快照保护，不影响训练流）。离线脚本 `diagnostics/probe_fusion_erosion.py` 从探针 run 的 `round_0020.pth` bootstrap，对每客户端每旧任务做**配对评估**（同 (client,task) 固定种子，三池变体共享同一 shuffle/dropout 序列）：
+
+- **ΔA(c,t) = acc(own_local) − acc(fused)**（非锚定客户端，own head）：广播替换对非锚定者旧任务的丢弃量（A 的天花板）
+- **ΔB(c,t) = acc(anchor_local) − acc(fused)**（全部客户端，own head）：蒸馏+wd 对旧任务功能的侵蚀量（B 的天花板）
+
+heads/protos/模型体全部来自 checkpoint 且三变体共享 → 差异 100% 归因 prompt 池。Sanity gate：dump 的 fused 与 checkpoint 里客户端 prompts 逐位一致，不一致 = 探针失效。
+
+### 26.2 命令（用户 tmux 执行，两条独立可并行）
+
+```bash
+# INR：resume inr_a5v2_M2_feat_p40 的 task_03_end，只跑 round 20
+python main.py datasets_delay --data_name ImageNet-R --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 40 --surrogate_num 5 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --max_rounds 21 \
+    --resume output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42/checkpoints/task_03_end.pth \
+    --fusion_probe_dump diagnostics_output/fusion_probe/inr \
+    --run_name inr_fusion_probe_r20
+
+# 离线评估（GPU，分钟级）
+python diagnostics/probe_fusion_erosion.py \
+    --run_dir output/ImageNet-R/fedta/inr_fusion_probe_r20/seed_42 \
+    --checkpoint round_0020.pth \
+    --dump_dir diagnostics_output/fusion_probe/inr \
+    --out_csv diagnostics_output/fusion_probe/inr_erosion.csv \
+    --summary_json diagnostics_output/fusion_probe/inr_erosion.json --device cuda
+
+# cifar：resume cifar_a5v2_M2_feat_full 的 task_03_end，同构
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --max_rounds 21 \
+    --resume output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42/checkpoints/task_03_end.pth \
+    --fusion_probe_dump diagnostics_output/fusion_probe/cifar \
+    --run_name cifar_fusion_probe_r20
+
+python diagnostics/probe_fusion_erosion.py \
+    --run_dir output/cifar100/fedta/cifar_fusion_probe_r20/seed_42 \
+    --checkpoint round_0020.pth \
+    --dump_dir diagnostics_output/fusion_probe/cifar \
+    --out_csv diagnostics_output/fusion_probe/cifar_erosion.csv \
+    --summary_json diagnostics_output/fusion_probe/cifar_erosion.json --device cuda
+```
+
+注：RESUME_MUST_MATCH 不含 max_rounds（§25.2 已验证），dump 无 RNG 消耗 + resume 恢复 RNG 态。
+
+### 26.2b run_dir 推断坑 + 已执行修正（2026-11-02 事故记录，先于判读）
+
+**事故**：`--resume` 给显式 checkpoint 路径时 RunManager **从 checkpoint 路径推断 run_dir（`ckpt.parent.parent`），`--run_name` 被静默忽略**（runtime_utils.py L211-219）。INR 探针的产物因此写进了原 M2' run 目录 `inr_a5v2_M2_feat_p40/seed_42`，而非计划的 `inr_fusion_probe_r20`——§26.2 原命令有误（断言"产物落在新目录"前未验证 RunManager 行为）。
+
+**损伤与恢复（已完成）**：
+- `round_0020.pth` 被 probe 覆写，原版不可恢复——probe 版是同轨迹 resume 的等价状态（RNG 态恢复 + dump 无 RNG 消耗，但 cudnn 非确定性下不逐位一致）。终态数据不受影响（分析用 task_XX_end / accuracy_matrix）；
+- `latest.pth` 已从 `task_04_end.pth` 恢复（内容逐位一致）；
+- `train_log.csv` 追加的 20 行 probe round-20 行已剥离（恢复 451 行 = header+450 原始数据；probe 会话备份于 `diagnostics_output/fusion_probe/inr/probe_session_backup/`）；
+- `train.log` 已截断回原 4249 行（probe 会话尾部单独备份）；
+- `task_XX_end.pth`、`round_0024.pth`、`accuracy_*.csv`、`args.json` 全程未动。
+
+**修正后的离线评估命令（INR，可立即跑）**——probe 的 round_0020.pth（融合后、广播后状态）就在原 run 目录，直接以原 run 为 bootstrap 源（只读，sanity gate 校验 dump 与其逐位一致）：
+
+```bash
+python diagnostics/probe_fusion_erosion.py \
+    --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
+    --checkpoint round_0020.pth \
+    --dump_dir diagnostics_output/fusion_probe/inr \
+    --out_csv diagnostics_output/fusion_probe/inr_erosion.csv \
+    --summary_json diagnostics_output/fusion_probe/inr_erosion.json --device cuda
+```
+
+**cifar resume 必须走 staging 副本**（避免同样的覆写；checkpoint 副本让 run_dir 推断落到 staging 目录，RunManager 会在那里写 args.json/command.txt，原 run 只读）：
+
+```bash
+mkdir -p diagnostics_output/fusion_probe/cifar/staging/seed_42/checkpoints
+cp output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42/checkpoints/task_03_end.pth \
+   diagnostics_output/fusion_probe/cifar/staging/seed_42/checkpoints/
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --max_rounds 21 \
+    --resume diagnostics_output/fusion_probe/cifar/staging/seed_42/checkpoints/task_03_end.pth \
+    --fusion_probe_dump diagnostics_output/fusion_probe/cifar \
+    && python diagnostics/probe_fusion_erosion.py \
+    --run_dir diagnostics_output/fusion_probe/cifar/staging/seed_42 \
+    --checkpoint round_0020.pth \
+    --dump_dir diagnostics_output/fusion_probe/cifar \
+    --out_csv diagnostics_output/fusion_probe/cifar_erosion.csv \
+    --summary_json diagnostics_output/fusion_probe/cifar_erosion.json --device cuda
+```
+
+### 26.3 判读表（预注册，先于数据）
+
+| 判读项 | 口径 | GREEN | YELLOW | RED |
+|---|---|---|---|---|
+| A：广播丢弃量 | mean ΔA（非锚定客户端 × 旧任务 0–3，corrected） | ≥ 1.0pp → A 立项 | 0.3–1.0pp → 量小，需评估实现成本再议 | < 0.3pp → A 判死 |
+| B：蒸馏侵蚀量 | mean ΔB（全部客户端 × 旧任务 0–3，corrected） | ≥ 1.0pp → B 立项 | 0.3–1.0pp | < 0.3pp → B 判死 |
+| 辅助方向一致性 | ΔA/ΔB 正值 cell 占比 | ≥ 60% | — | < 60% 且 mean 靠近门限 → 降一档 |
+| Sanity | dump fused vs checkpoint 客户端 prompts | 逐位一致 | — | 不一致 = 探针失效，重跑 |
+| B 的双数据集门 | 26.3 B 两数据集判读 | 双 GREEN → 写机制 | 单 GREEN → 只披露 | — |
+
+A 立项只需 INR GREEN（A 本质是 INR 侧机制，cifar 预期近 no-op，cifar 判读只作无害性参考）；B 瞄准两数据集共同空洞，按防堆参数纪律须双 GREEN 才写机制（不允许各自调参）。两方向均 RED → 融合侧判死，转向 head/proto 侧诊断。
+
+### 26.4 已知边界（预注册时声明）
+
+1. 单轮采样：round 20 是任务 4 首轮（刚换任务，本地训练对旧行扰动最大的阶段之一），量级或高于轮均值——ΔA/ΔB 是"该轮丢弃/侵蚀"的瞬时量，跨轮复利不外推，只作立项判据；
+2. evaluate 语义官方原样（`train=True` 前向、shuffle），配对种子使噪声在变体间共模抵消，但绝对值含 dropout 噪声；
+3. heads[t] 在 task 4 首轮尚无 heads[4]，当前任务无参考 cell（判读只依赖旧任务 cell，不受影响）；
+4. 探针 run 的 round 20 与原 run bit 一致仅当 dump 无 RNG 消耗成立（快照保护 + torch.save 不消费 torch RNG）；
+5. ΔB 含 Adam wd 的被动侵蚀与蒸馏梯度的主动侵蚀，二者不分离（对立项判据无差别，对机制设计有——GREEN 后需 ablation）。
+
+### 26.5 INR 探针结果与判读（2026-11-02，按 §26.3 预注册判据）
+
+| 判读项 | 实测 | 预注册判决 |
+|---|---|---|
+| A 广播丢弃量 | mean ΔA = **−0.35pp**（n=16，正值 cell 44%） | **RED**（<0.3pp；判死） |
+| B 蒸馏侵蚀量 | mean ΔB = **0.000pp，全部 20 cell 精确为 0** | **RED**（<0.3pp；判死） |
+
+**两个尖锐的证伪事实**：
+
+1. **ΔB ≡ 0（逐 cell 精确为零）**：INR 任务间路由分区（跨任务 Jaccard 0.13–0.19）意味着当前任务的蒸馏批次只路由进当前任务行——旧任务行的 prompt 与 key **收不到任何梯度**，Adam(+wd) 对 grad=None 的参数跳过 → 融合对旧任务功能是**逐位 pass-through**。"轨迹感知融合"(B) 瞄准的侵蚀在 INR 上数学上不存在（§26.4-5 的 wd/蒸馏不分离问题就此消失——两者都是零）。
+2. **ΔA < 0（广播是稳定器不是破坏者）**：非锚定客户端本地池相对融合池在旧任务上平均**低 0.35pp**——本地训练对邻近旧任务（t2 −1.9pp、t3 −0.7pp）的扰动大于对老任务（t0/t1 +0.6pp）的小改善；广播把大家重置回共识，净效应为正。"按行归属融合"(A) 要保留的"被丢弃更新"净值为负，保留反而更差。
+
+**合并推论**：INR 旧任务功能在池侧的演化路径 = 旧任务专属行任务结束后**永久冻结**（无梯度来源）+ 共享行（13–19% 流量）经锚定者谱系被当前任务压力缓慢漂移。池侧干扰是小头；INR 轨迹损失主要不在融合侧。
+
+**教训（预注册制度的价值）**：探针前的预期是 A/B 至少一个 ≥1.0pp GREEN——两者均被证伪。若跳过探针直接写机制，将复刻 PSC 式沉没成本。普查的"锚定不对称 +0.53pp"签名真实存在，但机制解释反了：锚定者优势不是"保住了自己的更新"，而是"从未离开共识"。
+
+**按 §26.3 预注册预案执行**：两方向均 RED → **融合侧判死，转向 head/proto 侧诊断**。cifar 臂（§26.2b staging 命令）仍值得跑一次作为披露级事实：cifar 共享行拓扑与 INR 相反——当前任务蒸馏梯度会真实进入旧任务所用行，若 cifar ΔB ≠ 0 则定位了 cifar 3.6pp 轨迹损失的融合分量，为下一个方向提供路标；不改变 RED 判决，不作为立项门。
+
+## 27. PGC：原型引导的类间几何先验（2026-11-02 预注册，探针先行）
+
+> 用户定案（2026-11-02）：巩固臂（M5）带轻 replay 档位代价，放弃；要 no-replay 方案。
+> 本节先注册 PGC 方案与 P1/P2 探针判据（先于数据），探针双门过后才写判据臂。
+
+### 27.0 背景与方案定义
+
+**瞄准点（no-replay 档内最大空白）**：边界内空间——"学的时候就没学好"。证据：
+
+- cifar M2' 边界行 96.09/96.67/**92.58**/94.46/94.11（T2 凹陷 2–4pp），base 在 T2 同样凹陷（90.02）→ 凹陷是协议结构性的；
+- INR M2' 边界行 86.22/82.59/**81.49**/84.43/82.03（T2 全阵最低）；
+- T0（无旧类干扰）refit 配方只差 0.69–0.84pp（M2' T0 边界 vs oracle 探针 mlp_local：cifar 96.09 vs 96.93、INR 86.22 vs 86.91）——**多任务边界多出来的 1.5–3pp 不是头配方问题**；
+- 残余轨迹分量（1.4–1.7pp）已论证低于 GREEN 门，不立项（M5 判死的另一面）。
+
+**机制假设（class_mask 语义下的 margin 挤压）**：native 评估带 class mask，新任务样本不可能被预测到旧类——损失路径不是"错分到旧类"，而是：新任务样本路由进旧类占用的行（cifar 共享核跨任务 Jaccard 0.75/0.89）→ 新旧类特征在同几行上混合 → **新类之间的判别 margin 被挤窄** → 新类间混淆增加 → 边界内损失。
+
+**方案**：FedTA 协议每轮把全类原型广播到每个客户端（`global_protos`，BGPS threshold=0.25 修复 + fix_keys 冻结维护），但客户端**训练时从未消费它们**（唯一用途是 server 侧修复；evaluate 不用原型）——协议里存在一条**广播了却无人使用的信息流**。PGC 在 phase-2 训练中激活它：损失从 `CE` 变为 `CE + λ·L_sep`，`L_sep` = 当前 batch 新类样本特征与**旧类**原型的排斥项（margin 余弦形式），让新任务学习不挤占旧类几何区域。
+
+**空间配准（代码事实，探针依赖）**：
+
+- `local_protos[c]` = **x1 1536 维 anchor-concat** 空间的类均值（Client_DF L746-767：original pre_logits → vit(task_id) 前向 → `model(feat)` 的第二个返回值 = Tail_Anchor.forward 的 `x1`，Tail_Anchor.py L59）；
+- global_protos = 各客户端 local_protos 的 BGPS 择优/修复联邦共识（Server_DF L385-528），每轮广播，客户端存 `self.global_protos`（Client_DF L983），checkpoint 持久化并经 bootstrap 恢复；
+- M2' refit feat 头的输入 = z_op 768 维 pre-anchor（`_a5_collect_head_inputs(feat_only=True)`，Client_DF L825-865），部署语义 = 垫零 1536 + 锚半区权重置零（L867-880）——**与 protos 的 x1 空间不同源**（P1/P2 因此各用各的空间，见 27.2）；
+- 梯度通路：prompt 特征依赖可训练池 → `λ·L_sep` 对 prompt/key 有梯度；ViT 冻结、Tail_Anchor、heads 全不碰 → 与 M2'（动 heads 存储）**正交叠加**。
+
+**实现预告（双门过后写进判据臂）**：`L_sep = mean_batch Σ_oldc relu(cos(f_i, p_oldc) − m_sep)`，f_i 为 batch 内新类样本的 prompt 增强特征，旧类原型集合 = global_protos 减去 current_class；`--pgc` 开关 + `λ`/`m_sep` 两个标量（预注册即默认，不扫描）；评估路径零依赖原型（训练时消费、corrected 评估零改动）。
+
+### 27.1 结构判据自检与死亡名单对照
+
+| 标准 | 检验 |
+|---|---|
+| 信息流形状 | 新建消费连接（protos → phase-2 损失），组件角色改变（protos 从"server 维护对象"变"客户端训练先验"）——激活协议内既有的死信息流，非换数据口径 |
+| 机制假设 | margin 挤压假说（27.0），且可被零训练探针（P1/P2）预先证伪 |
+| 新参数 | 1 开关 + λ + m_sep（预注册即默认） |
+| 与 M2' 正交 | 表征侧 vs 接口侧；OFF 逐位官方路径 |
+| no-replay | 原型是内存向量，官方协议本来就在收集/广播/checkpoint 它们——访问级别零变化 |
+
+死亡名单：≠ A2/PSC（不冻结、不合并任何行）；≠ route_fix（不动路由算子）；≠ 融合 A/B（不碰 SIKF）；≠ NCM 读出（判死的是原型做**读出**；PGC 是**训练约束**，评估零依赖）；≠ SIKF-Seen（不换蒸馏数据，新建训练信号，且该路线已被用户判为修复级弃用）；≠ 池化（无聚合）。
+
+### 27.2 探针设计（P1+P2 一体，`diagnostics/probe_boundary_attribution.py`，零训练）
+
+对 M2' run 的每个 `task_XX_end.pth`（cifar `cifar_a5v2_M2_feat_full` / INR `inr_a5v2_M2_feat_p40`，均 seed 42）：
+
+**P1 边界归属二分**（问题：边界空间的损失在头侧还是特征侧）：
+
+1. **配对核心（v3 修订，2026-11-02 按两次实测证据修正设计）**：每客户端用 `_a5_collect_head_inputs(t, feat_only=True)`（客户端方法直接复用，零逻辑漂移）收集任务 t train split 的 z_op；test split z_op 由探针收集（同前向语义、顺序 loader）；**恢复的 native refit 头（heads[t]，eval 模式，z⊕0 垫零前向——M2' feat 形状锚半区权重恒零，head(z||0) 数学上即 native 头功能）与 `fit_head`（import probe_oracle_headroom.py，mlp_local 同配方：768→256→ReLU→Dropout(0.1)→C、Adam 1e-3/wd 1e-4、100 epoch、batch 64、masked CE）重训头消费同一份缓存特征** → `rawΔ_t = R_retrain − R_native_cached`，batchwise 实现噪声在配对内共模抵消；
+2. 官方 `evaluate_all_seen_tasks` 串联重放（单快照 → 逐客户端 → 恢复，复刻 run_full_evaluation 结构）保留为**灾难 gate**：全行对账 R[t][k]（k=0..t，客户端均值）|diff| > 1.0pp 即 SystemExit——错头/错池/错任务类 bug 偏 multi-pp，在此拦截；亚 1pp 偏差作为实现噪声证据披露进 summary，不作 gate 失败；
+3. 配方差基线 `Δ0 = rawΔ_0`（T0 无多任务干扰，预期 0.5–1.2pp 带内，见 27.4-3）；校正 `Δ̃_t = rawΔ_t − Δ0`。
+
+**P2 几何侵入测量**（问题：凹陷任务的新类特征是否被旧类原型区域拉扯）：
+
+1. 原型：`client.global_protos`（checkpoint 恢复的联邦共识单份，x1 1536 空间）；旧类 = protos keys 中不属于任务 t 当前类、且属于任务 < t 已见类的键；
+2. 新类特征：任务 t train split 的 x1 前向（与官方 proto 收集同链：original pre_logits → vit(task_id) → feat → model(feat, y) 的 x1），按类均值得新类原型；
+3. 度量：`proto_intrusion(t)` = 新类原型到最近旧类原型的余弦（按新类取均值）；old-old 参照 = 旧类原型彼此最近邻余弦的 mean/p95；样本级 margin = cos(f, own_proto) − max cos(f, old_protos) 的均值。
+
+### 27.3 判读表（预注册，先于数据）
+
+| 判读项 | 口径 | 门 |
+|---|---|---|
+| 灾难 gate（sanity） | 官方重放 vs accuracy_matrix 全行 R[t][k]（k=0..t） | \|diff\| ≤ 1.0pp；错头/错池/错任务类 bug 偏 multi-pp 在此拦截。亚 1pp 偏差 = batchwise 实现噪声（27.4-6 实测证据），披露不拦截 |
+| P1 特征说（FEAT） | 全部任务校正 `Δ̃_t`（配对口径 rawΔ = retrain − native_cached） | **全部 < +0.3pp** → 头已吃满特征，PGC 立项空间成立 |
+| P1 头质量说（HEAD-LAG） | 任一任务校正 `Δ̃_t` | **≥ +1.0pp** → 头滞后主导，PGC 前提坍塌，方案死 |
+| P1 混合带 | 0.3–1.0pp | per-task 报告，判"部分"，按最大任务定夺 |
+| P2 侵入证据（INTRUDE） | 凹陷任务（cifar/INR 均为 T2）`proto_intrusion` vs 非凹陷任务均值 | **差 ≥ +0.05 cos** 或凹陷任务绝对值 > old-old 参照 p95 |
+| P2 无侵入（CLEAN） | 同上 | 两条件均不满足 → 与任务凹陷无关联，PGC 机制假设死 |
+| **双门（立项判据）** | P1=FEAT **且** P2=INTRUDE | 过 → 27.6 判据臂定稿；任一失败 → PGC 判死，零机制成本（与 A/B/PSC 预注册判死同构） |
+
+主判读场 cifar（共享核拓扑、T2 凹陷证据链完整）；INR 分区路由预期侵入弱，单独判读——INR 双门失败不否决 cifar 单数据集主张，但按防堆参数纪律，**cifar-only GREEN 的机制主张限定"共享核型场景"措辞**。
+
+### 27.4 已知边界（预注册时声明）
+
+1. **类语义相似 confound**：T2 的类与旧类可能天然相似（数据集固有）——P2 判读以"跨任务相对差"为主证据（凹陷 vs 非凹陷），绝对值仅作辅助；
+2. **原型坐标滞后**：global_protos 是旧类最后训练时点的 BGPS 共识快照，特征漂移后 P2 度量的"新类 vs 冻结原型"几何可能低估当前真实侵入——方向上偏保守（低估侵入 → 偏向 CLEAN），不破坏 INTRUDE 判决的可信度；
+3. **Δ0 基线内生**：配方差基线取自 T0 任务实测，若 T0 本身异常（边界内损失在 T0 已有），基线失真——判读时先检查 rawΔ_0 落在 0.5–1.2pp 预期带；
+4. **单 seed**：探针不扫种子（判死性探针，非效应量估计）；判据臂若 GREEN 才按惯例扩 3 种子；
+5. **P1/P2 都是判死性探针**：双门设计保证机制代码零沉没成本；若 P1 判 HEAD-LAG，其副产品（refit 机器在多任务边界退化的定位）转交修复级路线处理，不作为结构创新主张；
+6. **batchwise 评估的实现噪声（2026-11-02 两次实测，v3 修订依据）**：批内多数投票的 prompt 选择依赖 batch 组成 → 评估结果依赖 shuffle 实现。实测：探针两种合法 RNG 结构对 matrix 的 mean 偏差 0.44 / 0.68pp（cifar T0），官方 run 内双口径自差 0.08pp（server phase 96.17 vs matrix 96.09）；c0（首个评估客户端）跨结构逐位一致证明恢复无 bug，偏差全部来自 c1–c4 的序列敏感（±0.5–0.9pp/client）。推论：**matrix 的 R[t][k] 是单次实现，自带 ±0.5pp 级实现噪声带**；本探针的 P1 判读因此用同缓存配对设计（共模消噪），官方重放降级为灾难 gate；跨 run 比较任何 <1pp 的差异时须引用本条。
+
+### 27.5 探针命令（用户 tmux 执行，GPU 各约 15–30 分钟）
+
+```bash
+# cifar 主判读场（5 checkpoints 串行）
+python diagnostics/probe_boundary_attribution.py \
+    --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
+    --checkpoints task_00_end.pth,task_01_end.pth,task_02_end.pth,task_03_end.pth,task_04_end.pth \
+    --out_csv diagnostics_output/boundary_probe/cifar_attribution.csv \
+    --summary_json diagnostics_output/boundary_probe/cifar_attribution.json --device cuda
+
+# INR 对照场
+python diagnostics/probe_boundary_attribution.py \
+    --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
+    --checkpoints task_00_end.pth,task_01_end.pth,task_02_end.pth,task_03_end.pth,task_04_end.pth \
+    --out_csv diagnostics_output/boundary_probe/inr_attribution.csv \
+    --summary_json diagnostics_output/boundary_probe/inr_attribution.json --device cuda
+```
+
+（产物按 §24.2 落 `diagnostics_output/boundary_probe/` 家族目录。）
+
+### 27.5 cifar 探针结果与判读（2026-11-02，按 §27.3 预注册判据）
+
+探针执行记录：v1/v2 两版因 batchwise 实现噪声误设逐位 sanity gate 而 fail（修订见 27.4-6）；v3 曾有 native_cached 标签错位 bug（class_mask 原序 vs 布尔掩码升序错位 → 14% 假读数，HEAD-LAG 判决作废），修复为整数列索引后重跑。下表为修复后读数。
+
+**P1 配对读数（native_cached = M2' refit 头在共享 z_op 缓存上；retrain = mlp_local 同缓存）**：
+
+| t | native_cached | retrain | rawΔ | 校正 Δ̃（−Δ0=0.59） |
+|---|---|---|---|---|
+| 0 | 96.34 | 96.93 | +0.59 | （配方差基线） |
+| 1 | 96.69 | 97.65 | +0.96 | +0.37 |
+| 2 | 92.71 | 95.30 | **+2.59** | **+2.00** |
+| 3 | 94.68 | 96.47 | +1.79 | +1.20 |
+| 4 | 94.22 | 96.94 | +2.72 | **+2.13** |
+
+**P2 侵入读数**：T1 0.608 / **T2 0.740** / T3 0.671 / T4 0.755——T2 vs 非凹陷均值 gap +0.062 ≥ 0.05（弱 INTRUDE，T4 高侵入不凹陷破坏共变图景）；sample_margin 跨任务递减 0.449→0.274（与挤压方向一致）；第二条件（绝对值 > old-old p95 0.919）不成立。
+
+**双门判决：P1=HEAD-LAG → PGC 判死**（按 27.3 预注册，双门须 P1=FEAT）。
+
+**判读（关键事实链）**：
+
+1. **头滞后主导，特征几何次要**：T4 的 retrain 96.94 ≈ T0 的 96.93（同为"刚学完"任务、特征无干扰差异）——T4 边界 2.1pp 损失 100% 在头侧；T2 retrain 95.30 距 T0 基线仅 −1.6pp（含任务难度）。头滞后随任务数递增（t1 +0.37 → t4 +2.13）。PGC 治的病（特征 margin 挤压）是次要成分——判死成立。
+2. **副产品（按 27.4-5 预案转交修复级）**：M2' refit 头配方在多任务边界吃不满特征——mlp_local（hidden 256 + **train-only 标准化**）比 M2' refit（hidden 512 + 无标准化）在 T2/T4 高 2.0–2.7pp。两因素（标准化 / hidden 容量）未分离，均为修复级消融。`--head_standardize`×`--refit_input feat` 组合语义已验证正确（Client_DF L891-906：统计量在垫零前的 768 维 z_op 上计算、锚半区统计量恒等 0/1、训练后锚半区权重置零兜底——训练/部署分布一致，零代码改动可直接跑）；hidden 消融需参数化 `A5_REFIT_HIDDEN`。**这是 no-replay 档内当前最明确的 +2pp 级增益路径**。
+3. P2 的弱 INTRUDE 与 margin 递减趋势作为披露保留（几何分量存在但被头滞后掩盖），不构成行动项。
+
+### 27.6 判据臂（已作废，随 PGC 判死）→ 修复级配方分离探针（2026-11-02 预注册）
+
+原占位（cifar + INR 2 任务短程 M2' vs M2'+`--pgc`）不再执行——探针双门 FAIL，`--pgc` 机制代码零行实现（预注册判死第三次兑现：融合 A/B、PSC、PGC）。
+
+**27.5-2 转交项的执行方案（配方分离探针，零训练）**：探针 v3 的 retrain 列升级为 2×2 配方网格 `--retrain_grid std:256,std:512,nostd:256,nostd:512`（`fit_head` 新增 `standardize` 关键字，默认 True = 封板语义逐位不变；主列 std:256 保留历史 seed 维持跨版本可比）。四变体在同一份缓存特征上配对训练评估，读数为逐任务 rawΔ（vs native_cached）。**判级声明：本探针与后续训练臂均为配方卫生（修复级最轻档），不构成方法贡献主张，只产数字。**
+
+**分离判读映射（预注册，先于数据）**：
+
+| 读数形态（以 T2/T4 校正滞后为准，≥1.0pp 显著） | 解释 | 行动 |
+|---|---|---|
+| nostd512 ≈ 0 且 std256/std512 显著 | 标准化是主因 | 训练臂直接跑 `--head_standardize`（现成开关，命令见下） |
+| nostd256 ≈ std256 显著，nostd512/std512 ≈ 0 | hidden 容量是主因 | 先参数化 `A5_REFIT_HIDDEN`（新开关），再跑训练臂 |
+| 仅 std256 显著，其余 ≈ 0 | 联合效应不可分 | 训练臂配方 = std256 完整版（标准化 + hidden 参数化都要） |
+| 四变体全部 ≈ 0 | 差异不在两因素（残余候选：lr/epoch/batch/masked-CE 细节） | 暂停，报告后另议 |
+
+**离线读数预测训练臂的合法性**：M2' 的 heads[t] 即边界轮最后一次 refit 的产物，离线用边界 checkpoint 的接口状态重做 refit 与训练臂的边界头同构——训练臂只需跑胜出配方一次全程，避免盲跑。
+
+**训练臂命令（胜出配方为标准化主因时；cifar 全程）**：
+
+```bash
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --head_standardize \
+    --run_name cifar_a5v2_M2std_full
+```
+
+主判据 = corrected 边界列 T2（vs M2' 92.58，≥ +1.0pp GREEN）；探针对账带 = T2 预期 ~95.3±0.5（27.5-1 表 retrain 读数）；约束 = T0/T1 边界与终局 AA 不降。

@@ -345,6 +345,62 @@ def test_t6_merge_only_invariant():
     print("[PASS] T6 merge-only invariant")
 
 
+def test_t7_build_checkpoint_schema():
+    """Regression for the dead-code bug hit in production: the psc_state
+    block was inserted AFTER the unconditional `return {...}` literal in
+    Server_DF.build_checkpoint, so every checkpoint of a --psc run
+    silently lacked the server psc_state (fail-closed loader then refused
+    probe/resume). Schema-level guard: ON => key present and faithful;
+    OFF => key absent (frozen baseline schema bit-identical)."""
+    def build(psc_on):
+        server = Server_DF.__new__(Server_DF)
+        server.args = Namespace(**dict(PSC_ARGS, seed=42))
+        server.task_id = 1
+        server.client_num = 1
+        server.task_num = 2
+        server.model = None          # module_state_or_none(None) -> None
+        server.global_head = None
+        server.global_protos = None
+        server.temp_protos = None
+        server.fix_keys = set()
+        server.existing_class = set()
+        server.prompt = None
+        server.class_mask = [[[1, 2], [3, 4]]]
+
+        class _Subset(object):
+            indices = [0, 1]
+
+        server.client_data = [[_Subset(), _Subset()]]
+
+        class _Client(object):
+            id = 0
+            data_split_indices = {}
+
+            def state_dict_for_checkpoint(self):
+                return {"id": 0}
+
+        server.clients = [_Client()]
+        server.psc_on = psc_on
+        server._psc_core_slots = {3, 5}
+        server._psc_pair_streak = {(1, 2): 2}
+        server._psc_merged_pairs = [(1, 2)]
+        return server.build_checkpoint(3)
+
+    ckpt_on = build(True)
+    assert "psc_state" in ckpt_on, (
+        "server psc_state missing from the --psc checkpoint schema "
+        "(dead-code regression: block unreachable after the return)")
+    assert sorted(ckpt_on["psc_state"]["core_slots"]) == [3, 5]
+    assert ckpt_on["psc_state"]["pair_streak"] == {(1, 2): 2}
+    assert ckpt_on["psc_state"]["merged_pairs"] == [(1, 2)]
+
+    ckpt_off = build(False)
+    assert "psc_state" not in ckpt_off, (
+        "frozen-baseline checkpoint schema must stay bit-identical (PSC key "
+        "only added for the ON arm)")
+    print("[PASS] T7 build_checkpoint psc_state schema")
+
+
 def main():
     test_t1_streak_and_commit()
     test_t2_drift_rollback()
@@ -352,6 +408,7 @@ def main():
     test_t4_streak_reset_on_unmeasurable()
     test_t5_client_freeze_and_top1()
     test_t6_merge_only_invariant()
+    test_t7_build_checkpoint_schema()
     print("\nRESULT: PASS (all PSC consolidation unit tests)")
 
 

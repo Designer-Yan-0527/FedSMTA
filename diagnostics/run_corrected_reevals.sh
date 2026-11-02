@@ -24,8 +24,8 @@ run () {  # run <run_dir> <name> <ckpt-stem>
     && echo "OK  $name/$ck" || echo "FAIL $name/$ck（看 ${name}_${ck}_corrected.log）"
 }
 
-# ---- cifar ----
-for c in task_00_end task_04_end; do
+# ---- cifar（全 5 行 → 完整 corrected 矩阵） ----
+for c in task_00_end task_01_end task_02_end task_03_end task_04_end; do
   run output/cifar100/fedta/cifar_base_p15/seed_42             cifar_base_p15 $c
   run output/cifar100/fedta_a2/a2_key/seed_42                  cifar_a2_key   $c
   run output/cifar100/fedta_a2/cifar_a2_key_hsn/seed_42       cifar_a2_key_hsn $c
@@ -37,16 +37,17 @@ run output/cifar100/fedta/cifar_a5v2_M3_refit_std/seed_42     cifar_M3_refit_std
 run output/cifar100/fedta/cifar_a5v2_M4_full_noconsol/seed_42 cifar_M4_full      task_00_end
 run output/cifar100/fedta/cifar_a5v2_M5_refit_consol/seed_42  cifar_M5_refit_consol task_00_end
 
-# ---- INR（每 ckpt 重建环境 ~3min） ----
-for c in task_00_end task_04_end; do
+# ---- INR（每 ckpt 重建环境 ~3min；全 5 行 → 完整 corrected 矩阵） ----
+for c in task_00_end task_01_end task_02_end task_03_end task_04_end; do
   run output/ImageNet-R/fedta/inr_base_p40/seed_42             inr_base   $c
   run output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42        inr_a2_key $c
   run output/ImageNet-R/fedta/inr_hsn_p40/seed_42              inr_hsn    $c
 done
 
-# ---- M2' Gate（若已跑完） ----
-run output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42      inr_M2feat_p40 task_00_end
-run output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42     cifar_M2feat_full task_00_end
-run output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42     cifar_M2feat_full task_04_end
+# ---- M2' Gate（若已跑完；全 5 行） ----
+for c in task_00_end task_01_end task_02_end task_03_end task_04_end; do
+  run output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42      inr_M2feat_p40  $c
+  run output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42     cifar_M2feat_full $c
+done
 
 echo "ALL DONE $(date +%T)"

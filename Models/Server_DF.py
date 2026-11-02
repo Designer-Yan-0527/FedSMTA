@@ -1,6 +1,7 @@
 import random
 import time
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -271,6 +272,12 @@ class Server_DF(object):
                         i, "pre_fusion", self.thisclients[0],
                         _src.prompt_key)
             if _fusion_ran:
+                # --fusion_probe_dump (Sec.26): pre/post-fusion pool
+                # snapshots; '' = off = bit-identical official path.
+                _probe_dump = str(
+                    getattr(self.args, 'fusion_probe_dump', '') or '')
+                if _probe_dump:
+                    self._fusion_probe_dump(i, _probe_dump, "local")
                 self.kd_fusion_prompt(self.thisclients, round_i=i)
                 # PSC: consolidation only runs on fusion rounds (self.prompt
                 # is fresh); merges commit at task-boundary fusion rounds
@@ -279,6 +286,8 @@ class Server_DF(object):
                 # from and the task-start freeze snapshots are coherent.
                 if self.psc_on:
                     self.consolidate_prompts(i)
+                if _probe_dump:
+                    self._fusion_probe_dump(i, _probe_dump, "fused")
             # PSC: broadcast the core-row set every round (idempotent; the
             # clients consume it at task start via _psc_init_task_protection)
             if self.psc_on:
@@ -806,6 +815,40 @@ class Server_DF(object):
         return my_result
 
     # ------------------------------------------------------------------
+    # --fusion_probe_dump (RUNCOMMANDS Sec.26, pre-registered probe):
+    # snapshot the prompt pools around the SIKF fusion step. Read-only
+    # diagnostics: RNG-snapshot guarded, no parameter is touched, and the
+    # default '' keeps the official path bit-identical.
+    # ------------------------------------------------------------------
+    def _fusion_probe_dump(self, round_i, dump_dir, phase):
+        """phase 'local'  = every chosen client's post-local-training pool
+                           right BEFORE kd_fusion (what the broadcast will
+                           replace);
+        phase 'fused'  = the server pool right AFTER fusion (what the
+                           broadcast actually sends)."""
+        rng_snapshot = rng_state_dict()
+        try:
+            out_dir = Path(dump_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            payload = {"phase": phase, "round": int(round_i),
+                       "chosen": list(self.thisclients),
+                       "anchor": self.thisclients[0]}
+            if phase == "local":
+                payload["client_prompts"] = {
+                    j: (deepcopy(self.clients[j].prompts).state_dict()
+                        if self.clients[j].prompts is not None else None)
+                    for j in self.thisclients}
+            else:
+                payload["fused_prompts"] = (
+                    deepcopy(self.prompt).state_dict()
+                    if self.prompt is not None else None)
+            torch.save(payload, out_dir / f"round_{round_i:04d}_{phase}.pt")
+            print(f"[fusion_probe] dumped {phase} pools for round {round_i}"
+                  f" -> {out_dir}")
+        finally:
+            restore_rng_state(rng_snapshot)
+
+    # ------------------------------------------------------------------
     # PSC (--psc, RUNCOMMANDS Sec.25): server-side prompt consolidation.
     # The fused broadcast prompt's rows are merged into shared CORE
     # directions when they are functionally redundant, so later tasks
@@ -1117,7 +1160,7 @@ class Server_DF(object):
         return manifest
 
     def build_checkpoint(self, round_id):
-        return {
+        checkpoint = {
             "version": 1,
 
             "completed_round": round_id,
