@@ -51,7 +51,7 @@ provenance; S1/S2 must still pass.
 Usage (FedSMTA conda env, from the repo root):
 
   python diagnostics/export_split_manifest.py \
-      --reference-checkpoint output/cifar100/fedta_a2/a2_anchor/seed_42/checkpoints/latest.pth \
+      --reference-checkpoint output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42/checkpoints/latest.pth \
       -o protocol_manifests/cifar100_c5t5p15s20_seed42.json \
       --verify-task0-replay
 

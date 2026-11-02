@@ -127,22 +127,6 @@ def build_server(args, run_manager=None):
         prompt_key_init=args.prompt_key_init,
         head_type=args.head_type,
         use_prompt_mask=args.use_prompt_mask,
-        # A2-R 路由修复（--route_fix / --route_tau）：透传到 Global_Prompt
-        # （R1 正交球面 key 初始化 + R2 软路由）。默认 False = 官方行为
-        # 逐位一致。route_seed 用 --seed：R1 的独立随机流由 run 种子决定。
-        route_fix=args.route_fix,
-        route_tau=args.route_tau,
-        route_seed=args.seed,
-        # B 臂消融（--route_detach_ce_key_grad）：CE 软路由对 key 的梯度
-        # 隔离。默认 False = 逐位一致；仅 --route_fix 时生效。
-        route_detach_ce_key_grad=bool(
-            getattr(args, 'route_detach_ce_key_grad', False)),
-        # E1 臂修复（--route_selected_ce_grad）：forward-soft /
-        # backward-selected CE routing——前向逐位不变，CE 对 key 的梯度
-        # 只经 per-sample top-k 选中槽回传，CE 对特征梯度完整。默认
-        # False = 逐位一致；仅 --route_fix 时生效、与 B 臂互斥。
-        route_selected_ce_grad=bool(
-            getattr(args, 'route_selected_ce_grad', False)),
     )
 
     original_model.to(device)

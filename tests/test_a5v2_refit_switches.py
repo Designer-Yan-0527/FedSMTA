@@ -1,18 +1,18 @@
-"""A5-v2 readout-refit / consolidation switch tests (unittest, repo style).
+"""A5-v2 readout-refit switch tests (unittest, repo style).
 
 Switches added 2026-10-28 (pre-registered RUNCOMMANDS Sec.23):
 
-  F1 --head_dropout           train-side Dropout p of the phase-2 jointly
-                             trained Chead (default 0.5 = official)
   F2 --head_refit             post-phase-2 readout-only refit of heads[task_id]
   F3 --head_standardize       standardize refit input (StandardizedChead,
                              mu/sd as persistent buffers)
-     --interface_consolidate  task-boundary refit of heads[t'], t' < task_id
+
+(F1 --head_dropout 消融与 F4 巩固臂已随判死方向清理删除，存档见
+ git 历史。)
 
 Required semantics, all unit-tested here:
 
   * construction RNG-neutrality: Chead/Tail_Anchor construction consumes the
-    same RNG stream for ANY dropout p (F1 default 0.5 = official bitwise);
+    same RNG stream for ANY dropout p (official default 0.5 = bitwise);
   * legacy-args tolerance: missing flags -> official defaults via getattr;
   * default OFF = complete no-op: no joint-head snapshot, heads/model
     untouched, no checkpoint schema key (frozen baseline stays bit-identical);
@@ -21,8 +21,6 @@ Required semantics, all unit-tested here:
     corrected-metric delta is 100% attributable to the interface swap);
   * heads[] replacement + joint-head trajectory snapshot/restore;
   * refit is reproducible (deterministic stable seed -> identical head);
-  * consolidation fires only at task-boundary rounds and only for t' <
-    task_id; the current-task refit belongs to --head_refit alone;
   * rebuild_client_head: template / StandardizedChead branches, truncated
     or foreign key sets fail closed;
   * fail-closed: --head_standardize alone refuses to start; an A5 resume
@@ -69,15 +67,13 @@ def _task_dataset(task, n, seed):
 
 
 def _make_a5_client(head_refit=False, head_standardize=False,
-                   interface_consolidate=False, head_dropout=0.5,
                    task_id=0, legacy_args=False, seed=123, n_rows=24,
                    refit_input=None):
     from Models.Client_DF import Client_DF
     kwargs = dict(nb_classes=20, seed=seed)
     if not legacy_args:
-        kwargs.update(head_dropout=head_dropout, head_refit=head_refit,
-                      head_standardize=head_standardize,
-                      interface_consolidate=interface_consolidate)
+        kwargs.update(head_refit=head_refit,
+                      head_standardize=head_standardize)
         if refit_input is not None:
             kwargs['refit_input'] = refit_input
     args = types.SimpleNamespace(**kwargs)
@@ -112,8 +108,9 @@ def _cuda_rng_equal(a, b):
 
 
 class TestConstructionRngNeutrality(unittest.TestCase):
-    """F1: dropout p must not change the construction RNG stream (default
-    0.5 = official bitwise; p is a pure train-side hyperparameter)."""
+    """Chead dropout p must not change the construction RNG stream (official
+    default 0.5 = bitwise; p is a pure train-side hyperparameter, also used
+    by the M2' refit head recipe)."""
 
     def test_chead_dropout_p_construction_rng_neutral(self):
         torch.manual_seed(123)
@@ -151,24 +148,11 @@ class TestConstructionRngNeutrality(unittest.TestCase):
 
 class TestInitLocalModelDefaults(unittest.TestCase):
     """args wiring: legacy args (no A5 flags) and args=None keep the
-    official dropout 0.5; --head_dropout reaches the Tail_Anchor Chead."""
+    official dropout 0.5."""
 
     def test_legacy_args_keep_official_dropout(self):
         client = _make_a5_client(legacy_args=True)
         self.assertEqual(client.model.head.head[2].p, 0.5)
-        torch.manual_seed(123)
-        legacy = Tail_Anchor(10, 768, 200)
-        torch.manual_seed(123)
-        explicit = client.init_local_model(
-            'Tail_Anchor', types.SimpleNamespace(head_dropout=0.5))
-        self.assertTrue(torch.equal(legacy.key, explicit.key))
-        self.assertTrue(torch.equal(legacy.anchor_pool, explicit.anchor_pool))
-        self.assertTrue(_state_equal(legacy.head.state_dict(),
-                                     explicit.head.state_dict()))
-
-    def test_head_dropout_injected(self):
-        client = _make_a5_client(head_dropout=0.1)
-        self.assertEqual(client.model.head.head[2].p, 0.1)
 
     def test_args_none_keeps_official_dropout(self):
         client = _make_a5_client()
@@ -221,7 +205,7 @@ class TestRefitIsolationRngNeutral(unittest.TestCase):
 
     def _hook_args(self, **flags):
         base = dict(nb_classes=20, seed=7, head_refit=False,
-                    head_standardize=False, interface_consolidate=False)
+                    head_standardize=False)
         base.update(flags)
         return types.SimpleNamespace(**base)
 
@@ -298,27 +282,6 @@ class TestRefitIsolationRngNeutral(unittest.TestCase):
         # current task replaced
         self.assertFalse(_state_equal(client.heads[1].state_dict(), pre[1]))
 
-    def test_consolidate_boundary_semantics(self):
-        """--interface_consolidate: refits ONLY old tasks and ONLY at
-        task-boundary rounds ((round+1) % task_per_global_epoch == 0)."""
-        client = _make_a5_client(interface_consolidate=True, task_id=2)
-        self._prefill_heads(client)
-        pre = [deepcopy(client.heads[t].state_dict())
-               for t in range(client.task_id + 1)]
-        args = self._hook_args(interface_consolidate=True)
-        # non-boundary round: nothing replaced anywhere
-        client._a5_post_phase2_interface(3, args)
-        for t in range(client.task_id + 1):
-            self.assertTrue(_state_equal(client.heads[t].state_dict(),
-                                        pre[t]), t)
-        # boundary round: old tasks t' < task_id replaced ...
-        client._a5_post_phase2_interface(4, args)
-        for t in range(client.task_id):
-            self.assertFalse(_state_equal(client.heads[t].state_dict(),
-                                          pre[t]), t)
-        # ... current task NOT (that belongs to --head_refit)
-        self.assertTrue(_state_equal(client.heads[2].state_dict(), pre[2]))
-
 
 class TestRebuildClientHead(unittest.TestCase):
     """resume head rebuild: template / StandardizedChead branches + foreign
@@ -382,11 +345,6 @@ class TestFailClosed(unittest.TestCase):
     def test_standardize_with_refit_starts(self):
         self.assertIsNotNone(
             self._make_server(head_standardize=True, head_refit=True))
-
-    def test_standardize_with_consolidate_starts(self):
-        self.assertIsNotNone(
-            self._make_server(head_standardize=True,
-                              interface_consolidate=True))
 
     def test_legacy_server_args_accepted(self):
         """old checkpoints / legacy args carry no A5 flags at all: the
@@ -464,8 +422,7 @@ class TestRefitInputFeat(unittest.TestCase):
 
     def _hook_args(self, **flags):
         base = dict(nb_classes=20, seed=7, head_refit=False,
-                    head_standardize=False, interface_consolidate=False,
-                    refit_input='x1')
+                    head_standardize=False, refit_input='x1')
         base.update(flags)
         return types.SimpleNamespace(**base)
 
@@ -530,8 +487,8 @@ class TestRefitInputFeat(unittest.TestCase):
                                      c2.heads[0].state_dict()))
 
     def test_refit_input_feat_alone_refuses_to_start(self):
-        """fail-closed：--refit_input feat 无 refit/consolidation 时拒绝
-        启动（无作用对象）。"""
+        """fail-closed：--refit_input feat 无 refit 时拒绝启动
+        （无作用对象）。"""
         from Models.Server_DF import Server_DF
         args = types.SimpleNamespace(nb_classes=20, refit_input='feat')
         with self.assertRaises(SystemExit):

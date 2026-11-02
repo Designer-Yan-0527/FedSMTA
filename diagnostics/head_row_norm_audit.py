@@ -34,8 +34,8 @@ checkpoints opened read-only via bootstrap_server.
 
 Usage:
   python diagnostics/head_row_norm_audit.py \
-      --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
-      --run_dir output/cifar100/fedta_a2/a2_key/seed_42 [--tasks 0,1,2,3,4]
+      --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
+      --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 [--tasks 0,1,2,3,4]
 """
 
 import argparse

@@ -18,8 +18,8 @@ class Tail_Anchor(nn.Module):
         self.key = nn.Parameter(torch.randn(key_pool_size))
         nn.init.uniform_(self.key, -1, 1)
 
-        # A5-v2 F1（--head_dropout）：dropout 透传到 Chead，默认 0.5 =
-        # 官方行为逐位一致（Client_DF.init_local_model 从 args 注入）
+        # dropout 透传到 Chead，默认 0.5 = 官方行为逐位一致
+        # （F1 --head_dropout 消融已随判死方向清理删除，存档见 git 历史）
         self.head = Chead(200, dropout=dropout)
         anchor_pool_size = (nb_class,key_size)
         self.anchor_pool = nn.Parameter(torch.randn(anchor_pool_size))

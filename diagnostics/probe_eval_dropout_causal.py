@@ -158,7 +158,7 @@ def dropout_inventory(client):
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--run_dir", required=True,
-                   help="output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42")
+                   help="output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42")
     p.add_argument("--checkpoint", default="checkpoints/task_00_end.pth")
     p.add_argument("--task", type=int, default=0,
                    help="evaluated task index (heads[task] / test_loader[task])")

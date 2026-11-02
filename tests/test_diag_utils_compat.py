@@ -1,12 +1,14 @@
 """Regression test for diag_utils old-run compatibility.
 
-cifar_hsn (a pre-A2-R run) crashed feature extraction with
-AttributeError: 'Namespace' object has no attribute 'route_fix':
+cifar_hsn (a pre-switch era run) crashed feature extraction with
+AttributeError: 'Namespace' object has no attribute '<new switch>':
 load_args_from_run_dir used a hand-maintained backfill list of 3 keys,
 which went stale every time build_server grew a new parameter. The fix
 backfills EVERY current-parser key missing from the old args.json with
 the parser's parsed default; this test pins that semantics so the next
-new switch cannot reintroduce the crash.
+new switch cannot reintroduce the crash. (Historical example keys
+route_fix / skip_fed_avg_head were removed from the parser with their
+dead directions; the generic mechanism is era-agnostic and stays.)
 """
 import json
 import os
@@ -24,17 +26,16 @@ class TestDiagUtilsOldRunCompat(unittest.TestCase):
 
     def test_current_parser_defaults_cover_new_switches(self):
         d = _current_parser_defaults()
-        for key in ("route_fix", "route_key_no_wd", "route_selected_ce_grad",
-                    "skip_fed_avg_head", "method"):
+        for key in ("head_refit", "head_standardize", "refit_input",
+                    "method"):
             self.assertIn(key, d)
         # every post-hoc switch defaults to OFF = official behavior, so
         # replaying an old run stays faithful
-        self.assertFalse(d["route_fix"])
-        self.assertFalse(d["route_key_no_wd"])
-        self.assertFalse(d["route_selected_ce_grad"])
+        self.assertFalse(d["head_refit"])
+        self.assertFalse(d["head_standardize"])
 
     def test_old_args_json_gets_backfilled(self):
-        # an args.json from BEFORE --route_fix existed
+        # an args.json from BEFORE --head_refit existed
         old = {"data_name": "cifar100", "seed": 42, "client_num": 5,
                "resume": "auto", "max_rounds": 1, "data_path": "x"}
         with tempfile.TemporaryDirectory() as td:
@@ -43,7 +44,7 @@ class TestDiagUtilsOldRunCompat(unittest.TestCase):
                 json.dump(old, f)
             args = load_args_from_run_dir(td)
         # missing keys: current parser defaults
-        self.assertEqual(args.route_fix, False)
+        self.assertEqual(args.head_refit, False)
         self.assertFalse(hasattr(args, "nope_not_a_real_key"))
         # present keys: NOT overwritten
         self.assertEqual(args.seed, 42)

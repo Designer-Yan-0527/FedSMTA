@@ -66,7 +66,7 @@ re-access), never Gate input.
 Usage (from repo root):
 
   python diagnostics/probe_oracle_headroom.py \
-      --run_dir output/ImageNet-R/fedta_a2/inr_a2_key_p40/seed_42 \
+      --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
       --checkpoints task_00_end.pth,task_04_end.pth \
       --out_csv diagnostics_output/oracle_headroom_inr_a2.csv \
       --c2p 86.86,91.14

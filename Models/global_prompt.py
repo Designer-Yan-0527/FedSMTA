@@ -5,9 +5,7 @@ import torch.nn as nn
 
 class Global_Prompt(nn.Module):
     def __init__(self, length=5, embed_dim=768, embedding_key='mean', prompt_init='uniform', prompt_pool=False,
-                 prompt_key=False, pool_size=None, top_k=None, batchwise_prompt=False, prompt_key_init='uniform',
-                 route_fix=False, route_tau=0.1, route_seed=0, route_detach_ce_key_grad=False,
-                 route_selected_ce_grad=False):
+                 prompt_key=False, pool_size=None, top_k=None, batchwise_prompt=False, prompt_key_init='uniform'):
         super().__init__()
         self.length = length
         self.embed_dim = embed_dim
@@ -18,49 +16,6 @@ class Global_Prompt(nn.Module):
         self.pool_size = pool_size
         self.top_k = top_k
         self.batchwise_prompt = batchwise_prompt
-        # A2-R 路由修复开关（CLI --route_fix，默认 False = 官方行为逐位一致）：
-        #   官方 FedTA 的 Global_Prompt 路由存在结构性死锁——top-k/argmax 硬选择
-        #   不可导（路由决策无梯度）+ uniform(-1,1) 随机初始化近似平行 + pull 只拉
-        #   选中槽 → 初始垄断正反馈固化，所有样本 100% 命中单槽（诊断证据：
-        #   analyze_prompt_signal.py 实测 keyH≈0.004 bits），prompt 池退化为固定
-        #   bias。微训练探针 diagnostics/probe_route_fix.py（已验证）判决 R1+R2
-        #   使路由 5/5 客户端复活（keyH +3~4 bits）且准确率守住。
-        #   route_fix 开启 = R1（构造处正交球面 key 初始化）+ R2（forward 软路由）。
-        #   关闭时两个分支均不执行、不消耗任何 RNG（全局 torch 流零扰动）。
-        self.route_fix = route_fix
-        # R2 软路由温度 τ：w = softmax(similarity / route_tau)，CLI --route_tau
-        self.route_tau = route_tau
-        # B 臂消融开关（CLI --route_detach_ce_key_grad，默认 False）：
-        # route_audit 取证（r0, seed42）判决塌缩 100% 发生在本地训练，
-        # 且 100 个 key 全部相互对齐——需要作用于全池的力，只有 CE 软路由
-        # 的 softmax 耦合提供。本开关把 CE 路由用的相似度改为基于
-        # prompt_norm.detach() 重算：前向数值逐位不变，但 CE 对 key 的
-        # 梯度被阻断（对样本特征的梯度保留）；pull 继续用原始未 detach
-        # 的 similarity（官方等价语义、仅选中槽）。与 --route_fix 绑定，
-        # 未开启 route_fix 时 fail-closed 拒绝（防静默无效配置）。
-        self.route_detach_ce_key_grad = route_detach_ce_key_grad
-        if self.route_detach_ce_key_grad and not self.route_fix:
-            raise ValueError(
-                "--route_detach_ce_key_grad only takes effect with --route_fix")
-        # E1 臂修复开关（CLI --route_selected_ce_grad，默认 False）：
-        # B/C/D 三臂归因（2026-10-28 终审）判决 CE 全池软路由梯度是 key
-        # 塌缩主驱动（B 断后 4/5 客户端保秩 81-91；C 留 CE 则 5/5 全塌
-        # 3-8），但 B 的纯 detach 有严重副作用——绝大多数 key 失去梯度
-        # 供养后被 weight decay 磨没（mean norm 0.0067，rank healthy ≠
-        # key pool healthy）。E1 = forward-soft / backward-selected：
-        # 前向与 route_fix 逐位一致；CE 对 key 的梯度只经 per-sample
-        # detached top-k 选中槽回传（稀疏且按样本分散，刻意不做
-        # batchwise 多数投票——修复目标正是"全池被共同拉向同一方向"）；
-        # CE 对样本特征的梯度完整保留；pull 保持官方语义。与
-        # --route_fix 绑定，且与 B 臂互斥（同一消融矩阵的互斥臂）。
-        self.route_selected_ce_grad = route_selected_ce_grad
-        if self.route_selected_ce_grad and not self.route_fix:
-            raise ValueError(
-                "--route_selected_ce_grad only takes effect with --route_fix")
-        if self.route_selected_ce_grad and self.route_detach_ce_key_grad:
-            raise ValueError(
-                "--route_selected_ce_grad is mutually exclusive with "
-                "--route_detach_ce_key_grad")
 
         # 初始化提示池  提示数量x长度x嵌入维度
         # 提示长度为5？
@@ -79,46 +34,22 @@ class Global_Prompt(nn.Module):
             if prompt_key_init == 'zero':
                 self.prompt_key = nn.Parameter(torch.zeros(key_shape))
             elif prompt_key_init == 'uniform':
-                if route_fix:
-                    # R1：正交球面初始化（--route_fix 开启分支；探针
-                    # diagnostics/probe_route_fix.py 的 reset 臂
-                    # （reset_prompt_key_orthonormal）同款语义）。
-                    # 官方 uniform(-1,1) 随机 key 近似平行且选择决策不可导，
-                    # 初始 monopoly 正反馈固化为单槽命中（死锁第 2 环节）；
-                    # 正交化后初始方向两两垂直（球面 Haar 均匀），从源头打破。
-                    # 数学上与 nn.init.orthogonal_ 等价（高斯矩阵 QR 分解），
-                    # 但改走独立 torch.Generator：既不消耗全局 RNG 流
-                    # （数据划分 / 训练流与关闭时不发生相对移位），又可复现
-                    # （route_seed = run 的 --seed）。
-                    if pool_size > embed_dim:
-                        raise ValueError(
-                            f"route_fix R1 orthogonal init needs "
-                            f"pool_size<=embed_dim, got {pool_size}>{embed_dim}")
-                    gen = torch.Generator()  # 独立随机流，不碰全局 torch RNG
-                    gen.manual_seed(int(route_seed))
-                    raw = torch.randn(embed_dim, pool_size, generator=gen)
-                    q, _ = torch.linalg.qr(raw)   # (dim, pool) 列正交
-                    rows = q.t().contiguous()     # (pool, dim) 行正交
-                    # forward 中 key 与 cls 特征都过 l2_normalize，
-                    # 绝对尺度无信息、方向是全部信息 → 按行 L2 归一化落位
-                    self.prompt_key = nn.Parameter(self.l2_normalize(rows, 1))
-                else:
-                    # 官方路径（route_fix 关闭）：逐字保留，全局 RNG 消耗
-                    # 次数与原实现一致 → 默认 run 逐位可复现
-                    self.prompt_key = nn.Parameter(torch.randn(key_shape))
-                    nn.init.uniform_(self.prompt_key, -1, 1)
+                # 官方路径：逐字保留，全局 RNG 消耗次数与原实现一致
+                # （route_fix 家族已判死删除，存档见 git 历史）
+                self.prompt_key = nn.Parameter(torch.randn(key_shape))
+                nn.init.uniform_(self.prompt_key, -1, 1)
         else:
             # else use mean of prompt as key
             # only compatible with prompt, not prefix
             prompt_mean = torch.mean(self.prompt, dim=1)
             self.prompt_key = prompt_mean
-    
+
     def l2_normalize(self, x, dim=None, epsilon=1e-12):
         """Normalizes a given vector or matrix."""
         square_sum = torch.sum(x ** 2, dim=dim, keepdim=True)
         x_inv_norm = torch.rsqrt(torch.maximum(square_sum, torch.tensor(epsilon, device=x.device)))
         return x * x_inv_norm
-    
+
     def forward(self, x_embed, prompt_mask=None, cls_features=None):
         # 可以用class-specific prompt吗？
         out = dict()
@@ -148,151 +79,46 @@ class Global_Prompt(nn.Module):
 
             # prompt_mask其实就是判断哪些prompt要选择
             # 所以没有prompt_mask就不用余弦相似度了来进行选择了
-            if self.route_fix:
-                # -----------------------------------------------------------
-                # A2-R R2：可导软路由（--route_fix 开启分支）
-                # 探针（diagnostics/probe_route_fix.py）判决：R1+R2 使路由
-                # 5/5 客户端复活（keyH +3~4 bits）且准确率守住；训练与推理
-                # 同款软加权（不做 train-soft/infer-hard 分裂，探针验证的
-                # 就是全软形态）。官方 top-k/argmax 硬选择不可导是死锁第 1
-                # 环节，这里替换为全池可导 softmax：w = softmax(sim/τ)。
-                # τ=route_tau=0.1 时 softmax 的有效支撑集中在相似度最高的
-                # 少数槽上，与 top-k 选择语义兼容且对 prompt_key 处处可导。
-                # -----------------------------------------------------------
-                if prompt_mask is not None:
-                    # 探针同款 fail-closed：软路由与 use_prompt_mask 组合
-                    # 未经验证（本协议 use_prompt_mask=False），拒绝静默不一致
-                    raise RuntimeError(
-                        "--route_fix soft routing is incompatible with "
-                        "use_prompt_mask=True")
-                # 按样本软加权，天然取代官方 batchwise 批内多数投票分支。
-                # B 臂消融（--route_detach_ce_key_grad）：CE 路由用的相似度
-                # 改为基于 prompt_norm.detach() 重算——数值与 similarity 逐位
-                # 相同（前向完全不变），但 CE 梯度不再经 w 流向 prompt_key
-                # （经 x_embed_norm 流向样本特征的路径保留）；pull 仍用下方
-                # 原始未 detach 的 similarity。默认 False 时 route_sim 就是
-                # similarity 本身，与开关引入前的代码逐位一致。
-                if self.route_detach_ce_key_grad:
-                    route_sim = torch.matmul(
-                        x_embed_norm, prompt_norm.detach().t())
-                elif self.route_selected_ce_grad:
-                    # E1（--route_selected_ce_grad）：mask 重构技巧。
-                    #   sim_no_key = x_norm @ K_norm.detach().T   （无 key 梯度通道）
-                    #   ce_topk_idx = topk(sim.detach())          （per-sample 选择）
-                    #   route_sim = sim_no_key + mask*(sim - sim_no_key)
-                    # 数值上 route_sim == similarity（前向逐位不变），但反向：
-                    #   ∂route_sim/∂K = mask ⊙ ∂sim/∂K   → CE→key 仅选中槽
-                    #   ∂route_sim/∂x = ∂sim/∂x（全量）    → CE→feature 完整
-                    # softmax 耦合仍在（dL/droute_sim 对全槽非零），只是被
-                    # mask 门控后才到达 key——CE→feature 语义与 route_fix
-                    # 逐位相同。
-                    sim_no_key = torch.matmul(
-                        x_embed_norm, prompt_norm.detach().t())
-                    ce_topk_idx = torch.topk(
-                        similarity.detach(), k=self.top_k, dim=1).indices
-                    ce_mask = torch.zeros_like(similarity).scatter_(
-                        1, ce_topk_idx, 1.0)
-                    route_sim = sim_no_key + ce_mask * (
-                        similarity - sim_no_key)
-                else:
-                    route_sim = similarity
-                w = torch.softmax(route_sim / self.route_tau, dim=-1)  # B, Pool
-                batched_prompt = torch.einsum('bp,plc->blc', w, self.prompt)  # B, length, C
-                if self.top_k > 1:
-                    # token 数保持 length×top_k 不变（结构兼容：官方聚合 /
-                    # pos_embed / head_type='prompt' 消费者不受影响）
-                    batched_prompt = batched_prompt.repeat(1, self.top_k, 1)
-                out['prompt_idx'] = torch.argmax(similarity, dim=1)  # 仅诊断观察用（不可导）
-                out['prompt_norm'] = prompt_norm
-                out['x_embed_norm'] = x_embed_norm
-                out['similarity'] = similarity
-                out['soft_weights'] = w
-                if self.route_selected_ce_grad:
-                    # E1 诊断：本次 CE 反向可更新哪些槽（per-sample top-k，
-                    # 仅观察用，索引不传梯度）
-                    out['ce_route_topk'] = ce_topk_idx
-                # A 方案 pull 解耦（2026-10-27 全轨迹判决后修订）：
-                # 旧版全池软 pull（reduce_sim = top_k·Σ(w·sim)/B）与首臂
-                # round-0 key 塌缩（有效秩 87.8 → 6.5）同时出现，判定为
-                # 强候选驱动机制：w 近均匀时该式把全部 key 拉向特征均值
-                # 方向，FedAvg 抵消各客户端判别分量后仅存共性方向；
-                # 是否为唯一根因待 A 方案真实训练对照验证。
-                # 修订：pull 槽位选择逐字复刻官方路径（top-k +
-                # batchwise 批内多数投票，本协议 batchwise_prompt=True），
-                # 选择用 detach 的 sim（索引不传梯度），pull 梯度仅经
-                # 未 detach 的被选中相似度回传到对应 key；CE 路径保持
-                # 全池软路由不变（梯度仍经 w 流向全部 key）。
-                #   官方 reduce_sim = Σ_b Σ_{k∈idx} cos(x_b, key_k) / B
-                #   gather 版      = Σ(sel_sim) / B
-                # （数学值与梯度等价；浮点累加顺序不同，非逐位等价，
-                #   逐位声明需容差数值测试验证）
-                _, idx = torch.topk(similarity.detach(), k=self.top_k, dim=1)  # B, top_k
+            # 官方路径：以下代码逐字保留，保证默认 run 的前向与原实现逐位一致
+            if prompt_mask is None:
+                # 选择topk个
+                _, idx = torch.topk(similarity, k=self.top_k, dim=1) # B, top_k
                 if self.batchwise_prompt:
                     prompt_id, id_counts = torch.unique(idx, return_counts=True, sorted=True)
+                    # In jnp.unique, when the 'size' is specified and there are fewer than the indicated number of elements,
+                    # the remaining elements will be filled with 'fill_value', the default is the minimum value along the specified dimension.
+                    # Unless dimension is specified, this will be flattend if it is not already flat.
                     if prompt_id.shape[0] < self.pool_size:
                         prompt_id = torch.cat([prompt_id, torch.full((self.pool_size - prompt_id.shape[0],), torch.min(idx.flatten()), device=prompt_id.device)])
                         id_counts = torch.cat([id_counts, torch.full((self.pool_size - id_counts.shape[0],), 0, device=id_counts.device)])
-                    _, major_idx = torch.topk(id_counts, k=self.top_k)  # top_k
-                    major_prompt_id = prompt_id[major_idx]  # top_k
-                    idx = major_prompt_id.expand(x_embed.shape[0], -1)  # B, top_k
-                sel_sim = similarity.gather(1, idx)  # B, top_k（similarity 未 detach，梯度保留）
-                out['pull_idx'] = idx
-                reduce_sim = torch.sum(sel_sim) / x_embed.shape[0]
-                out['reduce_sim'] = reduce_sim
+                    _, major_idx = torch.topk(id_counts, k=self.top_k) # top_k
+                    major_prompt_id = prompt_id[major_idx] # top_k
+                    # expand to batch
+                    idx = major_prompt_id.expand(x_embed.shape[0], -1) # B, top_k
             else:
-                # 官方路径（route_fix 关闭）：以下代码逐字保留，保证默认
-                # run 的前向与原实现逐位一致
-                if prompt_mask is None:
-                    # 选择topk个
-                    _, idx = torch.topk(similarity, k=self.top_k, dim=1) # B, top_k
-                    if self.batchwise_prompt:
-                        prompt_id, id_counts = torch.unique(idx, return_counts=True, sorted=True)
-                        # In jnp.unique, when the 'size' is specified and there are fewer than the indicated number of elements,
-                        # the remaining elements will be filled with 'fill_value', the default is the minimum value along the specified dimension.
-                        # Unless dimension is specified, this will be flattend if it is not already 1D.
-                        if prompt_id.shape[0] < self.pool_size:
-                            prompt_id = torch.cat([prompt_id, torch.full((self.pool_size - prompt_id.shape[0],), torch.min(idx.flatten()), device=prompt_id.device)])
-                            id_counts = torch.cat([id_counts, torch.full((self.pool_size - id_counts.shape[0],), 0, device=id_counts.device)])
-                        _, major_idx = torch.topk(id_counts, k=self.top_k) # top_k
-                        major_prompt_id = prompt_id[major_idx] # top_k
-                        # expand to batch
-                        idx = major_prompt_id.expand(x_embed.shape[0], -1) # B, top_k
-                else:
-                    idx = prompt_mask # B, top_k
-                    print(idx)
+                idx = prompt_mask # B, top_k
+                print(idx)
 
-                # batched_prompt_raw 就是topk的prompt
-                batched_prompt_raw = self.prompt[idx] # B, top_k, length, C
-                batch_size, top_k, length, c = batched_prompt_raw.shape
-                batched_prompt = batched_prompt_raw.reshape(batch_size, top_k * length, c) # B, top_k * length, C
+            # batched_prompt_raw 就是topk的prompt
+            batched_prompt_raw = self.prompt[idx] # B, top_k, length, C
+            batch_size, top_k, length, c = batched_prompt_raw.shape
+            batched_prompt = batched_prompt_raw.reshape(batch_size, top_k * length, c) # B, top_k * length, C
 
-                out['prompt_idx'] = idx
+            out['prompt_idx'] = idx
 
-                # Debugging, return sim as well
-                out['prompt_norm'] = prompt_norm
-                out['x_embed_norm'] = x_embed_norm
-                out['similarity'] = similarity
+            # Debugging, return sim as well
+            out['prompt_norm'] = prompt_norm
+            out['x_embed_norm'] = x_embed_norm
+            out['similarity'] = similarity
 
-                # Put pull_constraint loss calculation inside
-                batched_key_norm = prompt_norm[idx] # B, top_k, C
-                out['selected_key'] = batched_key_norm
-                x_embed_norm = x_embed_norm.unsqueeze(1) # B, 1, C
-                sim = batched_key_norm * x_embed_norm # B, top_k, C
-                reduce_sim = torch.sum(sim) / x_embed.shape[0] # Scalar
+            # Put pull_constraint loss calculation inside
+            batched_key_norm = prompt_norm[idx] # B, top_k, C
+            out['selected_key'] = batched_key_norm
+            x_embed_norm = x_embed_norm.unsqueeze(1) # B, 1, C
+            sim = batched_key_norm * x_embed_norm # B, top_k, C
+            reduce_sim = torch.sum(sim) / x_embed.shape[0] # Scalar
 
-                # print('-------------------')
-                # print(x_embed_norm.shape)  #
-                # print(batched_key_norm.shape)
-                #
-                #
-                # print(sim.shape)
-                # print(sim)
-                # print(torch.sum(sim))
-                # print(reduce_sim.shape)
-                # print(reduce_sim)
-                # time.sleep(50)
-
-                out['reduce_sim'] = reduce_sim
+            out['reduce_sim'] = reduce_sim
         else:
             if self.prompt_init == 'zero':
                 self.prompt = nn.Parameter(torch.zeros(self.length, self.embed_dim))
@@ -300,7 +126,7 @@ class Global_Prompt(nn.Module):
                 self.prompt = nn.Parameter(torch.randn(self.length, self.embed_dim))
                 nn.init.uniform_(self.prompt)
             batched_prompt = self.prompt.unsqueeze(0).expand(x_embed.shape[0], -1, -1)
-        
+
         # The input with the prompt concatenated to the front. [B, prompt+token, C]
 
         out['total_prompt_len'] = batched_prompt.shape[1]

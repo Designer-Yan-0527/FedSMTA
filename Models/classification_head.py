@@ -6,9 +6,9 @@ from torch import nn
 
 class Chead(torch.nn.Module):
     def __init__(self,label_num,dropout=0.5):
-        """A5-v2 F1（--head_dropout，2026-10-28）：train 端 Dropout p 参数化。
-        默认 0.5 = 官方行为逐位一致（构造不消耗 RNG，前向路径不变）；
-        p=0.0 为归因消融臂（phase-2 前向不再消耗 dropout RNG，臂内自洽）。"""
+        """Dropout p 参数化：默认 0.5 = 官方行为逐位一致（构造不消耗
+        RNG，前向路径不变）；A5-v2 M2' refit 头配方使用 p=0.1。
+        （F1 --head_dropout 消融已随判死方向清理删除，存档见 git 历史。）"""
         super(Chead,self).__init__()
 
         # self.head = nn.Sequential(nn.Linear(768*2, label_num))

@@ -95,11 +95,15 @@ def parse_args():
     # mlp_local recipe (probe_oracle_headroom defaults; kept identical so
     # the T0 recipe-gap baseline stays comparable with §22.2 numbers)
     p.add_argument("--hidden", default=256, type=int)
-    p.add_argument("--retrain_grid", default="std:256,std:512,nostd:256,nostd:512",
-                   help="comma list of retrain recipe variants for the "
-                        "§27.6 recipe-separation reading; each spec is "
-                        "<std|nostd>:<hidden>. The std:<--hidden> entry is "
-                        "the P1 main retrain column (pre-registered)")
+    p.add_argument("--retrain_grid",
+                   default="std:256,std:512,nostd:256,nostd:512,z7m:256,x1m:512",
+                   help="comma list of retrain recipe variants; specs: "
+                        "<std|nostd>:<hidden> (§27.6 recipe grid, "
+                        "fit_head), z7m:<hidden> (§27.7 ladder B: 768-d "
+                        "input + refit masked-CE semantics), x1m:<hidden> "
+                        "(ladder C1: z||0 1536-d + refit structure). The "
+                        "std:<--hidden> entry is the P1 main retrain "
+                        "column (pre-registered)")
     p.add_argument("--epochs", default=100, type=int)
     p.add_argument("--lr", default=1e-3, type=float)
     p.add_argument("--wd", default=1e-4, type=float)
@@ -312,10 +316,59 @@ def p2_verdict(per_task, sunken, gap_gate):
     return "CLEAN"
 
 
+def fit_head_masked(z_tr, y_tr, classes, nb_classes, label_num, *, seed,
+                    hidden, pad_to_1536, epochs, lr, wd, dropout,
+                    batch_size, device):
+    """§27.7 ladder variants B/C1: EXACT replica of the refit head's
+    training loop (_a5_refit_one_head) on the probe's own (post-broadcast)
+    feature cache -- only the feature TIMEPOINT differs from the training
+    pipeline. No standardization (refit default); output dim = label_num
+    (Chead's hard-coded 200, bare columns included); masked CE replicates
+    the refit semantics: not_mask = setdiff1d(arange(nb_classes), classes)
+    filled with -inf (columns nb_classes..label_num-1 stay bare, exactly
+    like the official path). pad_to_1536: x1m variant feeds z||0 (1536),
+    z7m feeds the raw 768 z. Evaluation = logits[:, sorted(classes)]
+    argmax -- the native_cached column semantics. Returns test accuracy."""
+    import torch as _torch
+    z = _torch.tensor(np.asarray(z_tr, dtype=np.float32), device=device)
+    yt = _torch.tensor(np.asarray(y_tr, dtype=np.int64), device=device)
+    if pad_to_1536:
+        z = _torch.cat([z, _torch.zeros(
+            z.shape[0], z.shape[1], dtype=z.dtype, device=device)], dim=1)
+    not_mask = np.setdiff1d(np.arange(nb_classes), classes)
+    not_mask = _torch.tensor(not_mask, dtype=_torch.int64, device=device)
+    _torch.manual_seed(seed)
+    model = _torch.nn.Sequential(
+        _torch.nn.Linear(z.shape[1], hidden), _torch.nn.ReLU(),
+        _torch.nn.Dropout(p=dropout), _torch.nn.Linear(hidden, label_num))
+    model.to(device)
+    model.train()
+    opt = _torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    crit = _torch.nn.CrossEntropyLoss().to(device)
+    n = z.shape[0]
+    bs = min(batch_size, n)
+    for _ in range(epochs):
+        perm = _torch.randperm(n, device=device)
+        for s in range(0, n, bs):
+            idx = perm[s:s + bs]
+            logits = model(z[idx])
+            logits = logits.index_fill(dim=1, index=not_mask,
+                                       value=float("-inf"))
+            loss = crit(logits, yt[idx])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    model.eval()
+    return model
+
+
 def parse_grid(spec, main_hidden):
-    """'std:256,std:512,nostd:256,nostd:512' -> [(True,256),(True,512),
-    (False,256),(False,512)]. Fail-closed: the pre-registered P1 main
-    column std:<main_hidden> must be present (the P1 verdict reads it)."""
+    """§27.6 grid + §27.7 ladder. Spec forms:
+      std:<h> / nostd:<h>  : fit_head variants (pre-registered P1 columns)
+      z7m:<h>              : 768-d input + REFIT masked-CE semantics (ladder B)
+      x1m:<h>              : z||0 1536-d + refit structure (ladder C1)
+    Fail-closed: the pre-registered P1 main column std:<main_hidden> must
+    be present (the P1 verdict reads it)."""
     out = []
     seen_main = False
     for item in spec.split(","):
@@ -323,10 +376,10 @@ def parse_grid(spec, main_hidden):
         if not item:
             continue
         tag, sep, h = item.partition(":")
-        if not sep or tag not in ("std", "nostd"):
+        if not sep or tag not in ("std", "nostd", "z7m", "x1m"):
             raise SystemExit("bad --retrain_grid spec %r" % item)
-        entry = (tag == "std", int(h))
-        if entry == (True, main_hidden):
+        entry = (tag, int(h))
+        if entry == ("std", main_hidden):
             seen_main = True
         out.append(entry)
     if not seen_main:
@@ -489,24 +542,50 @@ def main():
             # (b) retrain recipe grid on the SAME cache. The
             # std:<args.hidden> entry keeps the historical seed so the P1
             # main column stays comparable across probe versions; every
-            # other variant gets its own deterministic seed.
+            # other variant gets its own deterministic seed. z7m/x1m are
+            # §27.7 ladder variants: refit-semantics training evaluated
+            # with the native_cached column indexing.
             variant_acc = {}
-            for std_flag, h in grid:
-                tag = ("std" if std_flag else "nostd") + str(h)
-                if (std_flag, h) == (True, args.hidden):
+            for gtag, h in grid:
+                tag = gtag + str(h)
+                if (gtag, h) == ("std", args.hidden):
                     vseed = stable_seed(args.seed_base, "p1",
                                         run_dir.name, c.id, t)
                 else:
                     vseed = stable_seed(args.seed_base, "p1", tag,
                                         run_dir.name, c.id, t)
-                handle = fit_head(
-                    z_tr, y_tr, classes, seed=vseed,
-                    hidden=h, epochs=args.epochs, lr=args.lr,
-                    wd=args.wd, dropout=args.dropout,
-                    batch_size=args.batch_size, device=args.device,
-                    standardize=std_flag)
-                pred = head_predict(handle, z_te, allowed=classes)
-                variant_acc[tag] = _acc(pred, y_te)
+                if gtag in ("std", "nostd"):
+                    handle = fit_head(
+                        z_tr, y_tr, classes, seed=vseed,
+                        hidden=h, epochs=args.epochs, lr=args.lr,
+                        wd=args.wd, dropout=args.dropout,
+                        batch_size=args.batch_size, device=args.device,
+                        standardize=(gtag == "std"))
+                    pred = head_predict(handle, z_te, allowed=classes)
+                    variant_acc[tag] = _acc(pred, y_te)
+                else:  # z7m / x1m ladder (§27.7)
+                    label_num = int(c.model.nb_class)
+                    model_m = fit_head_masked(
+                        z_tr, y_tr, classes, env_args.nb_classes,
+                        label_num, seed=vseed, hidden=h,
+                        pad_to_1536=(gtag == "x1m"),
+                        epochs=args.epochs, lr=args.lr, wd=args.wd,
+                        dropout=args.dropout, batch_size=args.batch_size,
+                        device=args.device)
+                    zt_t = torch.tensor(z_te, dtype=torch.float32)
+                    if gtag == "x1m":
+                        zt_t = torch.cat(
+                            [zt_t, torch.zeros(
+                                zt_t.shape[0], zt_t.shape[1],
+                                dtype=torch.float32)], dim=1)
+                    dev = next(model_m.parameters()).device
+                    with torch.no_grad():
+                        logits_m = model_m(zt_t.to(dev)).cpu().numpy()
+                    cols_m = sorted(classes)
+                    pred_m = np.asarray(
+                        [cols_m[i] for i in
+                         logits_m[:, cols_m].argmax(axis=1)])
+                    variant_acc[tag] = _acc(pred_m, y_te)
             retrain[c.id] = variant_acc["std%d" % args.hidden]
             variants_by_client.setdefault(c.id, {})[t] = variant_acc
         retrain_mean = float(np.mean(list(retrain.values())))
@@ -533,8 +612,7 @@ def main():
             p2_per_task[t] = None  # T0: no old classes, nothing to intrude
 
         raw_delta = retrain_mean - native_cached_mean
-        grid_tags = ["%s%d" % ("std" if s else "nostd", h)
-                     for s, h in grid]
+        grid_tags = [("%s%d" % (g, h)) for g, h in grid]
         variants_mean = {
             tag: float(np.mean(
                 [variants_by_client[cid][t][tag]
