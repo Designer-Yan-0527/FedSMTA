@@ -1428,3 +1428,61 @@ python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets 
 **归因判决：2pp 头滞后的真凶 = 训练-评估特征时点错位**。refit 头每轮在"本地 phase-2 后（广播前）"的池状态上缓存特征训练，而评估/部署发生在"广播后"的池状态上；错位量随任务数递增（t1 +0.66 → t4 +2.36 校正）——与广播对池的重置幅度随任务数累积一致（本地训练对共享行扰动越大、广播重置差异越大），机制与 §26.5-2"广播是稳定器"互证。CE 域、结构维度、标准化、hidden 四因素全部排除（互相重叠 ±0.3pp 内）；mlp_local 全族的 ~2pp 优势 = 它天然在探针的广播后缓存上训练，与配方无关。
 
 **行动方向（按 27.7 判级声明，另立判据臂验证，本探针不立项）**：refit 特征缓存时点移到广播后（客户端收到 server 池之后再 refit）——训练协议级改动。预期收益 = 头滞后读数的主体（T2 ~2pp / T4 ~2.4pp 边界），代价与交互（与每轮广播循环的顺序、RNG 中立设计是否保持、每轮 refit 语义变化）需在判据臂 spec 里预注册后再动。
+
+## 28. broadcast-post-refit 判据臂（§27.7-1 判决的落地，2026-11-02 预注册）
+
+> 立项依据 = §27.7-1 归因判决：oracle mlp_local 相对 M2' 的 ~2pp 优势来自**特征时点错配**——M2' 的 refit 头在"本地 phase-2 后（广播前）"的接口状态上缓存特征训练，而评估/部署发生在"广播后"状态（客户端 vit 已装载 server 融合 prompt）。判级声明同 §27.7：**修复级协议改进（配方只产数字），不构成方法创新主张**。
+
+### 28.1 方法定义（实现即本节，代码为准）
+
+**开关**：`--refit_timing {local,post_broadcast}`，默认 `local` = M2' 现行为逐位不变；fail-closed：`post_broadcast` 必须与 `--head_refit` 联用（无作用对象拒绝启动）。与 `--refit_input` / `--head_standardize` 正交（同一次 refit 的输入路径与标准化配方照常生效）。
+
+**`post_broadcast` 语义**（相对 M2' 的唯一变量 = refit 时点）：
+
+1. `train()` 末尾钩子退化为纯快照：`_a5_joint_head` 照常快照（phase-2 后、两 evaluate 前），**不再**在本地时点 refit；`heads[task_id]` 保持官方语义（= phase-2 后联训头）。
+2. refit 移到 `get_global_proto_and_head()`（广播路径）内、`vit.load_prompts(广播 prompt)` 之后、两个 evaluate 之前：特征缓存在**广播后接口状态**（融合 prompt + 本地 phase-2 后 Tail_Anchor 状态）上采集——与随后的 evaluate 特征流完全同源；refit 配方（masked CE / Adam 1e-3,wd 1e-4 / 100 epoch / batch 64 / 稳定种子）与 M2' 完全一致，替换 `heads[task_id]` 后再 evaluate（server 相位的日志/corrected 口径即反映新头）。
+3. 非参与客户端（`get_global_proto_and_head_no_test` 路径）不 refit——与 M2' 一致（refit 只属于 train() 参与者）。
+
+**RNG 中立（不变式，单测覆盖）**：refit 全程四流快照恢复，插入点前后（train() 两 evaluate、广播路径两 evaluate）的 RNG 消费流与官方逐位一致 → 表征侧轨迹（prompt/key/anchor/joint head）与官方 run 逐位一致；本臂 vs M2' 的任何 corrected 指标差 100% 归因于 refit 特征时点。checkpoint schema 不变（heads[task_id] = 广播后 refit 头、a5_joint_head = 联训轨迹；边界轮 checkpoint 在广播后保存，天然捕获新头）；`refit_timing` 增补 RESUME_MUST_MATCH（two-sided，老 checkpoint 兼容）。
+
+**已知边界（如实报告）**：
+
+1. 广播后时点的特征仍带 train split 增强（与 M2' 同数据流）；探针对账时注意。
+2. train() 末尾两 evaluate（本地相位日志）在 M2' 用 refit 头、在本臂用联训头——本地相位读数两臂语义不同，跨臂对照一律用 server 相位/corrected 边界口径。
+3. `local` 显式值与 legacy args（无该键）逐位一致（getattr 默认路径，单测覆盖）。
+
+### 28.2 判读（预注册，先于数据）
+
+| 判读项 | 口径 | 门 |
+|---|---|---|
+| 主判据 | cifar M2''（post_broadcast）vs M2'（local）corrected 边界列 T2/T4 差 | **≥ +1.0pp = GREEN**（对齐 §27.6 门槛；§27.7-1 预期主体 ~2pp，对账带 = T2 ~+2.0 / T4 ~+2.4） |
+| 早期轮约束 | T0/T1 边界差不降 | 广播-本地特征差随任务数累积（t1 仅 +0.66），早期轮预期 ≈0；若显著为负则时点改动有未建模代价 |
+| 探针对账 | 边界列 vs §27.7-1 x1m512 读数（T2 95.00 / T4 96.90） | 收益主体兑现则差值 ≈ 0±0.5；显著低于探针 → 查增强/划分差异 |
+| INR 复核 | INR M2'' vs M2'（81.93 corrected）同划分 | 预期同向（错位量随任务数增长机制通用）；不设 GREEN 门，作方向性证据 |
+| 轨迹不变性 sanity | 两臂 key/anchor/joint-head checkpoint 抽查 | 逐位一致（RNG 中立设计保证） |
+
+GREEN 后按惯例补 3 种子（1999/2025）；判级不变：修复级配方，不作方法主张。
+
+### 28.3 命令（GPT 审核通过后执行；先跑 T0 三 Gate 回归确认基线逐位不变）
+
+```bash
+# T0 回归（三 Gate：官方基线 / M2' OFF / M2' ON 逐位复现，--max_rounds 2）
+
+# 判据臂（cifar 全程；M2'' = M2' + --refit_timing post_broadcast 单变量）
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --client_num 5 --task_num 5 --private_class_num 15 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --refit_timing post_broadcast \
+    --run_name cifar_a5v2_M2pb_full
+
+# INR 复核臂（M2' 同划分：task_num 5 / private 40 / surrogate 5，
+# 与 inr_a5v2_M2_feat_p40 单变量对照）
+python main.py datasets_delay --data_name ImageNet-R --data-path ./local_datasets \
+    --surrogate_num 5 \
+    --client_num 5 --task_num 5 --private_class_num 40 \
+    --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 \
+    --head_refit --refit_input feat --refit_timing post_broadcast \
+    --run_name inr_a5v2_M2pb_p40
+```
+
+主判读场 = cifar（`cifar_a5v2_M2_feat_full` 为 M2' 对照，92.58 T2 / 94.22→96.90 见 §27.7-1）；INR 对照 = `inr_a5v2_M2_feat_p40`（81.93 corrected，task_num 5 / private 40 / surrogate 5）。GREEN 后种子扩展同 §23.2 惯例。

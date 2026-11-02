@@ -118,6 +118,14 @@ class Server_DF(object):
                 "--refit_input feat requires --head_refit "
                 "(nothing to refit; "
                 "fail-closed, RUNCOMMANDS Sec.23.6-1)")
+        # A5-v2 §28 fail-closed：refit_timing 只改 refit 的时点；单独
+        # 开启 = 无效配置，拒绝启动而非静默忽略
+        if str(getattr(args, 'refit_timing', 'local')) == 'post_broadcast' and not (
+                bool(getattr(args, 'head_refit', False))):
+            raise SystemExit(
+                "--refit_timing post_broadcast requires --head_refit "
+                "(nothing to refit; "
+                "fail-closed, RUNCOMMANDS Sec.28)")
 
     def init_client(self):
         print('Initialize clients')
@@ -712,7 +720,7 @@ class Server_DF(object):
         "seed", "threshold", "surrogate_num",
         # A5-v2（RUNCOMMANDS §23）：跨 ON/OFF resume 会静默改变接口语
         # 义与 joint-head 轨迹管理；two-sided 检查保持老 checkpoint 兼容
-        "head_refit", "head_standardize", "refit_input",
+        "head_refit", "head_standardize", "refit_input", "refit_timing",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):

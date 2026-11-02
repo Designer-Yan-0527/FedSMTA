@@ -27,12 +27,13 @@ class TestDiagUtilsOldRunCompat(unittest.TestCase):
     def test_current_parser_defaults_cover_new_switches(self):
         d = _current_parser_defaults()
         for key in ("head_refit", "head_standardize", "refit_input",
-                    "method"):
+                    "refit_timing", "method"):
             self.assertIn(key, d)
         # every post-hoc switch defaults to OFF = official behavior, so
         # replaying an old run stays faithful
         self.assertFalse(d["head_refit"])
         self.assertFalse(d["head_standardize"])
+        self.assertEqual(d["refit_timing"], "local")
 
     def test_old_args_json_gets_backfilled(self):
         # an args.json from BEFORE --head_refit existed

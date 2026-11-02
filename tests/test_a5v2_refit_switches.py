@@ -5,6 +5,10 @@ Switches added 2026-10-28 (pre-registered RUNCOMMANDS Sec.23):
   F2 --head_refit             post-phase-2 readout-only refit of heads[task_id]
   F3 --head_standardize       standardize refit input (StandardizedChead,
                              mu/sd as persistent buffers)
+  §28 --refit_timing          local (default, M2' bit-identical) vs
+                             post_broadcast (refit moved into the broadcast
+                             path, feature cache on the post-broadcast
+                             interface state = Sec.27.7-1 verdict arm)
 
 (F1 --head_dropout 消融与 F4 巩固臂已随判死方向清理删除，存档见
  git 历史。)
@@ -56,6 +60,17 @@ class _A5Vit(torch.nn.Module):
     def forward(self, input, task_id=None, cls_features=None, train=False):
         return {'feat': input}
 
+    def load_prompts(self, prompts):
+        pass
+
+
+class _A5Orig(torch.nn.Module):
+    """Minimal original_model stand-in for evaluate() (which requires a
+    {'pre_logits': ...} output when original_model is not None)."""
+
+    def forward(self, input):
+        return {'pre_logits': input}
+
 
 def _task_dataset(task, n, seed):
     """Deterministic per-task dataset; labels are INSIDE the task's class
@@ -68,7 +83,7 @@ def _task_dataset(task, n, seed):
 
 def _make_a5_client(head_refit=False, head_standardize=False,
                    task_id=0, legacy_args=False, seed=123, n_rows=24,
-                   refit_input=None):
+                   refit_input=None, refit_timing=None, original_model=None):
     from Models.Client_DF import Client_DF
     kwargs = dict(nb_classes=20, seed=seed)
     if not legacy_args:
@@ -76,12 +91,15 @@ def _make_a5_client(head_refit=False, head_standardize=False,
                       head_standardize=head_standardize)
         if refit_input is not None:
             kwargs['refit_input'] = refit_input
+        if refit_timing is not None:
+            kwargs['refit_timing'] = refit_timing
     args = types.SimpleNamespace(**kwargs)
     class_mask = [[2 * t, 2 * t + 1] for t in range(10)]
     train_data = [_task_dataset(t, n_rows, seed) for t in range(10)]
     torch.manual_seed(seed)
-    client = Client_DF(0, None, 'Tail_Anchor', 5, train_data, 1, 16, 0.01,
-                       _DEVICE, 'fedta', class_mask, args, _A5Vit())
+    client = Client_DF(0, original_model, 'Tail_Anchor', 5, train_data, 1,
+                       16, 0.01, _DEVICE, 'fedta', class_mask, args,
+                       _A5Vit())
     client.model.to(_DEVICE)
     client.task_id = task_id
     client.data_split_indices = {
@@ -504,6 +522,164 @@ class TestRefitInputFeat(unittest.TestCase):
                             [[0, 1]], 0.01, 5, 1, 16, 'cpu', 'fedta', 0.25,
                             None, None, args, None)
         self.assertIsNotNone(server)
+
+
+@unittest.skipUnless(_CUDA, "Tail_Anchor.forward hardcodes .to('cuda')")
+class TestRefitTimingPostBroadcast(unittest.TestCase):
+    """A5-v2 §28 判据臂（--refit_timing post_broadcast，§27.7-1 归因判决
+    的落地）：refit 从 train() 末尾（本地 phase-2 后、广播前接口状态）移到
+    广播路径 get_global_proto_and_head 内（融合 prompt 已装载的广播后接口
+    状态）。不变式：local 默认 = M2' 逐位一致；post_broadcast 下本地钩子
+    退化为纯快照；广播路径 refit 对 RNG 流与表征侧完全中性。与
+    TestRefitIsolationRngNeutral 同理需要 CUDA。"""
+
+    def _hook_args(self, **flags):
+        base = dict(nb_classes=20, seed=7, head_refit=False,
+                    head_standardize=False, refit_input='x1',
+                    refit_timing='local')
+        base.update(flags)
+        return types.SimpleNamespace(**base)
+
+    def test_local_timing_bitwise_matches_legacy(self):
+        """legacy args（无 refit_timing 键）与显式 'local' 的本地 refit 头
+        逐位一致（getattr 默认路径 = M2' 现行为封板）。"""
+        c1 = _make_a5_client(head_refit=True, task_id=0)
+        a1 = self._hook_args(head_refit=True)
+        del a1.refit_timing  # legacy checkpoint / 旧 args
+        c2 = _make_a5_client(head_refit=True, task_id=0)
+        c1._a5_post_phase2_interface(0, a1)
+        c2._a5_post_phase2_interface(
+            0, self._hook_args(head_refit=True, refit_timing='local'))
+        self.assertFalse(c2._a5_refit_post_broadcast)
+        self.assertTrue(_state_equal(c1.heads[0].state_dict(),
+                                      c2.heads[0].state_dict()))
+
+    def test_post_broadcast_skips_local_refit(self):
+        """post_broadcast：本地钩子退化为纯快照——joint 轨迹照常快照/恢复，
+        但 heads[task_id] 不被替换（保持官方联训头语义）。"""
+        client = _make_a5_client(head_refit=True, task_id=0,
+                                 refit_timing='post_broadcast')
+        self.assertTrue(client._a5_refit_post_broadcast)
+        client.heads[0] = deepcopy(client.model.get_head())
+        joint_state = deepcopy(client.model.get_head().state_dict())
+        key0 = client.model.key.detach().clone()
+        rng_t = torch.get_rng_state()
+        rng_p = random.getstate()
+        rng_n = np.random.get_state()
+
+        client._a5_post_phase2_interface(
+            3, self._hook_args(head_refit=True, refit_timing='post_broadcast'))
+
+        # joint trajectory snapshotted and restored into model.head
+        self.assertTrue(_state_equal(client._a5_joint_head.state_dict(),
+                                     joint_state))
+        self.assertTrue(_state_equal(client.model.get_head().state_dict(),
+                                      joint_state))
+        # heads[task_id] NOT replaced at the local timepoint
+        self.assertTrue(_state_equal(client.heads[0].state_dict(),
+                                     joint_state))
+        self.assertTrue(torch.equal(client.model.key.detach(), key0))
+        self.assertTrue(torch.equal(torch.get_rng_state(), rng_t))
+        self.assertEqual(random.getstate(), rng_p)
+        self.assertTrue(_np_state_equal(np.random.get_state(), rng_n))
+
+    def _prep_broadcast_client(self, refit_timing):
+        client = _make_a5_client(head_refit=True, task_id=0,
+                                 refit_timing=refit_timing,
+                                 original_model=_A5Orig())
+        torch.manual_seed(1000)
+        client.heads[0] = Chead(200, dropout=0.1)
+        client.heads[0].to(_DEVICE)
+        client.test_loader = [_task_dataset(0, 8, 123)]
+        return client
+
+    def test_post_broadcast_refit_at_broadcast_rng_neutral(self):
+        """广播路径：post_broadcast 臂在 get_global_proto_and_head 内 refit
+        （heads[0] 被替换）；local 臂该钩子为 no-op。两臂从同一四流起点出发，
+        走完整广播-评估循环后 RNG 消费逐位一致（refit 插入对官方循环完全
+        中性）、表征侧 key/anchor 逐位一致。"""
+        def _rng_now():
+            return (torch.get_rng_state(),
+                    torch.cuda.get_rng_state_all(),
+                    random.getstate(),
+                    np.random.get_state())
+
+        def _rng_restore(state):
+            torch.set_rng_state(state[0])
+            torch.cuda.set_rng_state_all(state[1])
+            random.setstate(state[2])
+            np.random.set_state(state[3])
+
+        c_ref = self._prep_broadcast_client('post_broadcast')
+        c_ctrl = self._prep_broadcast_client('local')
+        start = _rng_now()
+
+        c_ref.get_global_proto_and_head(None, None, None, 3)
+        after_ref = _rng_now()
+        # rewind to the identical start state, run the control arm
+        _rng_restore(start)
+        c_ctrl.get_global_proto_and_head(None, None, None, 3)
+        after_ctrl = _rng_now()
+
+        # refit ran only in the post_broadcast arm
+        self.assertIsInstance(c_ref.heads[0], Chead)
+        self.assertFalse(_state_equal(c_ref.heads[0].state_dict(),
+                                       c_ctrl.heads[0].state_dict()))
+        # representation side identical（model.head 两臂各自被 evaluate 装成
+        # 本臂 heads[0]，属预期读数侧差异；不变式 = key/anchor + joint 轨迹，
+        # 后者下一轮 phase-2 前统一恢复）
+        self.assertTrue(torch.equal(c_ref.model.key.detach(),
+                                   c_ctrl.model.key.detach()))
+        self.assertTrue(torch.equal(c_ref.model.anchor_pool.detach(),
+                                   c_ctrl.model.anchor_pool.detach()))
+        self.assertIsNone(c_ref._a5_joint_head)
+        self.assertIsNone(c_ctrl._a5_joint_head)
+        # four RNG streams consumed identically over the full path
+        self.assertTrue(torch.equal(after_ref[0], after_ctrl[0]))
+        self.assertTrue(_cuda_rng_equal(after_ref[1], after_ctrl[1]))
+        self.assertEqual(after_ref[2], after_ctrl[2])
+        self.assertTrue(_np_state_equal(after_ref[3], after_ctrl[3]))
+        # refit head is deterministic: same start state -> twin reproduces it
+        c_ref2 = self._prep_broadcast_client('post_broadcast')
+        _rng_restore(start)
+        c_ref2.get_global_proto_and_head(None, None, None, 3)
+        self.assertTrue(_state_equal(c_ref.heads[0].state_dict(),
+                                      c_ref2.heads[0].state_dict()))
+
+    def test_refit_timing_post_broadcast_alone_refuses_to_start(self):
+        """fail-closed：--refit_timing post_broadcast 无 refit 时拒绝启动
+        （无作用对象）。"""
+        from Models.Server_DF import Server_DF
+        args = types.SimpleNamespace(nb_classes=20,
+                                     refit_timing='post_broadcast')
+        with self.assertRaises(SystemExit):
+            Server_DF('Server', None, 'Tail_Anchor', 1, 1, [None],
+                      [[0, 1]], 0.01, 5, 1, 16, 'cpu', 'fedta', 0.25,
+                      None, None, args, None)
+
+    def test_refit_timing_post_broadcast_with_refit_starts(self):
+        from Models.Server_DF import Server_DF
+        args = types.SimpleNamespace(nb_classes=20, head_refit=True,
+                                     refit_timing='post_broadcast')
+        server = Server_DF('Server', None, 'Tail_Anchor', 1, 1, [None],
+                           [[0, 1]], 0.01, 5, 1, 16, 'cpu', 'fedta', 0.25,
+                           None, None, args, None)
+        self.assertIsNotNone(server)
+
+    def test_resume_timing_mismatch_and_legacy_compatibility(self):
+        """refit_timing 增补 RESUME_MUST_MATCH（two-sided）：跨时点 resume
+        拒绝；老 checkpoint（无该键）兼容。"""
+        from Models.Server_DF import Server_DF
+        args = types.SimpleNamespace(nb_classes=20, head_refit=True,
+                                     refit_timing='local')
+        server = Server_DF('Server', None, 'Tail_Anchor', 1, 1, [None],
+                           [[0, 1]], 0.01, 5, 1, 16, 'cpu', 'fedta', 0.25,
+                           None, None, args, None)
+        with self.assertRaises(ValueError):
+            server.validate_checkpoint_args(
+                {'head_refit': True, 'refit_timing': 'post_broadcast'})
+        # legacy checkpoint args carry no refit_timing key -> compatible
+        server.validate_checkpoint_args({'head_refit': True})
 
 
 if __name__ == '__main__':

@@ -125,6 +125,12 @@ class Client_DF(object):
         # 生；默认 OFF = 官方路径逐位一致）
         self._a5_joint_head = None
         self._a5_refit_on = bool(getattr(args, 'head_refit', False))
+        # §28 判据臂：refit 时点（默认 local = M2' 现行为；post_broadcast
+        # = 广播路径内 refit，特征缓存用广播后接口状态）
+        self._a5_refit_post_broadcast = (
+            str(getattr(args, 'refit_timing', 'local')) == 'post_broadcast')
+        # 广播路径钩子需要 args（get_global_proto_and_head 不透传）
+        self.args = args
 
 
     def init_local_model(self,model_name,args=None):
@@ -466,17 +472,22 @@ class Client_DF(object):
             with torch.no_grad():
                 head.head[0].weight[:, half:] = 0.0
         print('[A5-v2] client %d task %d round %d: refit head on %d train '
-              'rows (standardize=%s, input=%s)'
+              'rows (standardize=%s, input=%s, timing=%s)'
               % (self.id, task_id, round_id, n,
                  bool(getattr(args, 'head_standardize', False)),
-                 'feat' if refit_feat else 'x1'))
+                 'feat' if refit_feat else 'x1',
+                 'post_broadcast' if self._a5_refit_post_broadcast
+                 else 'local'))
         return head
 
     def _a5_post_phase2_interface(self, round, args):
         """train() 末尾的 A5-v2 钩子（官方两 evaluate 之前、heads 保存
         之后；默认 OFF = 完全 no-op）：
           1. joint-head 轨迹快照（任何存储替换之前，_a5_joint_head）；
-          2. --head_refit：当前任务 heads[task_id] 换 refit 头（每轮）。
+          2. --head_refit（且 --refit_timing local，§28 默认）：当前任务
+             heads[task_id] 换 refit 头（每轮）。post_broadcast 时点下
+             本钩子只做快照——refit 移到广播路径
+             （_a5_post_broadcast_interface），特征缓存用广播后接口状态。
         全程四流 RNG 快照恢复 + 模块模式恢复——表征侧轨迹（prompt/key/
         anchor/joint head）与官方 run 逐位一致，corrected 指标变化 100%
         归因于接口替换（单测覆盖，RUNCOMMANDS §23.1 RNG 中立）。"""
@@ -490,7 +501,8 @@ class Client_DF(object):
         try:
             if self.original_model is not None:
                 self.original_model.eval()
-            if bool(getattr(args, 'head_refit', False)):
+            if (bool(getattr(args, 'head_refit', False))
+                    and not self._a5_refit_post_broadcast):
                 head = self._a5_refit_one_head(self.task_id, round, args)
                 if head is not None:
                     self.heads[self.task_id] = head
@@ -503,6 +515,33 @@ class Client_DF(object):
         # 官方顺序装回 heads[task]；phase-2 前另有恢复，双保险）
         self.model.load_head(deepcopy(self._a5_joint_head))
 
+    def _a5_post_broadcast_interface(self, round, args):
+        """§28 判据臂（--refit_timing post_broadcast）的广播路径钩子：
+        get_global_proto_and_head 内、vit.load_prompts(广播 prompt) 之后、
+        两 evaluate 之前调用。特征缓存在广播后接口状态（融合 prompt +
+        本地 phase-2 后 Tail_Anchor 状态）上采集 = 评估特征流同源，闭合
+        §27.7-1 归因的训练-评估特征时点错位。refit 配方与 local 时点完全
+        一致（_a5_refit_one_head）；四流 RNG 快照恢复保证插入点前后的
+        RNG 消费流与官方逐位一致（表征侧轨迹不变式，单测覆盖）。默认
+        （local 时点）= 完全 no-op。"""
+        if not (self._a5_refit_on and self._a5_refit_post_broadcast):
+            return
+        rng = self._a5_rng_snapshot()
+        vit_was_training = self.vit.training
+        orig_was_training = (self.original_model.training
+                             if self.original_model is not None else None)
+        try:
+            if self.original_model is not None:
+                self.original_model.eval()
+            head = self._a5_refit_one_head(self.task_id, round, args)
+            if head is not None:
+                self.heads[self.task_id] = head
+        finally:
+            if orig_was_training is not None:
+                self.original_model.train(orig_was_training)
+            self.vit.train(vit_was_training)
+            self._a5_rng_restore(rng)
+
     def load_global_weights(self,weights):
         self.model.load_state_dict(weights)
         self.evaluate(self.task_id,self.nb_classes)
@@ -514,6 +553,11 @@ class Client_DF(object):
 
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
+
+        # A5-v2 §28 判据臂（--refit_timing post_broadcast）：广播后接口
+        # 状态（融合 prompt 已装载）上的 refit，特征流与随后的 evaluate
+        # 同源；默认（local 时点 / OFF）= 完全 no-op
+        self._a5_post_broadcast_interface(round, self.args)
 
         acc_task0 = self.evaluate(0, self.nb_classes)
         acc_current = self.evaluate(self.task_id,self.nb_classes)

@@ -146,6 +146,22 @@ def get_args_parser(subparsers):
                                  'the anchor-half weights hard-zeroed (x1[:, :768] IS '
                                  'z_op), so evaluate/checkpoint/resume paths are '
                                  'unchanged. Fail-closed: requires --head_refit.')
+    subparsers.add_argument('--refit_timing', default='local',
+                            choices=['local', 'post_broadcast'],
+                            help='A5-v2 Sec.28 criterion arm (default local = '
+                                 'current M2\' behavior, bit-identical): WHEN the '
+                                 'readout refit runs. local = end of train(), on '
+                                 'the local post-phase-2 (pre-broadcast) interface '
+                                 'state; post_broadcast = inside the broadcast '
+                                 'path (get_global_proto_and_head), on the '
+                                 'post-broadcast state (fused prompt already '
+                                 'loaded into vit) -- the same feature stream '
+                                 'evaluation/deployment uses, closing the ~2pp '
+                                 'train-eval feature-timing gap attributed by the '
+                                 'Sec.27.7-1 ladder probe. Orthogonal to '
+                                 '--refit_input/--head_standardize; checkpoint '
+                                 'schema unchanged. Fail-closed: requires '
+                                 '--head_refit. See RUNCOMMANDS.md Sec.28.')
     subparsers.add_argument('--client_num', default=5, type=int,
                             help='the num of client')
     subparsers.add_argument('--task_num', default=5, type=int,
