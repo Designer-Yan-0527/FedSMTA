@@ -1676,11 +1676,12 @@ F5  Oracle-2b > hard switch +0.25pp → DTCPR 获得设计依据，写 §31 训�
 ### 30.6 命令（GPT 审核通过后执行；GPU 轻前向，与 M2'' 训练错峰）
 
 ```bash
-# cifar 主判读场（保留 run 5 边界 checkpoint；天然臂 5 次全量 test 前向 + 翻转批次追加臂）
+# cifar 主判读场（保留 run 5 边界 checkpoint；天然臂 + native_draws 4 + 翻转批次追加臂，GPU 约 25–35 分钟）
 python diagnostics/probe_routing_flip.py \
     --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
     --data_path ./local_datasets --device cuda \
     --cache_dir diagnostics_output/routeflip_cifar \
+    --native_draws 4 \
     --out_csv diagnostics_output/routeflip_cifar.csv \
     --out_rows_csv diagnostics_output/routeflip_cifar_rows.csv \
     --out_json diagnostics_output/routeflip_cifar.summary.json
@@ -1690,6 +1691,7 @@ python diagnostics/probe_routing_flip.py \
     --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
     --data_path ./local_datasets --device cuda \
     --cache_dir diagnostics_output/routeflip_inr \
+    --native_draws 4 \
     --out_csv diagnostics_output/routeflip_inr.csv \
     --out_rows_csv diagnostics_output/routeflip_inr_rows.csv \
     --out_json diagnostics_output/routeflip_inr.summary.json
@@ -1698,3 +1700,15 @@ python diagnostics/probe_routing_flip.py \
 产物：`routeflip_{ds}.csv`（过渡×client×task 聚合 + 2×2 因子分解读数）+ `routeflip_{ds}_rows.csv`（per-row 分析即用表：FlipSeverity / D_rel / D_cos / ΔErr / TopKMargin / vote margin）+ `routeflip_{ds}.summary.json`（F0–F5 门读数 + verdict + 机制链判定）。判级声明：探针级诊断，产判据不产数字；F5 全链成立才写 DTCPR 训练臂预注册（§31）。
 
 > **工程冒烟记录（2026-11-03，2 状态 task_00→01，cifar 保留 run；工程验证非正式判读）**：链路全通（提取 / canon 对齐 / 缓存复现 / shim 强制槽=天然槽时与官方路由**逐位一致** maxdiff 0.0）。过渡 0→1 **零翻转批次、零多数槽轮换**；keyH = 0.0079 / 0.0058 bits（与 §20 单槽垄断先验 ≈0.004 bits 一致，垄断槽 = slot 6，份额 99.94/99.95%）；annex 与 client CSV 最大差 0.59pp；跨状态 heads[0] 哈希恒定（F3 同头前提成立）。正式判读仍以 5 状态全量跑为准——但单槽垄断若在全部 5 状态成立，F1 将按预注册判死分支触发（2×2 因子分解同时给出 contents 通道归因）。
+
+### 30.7 第二轮审核修订（2026-11-03，`6178c74` 有条件批准 → 4 锁死点全部落实；probe v3）
+
+审核结论：APPROVE Probe-F full run, conditional on evaluator/statistical sanity。四项修订全部预注册落实：
+
+1. **统计单位 = batch exposure**：`batchwise_prompt=True` 下 route 是 R_{t,b}（batch 级量），同 batch 样本共享 flip，不得当独立 route observation。F1 已按 batch flip rate（v1 即如此）；F2/F3 保留 sample feature/loss 但**显著性按 batch 聚类**：flip vs stable 对比量配 **paired batch bootstrap 95% CI**（B=1000，`--n_boot`/`--boot_seed` 稳定种子，重抽样单位 = batch）；F2 门升级为"中位数比值 ≥1.2 **且** 池化 batch-bootstrap CI 下界 >0（D_rel/D_cos 双指标）"。**F4 重写为 batch routing-boundary precursor**：m_{t−1,b}↓ ⇒ P(R_{t,b}≠R_{t−1,b})↑——batch 级 vote margin / mean margin 预测 batch 级 flip，per-sample margin 只是批内背景量，不再作前兆单位。
+2. **确定性同 batch 分区 + 组成敏感性 annex**：跨 checkpoint 完全相同 deterministic partition 已由 canon 键连接 fail-closed 断言保证（分区由划分 manifest 锁定，非运行时抽样）。新增**零 GPU annex**：同一 checkpoint 下用缓存 per-sample 偏好构造备选固定分区（canon 序 circular shift 1..B−1），统计是否有任何 batch 多数槽改变——若换分组就大量改 route，则 "temporal route" 根本不是样本固有属性，DTCPR 死得更硬（判读措辞预注册："routing is batch-composition sensitive"）。
+3. **2×2 标量归因严谨化**：向量恒等式 D−A = Δr + Δp + Δ_int 只对**向量**成立，不对其范数成立——feature 端只报**向量幅值**（mean ‖Δr‖/‖Δp‖/‖Δ_int‖/‖D−A‖），明文禁止百分比归因。标量归因双轨：① 准确率计数池（route_pool/content_pool/interaction_pool）——正确性指示变量逐行可加，恒等式**精确成立**（保留为主归因）；② 新增 **loss 两因素 Shapley**：φ_r = ½[(L_B−L_A)+(L_D−L_C)]、φ_p = ½[(L_C−L_A)+(L_D−L_B)]，φ_r+φ_p = L_D−L_A 精确（nats，逐过渡并报）。
+4. **probe-vs-native 0.59pp 差异定位（正式 F3 verdict 前置）**：`--native_draws N`（默认 2）逐 (state, client, task) 做**同 checkpoint/head/人群的 native 语义抽样**（Chead Dropout ON + shuffle=True batch 8，种子派生稳定可复现），把 gap 分解为 (i) native 抽样随机性（draw spread，CSV 本身也是该过程的一次抽样）(ii) eval 模式抬升（probe − mean draw）(iii) 未解释残差；报告 frac_residual_within_draw_spread、max_unexplained_pp、worst_key。**残差未被定位前 F3 verdict 不作数**（0.59pp 已达 1pp 门的过半）。冒烟（2 状态）首批分解：draw spread 均值 0.64pp / 最大 1.23pp（**native Dropout 抽样噪声主导**——与 Track E 的 Dropout 定性一致）、eval 抬升均值 +0.42pp、13/15 键残差完全落在抽样随机性内，仅 state0/client2/task0 有 0.45pp 未解释（3 抽样的 spread 估计本身偏低，疑似功效不足而非语义分歧）；**正式跑提 `--native_draws 4` 收紧 spread 估计**。
+5. **F5 净收益门（A2-R 先例约束）**：A2-R 死因 = 常开软混合本身 −1.9pp ⇒ flip 子集 oracle 赢不能读作净赢。预注册：可部署 transition gate 必须 **disagreement-gated**（stable batch 上 G_stable ≡ 0 by design，§31 训练臂的证明义务）；探针显式报告 **G_net = P(flip)·G_flip**（部署级期望池）。G_flip 过 0.25pp 但 G_net 不过同一工程底线 → verdict = `PASS_NET_REVIEW`（转外审，不直接立项）。
+
+**判读优先阶梯（审核冻结，替代原线性树的第一读序）**：Route exists? → Route changes temporally? → Route explains drift? → Route owns accuracy pool?——**前两步死则不救 DTCPR，直接读 2×2 的 content channel**。F1 判死措辞升级为**拒绝自身机制假说**（hypothesis rejected，非"探针失败"）：若 5 状态 FlipRate≈0 且 keyH≈0，则写 "the discrete temporal route-switching hypothesis is rejected"，DTCPR 当天判死不写臂；2×2 同时回答 "route fixed + feature still drifts"——若 Δ_route≈0 而 Δ_content≫0，DHT 的非仿射漂移获得全新且更扎实的解释：**非仿射部署漂移由 prompt 内容演化主导，而非离散槽位切换**（探针推翻设计假说后找到的新机制，论文素材）。

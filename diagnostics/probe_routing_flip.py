@@ -45,6 +45,29 @@ native matrix -- every gate acts on cross-state / cross-arm differences,
 so the bias cancels; the accuracy cross-check is an informative annex
 with a 3pp tolerance).
 
+Review round 2 hardening (2026-11-03, conditional approval):
+  1. statistical unit = BATCH exposure: flip-vs-stable contrasts use
+     paired BATCH bootstrap CIs (route is a batch-level quantity under
+     batchwise_prompt); F4 is explicitly a batch routing-boundary
+     precursor, not a per-sample one;
+  2. deterministic identical batch partition across checkpoints is
+     asserted via the canonical key join, plus a batch-composition
+     sensitivity annex (alternative fixed partitions from cached prefs,
+     zero GPU);
+  3. scalar attribution is rigorous: accuracy-count pools obey the
+     exact per-row additive identity; loss-level two-factor Shapley
+     (phi_r + phi_p = L_D - L_A exactly) is reported alongside;
+     feature-vector deltas are reported as magnitudes only, NEVER as
+     percentage attribution (norms do not decompose);
+  4. the probe-vs-native-CSV gap is LOCATED via seeded native-mode draws
+     (Dropout ON + shuffle) per (state, client, task), decomposing it
+     into dropout draw stochasticity / eval uplift / unexplained
+     residual;
+  5. F5 reports the deployment-wide net pool G_net = P(flip)*G_flip and
+     requires G_flip>0 with G_stable=0-by-design (disagreement-gated
+     gate) -- the A2-R death (-1.9pp from the always-on soft mixture)
+     forbids reading a flip-subset oracle win as a net win.
+
 fail-closed: use_prompt_mask=True or top_k!=1 or batchwise_prompt=False
 -> refuse (probe semantics are only defined for this deployment path);
 cache fingerprints (run/checkpoint/batch/probe version) must match;
@@ -82,7 +105,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from diag_utils import bootstrap_server, load_args_from_run_dir  # noqa: E402
 
-PROBE_VERSION = "routingflip-v2"
+PROBE_VERSION = "routingflip-v3"
 TAG = "[routeflip-probe]"
 EPS = 1e-8
 
@@ -126,6 +149,17 @@ def parse_args():
     p.add_argument("--native_tol", default=3.0, type=float,
                    help="informative annex tolerance vs client CSVs (pp; "
                         "covers the pre-registered dropout-off uplift)")
+    p.add_argument("--native_draws", default=2, type=int,
+                   help="per (state, client, task): native-mode accuracy "
+                        "draws (Chead Dropout ON + shuffle=True batch 8, "
+                        "seeded) to LOCATE the probe-vs-client-CSV gap "
+                        "(review round 2); 0 skips")
+    p.add_argument("--n_boot", default=1000, type=int,
+                   help="paired batch bootstrap replicates (route is a "
+                        "BATCH-level quantity under batchwise_prompt; "
+                        "significance of flip-vs-stable contrasts must "
+                        "cluster by batch)")
+    p.add_argument("--boot_seed", default=20261103, type=int)
     p.add_argument("--overwrite_cache", action="store_true")
     return p.parse_args()
 
@@ -146,6 +180,12 @@ def _hash_module(module):
 
 def _hash_array(arr):
     return hashlib.sha256(np.ascontiguousarray(arr).tobytes()).hexdigest()[:16]
+
+
+def _seed(*parts):
+    """Stable derived seed from arbitrary ints (house stable_seed style)."""
+    h = hashlib.sha256(",".join(str(int(p)) for p in parts).encode())
+    return int(h.hexdigest()[:8], 16) % (2 ** 31 - 1)
 
 
 class _ShimPrompt(torch.nn.Module):
@@ -252,6 +292,84 @@ def _acc_rows(vecs, ys):
     return _acc(_list_correct(vecs, ys))
 
 
+def _vec_ce(vecs, ys):
+    """Per-row cross-entropy from masked-logit vectors."""
+    out = np.empty(len(ys), dtype=np.float64)
+    for i in range(len(ys)):
+        v = vecs[i]
+        mx = v.max()
+        out[i] = math.log(np.exp(v - mx).sum()) + mx - v[int(ys[i])]
+    return out
+
+
+def _batch_boot_ci(values, batch_ids, flip_flags, n_boot, seed, stat):
+    """Paired BATCH bootstrap 95% CI for the flip-vs-stable contrast
+    (review round 2, item 1: under batchwise_prompt the route is a
+    batch-level quantity, so the resampling unit is the BATCH, not the
+    sample; sample-level rows within a batch are perfectly correlated in
+    their route exposure).
+
+    stat: 'median' or 'mean'; returns (lo, hi, n_valid_reps) of
+    stat(flip) - stat(stable), or None when one side has no batches.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    batch_ids = np.asarray(batch_ids)
+    order = np.argsort(batch_ids, kind="stable")
+    sorted_ids = batch_ids[order]
+    bounds = np.nonzero(np.r_[True, sorted_ids[1:] != sorted_ids[:-1],
+                              True])[0]
+    groups = [order[bounds[i]:bounds[i + 1]]
+              for i in range(len(bounds) - 1)]
+    group_flip = np.array([bool(flip_flags[g[0]]) for g in groups])
+    if group_flip.all() or not group_flip.any() or len(groups) < 2:
+        return None
+    rng = np.random.default_rng(seed)
+    stats = []
+    for _ in range(n_boot):
+        pick = rng.integers(0, len(groups), len(groups))
+        rows = np.concatenate([groups[i] for i in pick])
+        fl = np.concatenate([np.full(len(groups[i]), group_flip[i])
+                             for i in pick]).astype(bool)
+        vf, vs = values[rows][fl], values[rows][~fl]
+        if len(vf) == 0 or len(vs) == 0:
+            continue
+        if stat == "median":
+            stats.append(float(np.median(vf) - np.median(vs)))
+        else:
+            stats.append(float(vf.mean() - vs.mean()))
+    if len(stats) < max(10, n_boot // 10):
+        return None
+    lo, hi = np.percentile(stats, [2.5, 97.5])
+    return (round(float(lo), 4), round(float(hi), 4), len(stats))
+
+
+def _alt_partition_majority_changes(pref_seq, batch_size):
+    """Batch-composition sensitivity (review round 2, item 2): under the
+    canon (rel_idx) order of one (client, task) population, build the base
+    contiguous partition and circular-shift alternatives (shifts
+    1..batch_size-1); count how many alternative partitions change any
+    batch majority slot. Zero GPU: consumes only cached per-sample
+    preferences."""
+    n = len(pref_seq)
+    if n == 0:
+        return 0, 0
+
+    def majorities(seq):
+        ms = []
+        for i in range(0, len(seq), batch_size):
+            vals, cnts = np.unique(seq[i:i + batch_size],
+                                   return_counts=True)
+            ms.append(int(vals[int(np.argmax(cnts))]))
+        return ms
+
+    base = majorities(pref_seq)
+    changed = 0
+    for s in range(1, batch_size):
+        alt = majorities(np.roll(pref_seq, s))
+        changed += int(np.sum(np.array(alt) != np.array(base)))
+    return changed, batch_size - 1
+
+
 # ----------------------------------------------------------------------
 # per-state extraction
 # ----------------------------------------------------------------------
@@ -349,6 +467,7 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, interior_lams,
     head_hashes = {}
     key_hashes = {}
     pv_cpu = {}
+    native_draws = {}
     n_rows = 0
     flat_len = 0
     n_flip_batches = 0
@@ -508,6 +627,51 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, interior_lams,
                         arm[f"lg_2a_{lam}"].append(lg2a[bi].cpu().numpy())
                         arm[f"lg_2b_{lam}"].append(lg2b[bi].cpu().numpy())
 
+            # ---- native-mode draws (annex: locate the probe-vs-CSV gap) --
+            # Chead Dropout ON (fresh training-mode head copy, .eval() NOT
+            # called -- the exact native evaluate() implementation-mode
+            # semantics, Track E) + shuffle=True batch 8 with a seeded
+            # generator: each draw is a reproducible realization of the
+            # stochastic native readout. Contrasting draws with the
+            # deterministic probe pass separates dropout stochasticity /
+            # eval-mode uplift / batch composition (review round 2, item 4).
+            if args_cli.native_draws > 0:
+                draw_accs = []
+                for d in range(args_cli.native_draws):
+                    torch.manual_seed(
+                        _seed(run_args.seed, t_index, cid, t, d))
+                    g = torch.Generator()
+                    g.manual_seed(_seed(run_args.seed, 7, t_index, cid, t, d))
+                    client.model.load_head(client.heads[t])  # fresh copy,
+                    # training mode -> Dropout active (native semantics)
+                    dl = DataLoader(subset, batch_size=args_cli.batch_size,
+                                    shuffle=True, generator=g,
+                                    num_workers=run_args.num_workers)
+                    ncorr = 0
+                    ntot = 0
+                    for inp2, tgt2 in dl:
+                        inp2 = inp2.to(device, non_blocking=True)
+                        tgt2 = tgt2.to(device, non_blocking=True)
+                        with torch.no_grad():
+                            out_ref2 = server.origin_model(inp2)
+                            q2 = out_ref2["pre_logits"]
+                            out2 = client.vit(inp2,
+                                              task_id=client.task_id,
+                                              cls_features=q2, train=True)
+                            lg2 = client.model(
+                                out2["feat"].float(), None)[0]
+                            lg2 = lg2.index_select(1, mpos).float()
+                        pred2 = lg2.argmax(dim=1)
+                        ncorr += int((pred2 == torch.searchsorted(
+                            mpos, tgt2)).sum())
+                        ntot += int(tgt2.numel())
+                    draw_accs.append(100.0 * ncorr / ntot)
+                native_draws[f"{cid},{t}"] = [round(a, 2)
+                                              for a in draw_accs]
+                # restore the deterministic eval-mode head for later uses
+                client.model.load_head(client.heads[t])
+                client.model.eval()
+
     # ---- canonical row order (Sec.29.1c lesson) ------------------------
     # Row blocks are laid out per (client, task) in extraction order, so
     # the same logical sample lives at different absolute positions in
@@ -602,6 +766,7 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, interior_lams,
         "head_hashes": head_hashes,
         "key_hashes": key_hashes,
         "pv": pv_cpu,
+        "native_draws": native_draws,
     }
 
     meta = {
@@ -613,6 +778,7 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, interior_lams,
         "masks": class_masks,
         "head_hashes": head_hashes,
         "key_hashes": key_hashes,
+        "native_draws": native_draws,
         "prompt_value_hashes": {str(c): _hash_array(v)
                                 for c, v in pv_cpu.items()},
         "embedding_key": run_args_probe.embedding_key,
@@ -692,6 +858,7 @@ def _load_state(npz_path, meta):
         "masks": meta["masks"],
         "head_hashes": meta["head_hashes"],
         "key_hashes": meta["key_hashes"],
+        "native_draws": meta.get("native_draws", {}),
         "pv": pv,
     }
 
@@ -763,12 +930,17 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
     trans_flip_batches = []
     trans_flip_rows = []
     route_pools, drift_pools, content_pools = [], [], []
-    f4_vm, f4_flip = [], []
+    f4_vm, f4_flip, f4_mm = [], [], []
     f5_lgA, f5_lgD, f5_y = [], [], []
     f5_correctB = []
     f5_2a, f5_2b = {}, {}
     rotation_events = []
     f1_pass = False
+    # pooled accumulators for batch-clustered contrasts (review round 2)
+    pool_b_ids, pool_flip = [], []
+    pool_drel, pool_dcos, pool_derr, pool_n_old = [], [], [], []
+    shapley_records = []
+    feat_delta_records = []
 
     for i in range(1, len(states)):
         st_new, st_old = states[i], states[i - 1]
@@ -830,6 +1002,27 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
         derr_stable = (float(d_err[~flip].mean()) if n_stable
                        else float("nan"))
 
+        # paired BATCH bootstrap CIs (review round 2, item 1): route
+        # exposure is batch-level under batchwise_prompt, so flip-vs-
+        # stable contrasts must resample BATCHES, not samples
+        b_ids = (old_rows["client"] * 10_000_000
+                 + old_rows["task"] * 10_000 + old_rows["bseq"])
+        bs = args_cli.boot_seed + tr
+        ci_drel = _batch_boot_ci(d_rel, b_ids, flip, args_cli.n_boot,
+                                 bs, "median")
+        ci_dcos = _batch_boot_ci(d_cos, b_ids, flip, args_cli.n_boot,
+                                 bs + 1, "median")
+        ci_derr = _batch_boot_ci(d_err, b_ids, flip, args_cli.n_boot,
+                                 bs + 2, "mean")
+        # pooled accumulators (F2 gate uses the pooled contrast)
+        p_ids = b_ids + tr * 1_000_000_000
+        pool_b_ids.append(p_ids)
+        pool_flip.append(flip)
+        pool_drel.append(d_rel)
+        pool_dcos.append(d_cos)
+        pool_derr.append(d_err)
+        pool_n_old.append(n_old)
+
         # F3b + 2x2 pools (arms live exactly on flip rows, in NEW-state
         # canonical row space)
         arm = st_new["arms"]
@@ -858,6 +1051,56 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
                     _list_correct(_arm_vecs(arm, f"lg_2a_{lam}"), y_arm))
                 f5_2b.setdefault(lam, []).append(
                     _list_correct(_arm_vecs(arm, f"lg_2b_{lam}"), y_arm))
+            # two-factor loss Shapley + feature-vector delta magnitudes
+            # (review round 2, item 3). The accuracy-count pools below
+            # obey the exact per-row additive identity, so they stay the
+            # primary scalar attribution; loss Shapley is the symmetric
+            # check (phi_r + phi_p = L_D - L_A exactly); norms are
+            # magnitudes, never percentages.
+            ceA_f = _vec_ce(lgA, y_arm)
+            ceB_f = _vec_ce(_arm_vecs(arm, "lg_B"), y_arm)
+            ceC_f = _vec_ce(_arm_vecs(arm, "lg_C"), y_arm)
+            ceD_f = _vec_ce(lgD, y_arm)
+            LA, LB, LC, LD = (float(ceA_f.mean()), float(ceB_f.mean()),
+                              float(ceC_f.mean()), float(ceD_f.mean()))
+            phi_r = 0.5 * ((LB - LA) + (LD - LC))
+            phi_p = 0.5 * ((LC - LA) + (LD - LB))
+            phi_int = (LD - LA) - phi_r - phi_p
+            shapley_records.append({
+                "transition": tr, "n_flip_rows": n_flip,
+                "L_A": round(LA, 4), "L_B": round(LB, 4),
+                "L_C": round(LC, 4), "L_D": round(LD, 4),
+                "phi_route_nats": round(phi_r, 4),
+                "phi_content_nats": round(phi_p, 4),
+                "phi_interaction_nats": round(phi_int, 4),
+                "identity_check_nats": round(
+                    phi_r + phi_p + phi_int - (LD - LA), 6),
+            })
+            zA_f = z_new[flip]
+            zD_f = z_old[flip]
+            zB_f = (arm["z_B"] if isinstance(arm["z_B"], np.ndarray)
+                    else np.stack(arm["z_B"]))
+            zC_f = (arm["z_C"] if isinstance(arm["z_C"], np.ndarray)
+                    else np.stack(arm["z_C"]))
+            d_r = zB_f - zA_f
+            d_p = zC_f - zA_f
+            d_int = zD_f - zB_f - zC_f + zA_f
+            dDA = zD_f - zA_f
+            feat_delta_records.append({
+                "transition": tr,
+                "mean_norm_delta_route": round(float(np.mean(
+                    np.linalg.norm(d_r, axis=1))), 4),
+                "mean_norm_delta_content": round(float(np.mean(
+                    np.linalg.norm(d_p, axis=1))), 4),
+                "mean_norm_delta_interaction": round(float(np.mean(
+                    np.linalg.norm(d_int, axis=1))), 4),
+                "mean_norm_total_drift": round(float(np.mean(
+                    np.linalg.norm(dDA, axis=1))), 4),
+                "note": "vector magnitudes ONLY -- the identity "
+                        "D-A = dr + dp + dint holds for vectors, NOT for "
+                        "norms; no percentage attribution from these "
+                        "numbers",
+            })
 
         drift_pool = 100.0 * (correct_old.sum() - c_new.sum()) / n_old
         if n_flip:
@@ -884,6 +1127,7 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
         flip_rate = float(flip_batches.mean()) if len(vm) else 0.0
         f4_vm.append(vm)
         f4_flip.append(flip_batches)
+        f4_mm.append(bt_old["mean_margin"])
 
         rotated = (summary["states"][i - 1]["batch_mode_slot"]
                    != summary["states"][i]["batch_mode_slot"])
@@ -920,6 +1164,9 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
             "med_d_rel_stable": round(_median(d_rel[~flip]), 4),
             "med_d_cos_flip": round(_median(d_cos[flip]), 4),
             "med_d_cos_stable": round(_median(d_cos[~flip]), 4),
+            "ci95_drel_flip_minus_stable": ci_drel,
+            "ci95_dcos_flip_minus_stable": ci_dcos,
+            "ci95_derr_flip_minus_stable": ci_derr,
         }
         summary["transitions"].append(trans_rec)
         agg_rows.append({
@@ -940,6 +1187,18 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
             "med_d_rel_stable": trans_rec["med_d_rel_stable"],
             "med_d_cos_flip": trans_rec["med_d_cos_flip"],
             "med_d_cos_stable": trans_rec["med_d_cos_stable"],
+            "ci_drel_lo": trans_rec["ci95_drel_flip_minus_stable"][0]
+            if trans_rec["ci95_drel_flip_minus_stable"] else "",
+            "ci_drel_hi": trans_rec["ci95_drel_flip_minus_stable"][1]
+            if trans_rec["ci95_drel_flip_minus_stable"] else "",
+            "ci_dcos_lo": trans_rec["ci95_dcos_flip_minus_stable"][0]
+            if trans_rec["ci95_dcos_flip_minus_stable"] else "",
+            "ci_dcos_hi": trans_rec["ci95_dcos_flip_minus_stable"][1]
+            if trans_rec["ci95_dcos_flip_minus_stable"] else "",
+            "ci_derr_lo": trans_rec["ci95_derr_flip_minus_stable"][0]
+            if trans_rec["ci95_derr_flip_minus_stable"] else "",
+            "ci_derr_hi": trans_rec["ci95_derr_flip_minus_stable"][1]
+            if trans_rec["ci95_derr_flip_minus_stable"] else "",
         })
 
         # per-client detail rows (robustness: is the pool one-client noise?)
@@ -988,6 +1247,9 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
                 if n_f_c else "",
                 "med_d_cos_stable": round(_median(d_cos[sel & ~flip]), 4)
                 if (n_c - n_f_c) else "",
+                "ci_drel_lo": "", "ci_drel_hi": "",
+                "ci_dcos_lo": "", "ci_dcos_hi": "",
+                "ci_derr_lo": "", "ci_derr_hi": "",
             })
 
         # per-row analysis CSV
@@ -1031,27 +1293,50 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
     any_flip = sum(trans_flip_rows) > 0
     f2_verdict = "N/A"
     f2_detail = {}
+    # pooled batch-clustered contrast inputs (review round 2, item 1)
+    pooled_drel = (np.concatenate(pool_drel) if pool_drel
+                   else np.zeros((0,)))
+    pooled_dcos = (np.concatenate(pool_dcos) if pool_dcos
+                   else np.zeros((0,)))
+    pooled_derr = (np.concatenate(pool_derr) if pool_derr
+                   else np.zeros((0,)))
+    pooled_bids = (np.concatenate(pool_b_ids) if pool_b_ids
+                   else np.zeros((0,), dtype=np.int64))
+    pooled_flip = (np.concatenate(pool_flip) if pool_flip
+                   else np.zeros((0,), dtype=bool))
+    ci_derr_pooled = None
     if any_flip:
         ok = True
-        for metric in ("d_rel", "d_cos"):
-            fms = [t[f"med_{metric}_flip"] for t in summary["transitions"]
-                   if t["n_flip_rows"] > 0]
-            sms = [t[f"med_{metric}_stable"] for t in summary["transitions"]
-                   if t["n_flip_rows"] > 0]
-            fm = float(np.mean(fms))
-            sm = float(np.mean(sms))
+        for metric, vals in (("d_rel", pooled_drel),
+                             ("d_cos", pooled_dcos)):
+            fv = vals[pooled_flip]
+            sv = vals[~pooled_flip]
+            fm = float(np.median(fv)) if len(fv) else float("nan")
+            sm = float(np.median(sv)) if len(sv) else float("nan")
+            ci = _batch_boot_ci(vals, pooled_bids, pooled_flip,
+                                args_cli.n_boot, args_cli.boot_seed + 900,
+                                "median")
             f2_detail[metric] = {"flip_median": round(fm, 4),
-                                 "stable_median": round(sm, 4)}
-            if not (fm >= args_cli.f2_ratio_gate * sm):
+                                 "stable_median": round(sm, 4),
+                                 "ci95_flip_minus_stable": ci}
+            ratio_ok = (fm >= args_cli.f2_ratio_gate * sm)
+            ci_ok = bool(ci and ci[0] > 0)
+            if not (ratio_ok and ci_ok):
                 ok = False
+        ci_derr_pooled = _batch_boot_ci(pooled_derr, pooled_bids,
+                                        pooled_flip, args_cli.n_boot,
+                                        args_cli.boot_seed + 903, "mean")
+        f2_detail["d_err"] = {"ci95_flip_minus_stable": ci_derr_pooled}
         f2_verdict = "PASS" if ok else "FAIL"
 
     f3a_detail = {
         "E_derr_flip": [t["E_derr_flip"] for t in summary["transitions"]],
         "E_derr_stable": [t["E_derr_stable"] for t in
                           summary["transitions"]],
+        "ci95_derr_flip_minus_stable_pooled": ci_derr_pooled,
         "note": "corroboration only; guards the 'flip rows are harder' "
-                "confound (cross-state change, not absolute difficulty)",
+                "confound (cross-state change, not absolute difficulty); "
+                "CI is batch-clustered",
     }
 
     mean_route_pool = float(np.mean(route_pools)) if route_pools else 0.0
@@ -1067,10 +1352,19 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
     vm_all = np.concatenate(f4_vm) if f4_vm else np.zeros((0,))
     fl_all = (np.concatenate(f4_flip) if f4_flip
               else np.zeros((0,), dtype=bool))
-    f4_detail = {"n_batches": int(len(vm_all)),
+    mm_all = np.concatenate(f4_mm) if f4_mm else np.zeros((0,))
+    # F4 is a BATCH routing-boundary precursor (review round 2, item 1):
+    # m_{t-1,b} down => P(R_{t,b} != R_{t-1,b}) up -- batch-level margins
+    # predict batch-level flips; per-sample margins are within-batch
+    # context only, never the precursor unit.
+    f4_detail = {"unit": "batch routing-boundary precursor",
+                 "n_batches": int(len(vm_all)),
                  "point_biserial_vote_margin_vs_flip":
                      round(_point_biserial(vm_all, fl_all), 4)
-                     if len(vm_all) else None}
+                     if len(vm_all) else None,
+                 "point_biserial_mean_margin_vs_flip":
+                     round(_point_biserial(mm_all, fl_all), 4)
+                     if len(mm_all) else None}
     if len(vm_all) >= 10 and len(np.unique(fl_all)) > 1:
         qs = np.quantile(vm_all, [0.2, 0.4, 0.6, 0.8])
         bins = np.digitize(vm_all, qs)
@@ -1121,11 +1415,37 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
             "acc_D_tm1(lam=0)": round(accD, 2)}
         if best_2b > -1e8:
             f5_detail["oracle2b_best_interior_gain_pp"] = o2_gain
+        # net-gain accounting (review round 2, A2-R precedent): a deployable
+        # consensus gate is DISAGREEMENT-GATED, so it never fires on stable
+        # batches => G_stable = 0 BY DESIGN (a Sec.31 design constraint,
+        # not a measurement). The deployment-wide expectation is
+        # G_net = P(flip) * G_flip; report it explicitly -- A2-R died of
+        # the always-on soft mixture itself (-1.9pp), so an Oracle-2b pass
+        # on a tiny flip population must NOT be read as a net win.
+        n_old_pooled = int(np.sum(pool_n_old)) if pool_n_old else 0
+        flip_frac_pooled = (int(len(f5_y)) / n_old_pooled
+                            if n_old_pooled else 0.0)
+        net_pool_pp = (flip_frac_pooled * (o2_gain if o2_gain is not None
+                                           else 0.0))
+        f5_detail["flip_fraction_pooled"] = round(flip_frac_pooled, 4)
+        f5_detail["net_pool_pp"] = round(net_pool_pp, 3)
+        f5_detail["g_stable_note"] = (
+            "0 by design for a disagreement-gated transition gate; the "
+            "A2-R -1.9pp always-on soft-mixture death means the Sec.31 "
+            "arm must PROVE the gate never fires on stable batches")
 
     o1_pass = bool(o1_gain is not None and o1_gain > 0.0)
     o2_pass = bool(o2_gain is not None
                    and o2_gain >= args_cli.oracle_gain_gate)
     f5_verdict = "N/A" if not f5_y else ("PASS" if o2_pass else "FAIL")
+    if o2_pass and f5_detail.get("net_pool_pp") is not None \
+            and f5_detail["net_pool_pp"] < args_cli.oracle_gain_gate:
+        f5_verdict = "PASS_NET_REVIEW"
+        f5_detail["net_review_note"] = (
+            "G_flip clears the gate but the deployment-wide net pool "
+            f"({f5_detail['net_pool_pp']}pp) does not clear the same "
+            "engineering floor -- escalate to external review before "
+            "writing the Sec.31 arm")
 
     verdicts = {
         "F0": ("A2-R precedent stands (Sec.20.6): routing metrics were "
@@ -1148,20 +1468,33 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
         if content_pools else None,
         "drift_pool_mean_pp": round(float(np.mean(drift_pools)), 3)
         if drift_pools else None,
+        "loss_shapley_per_transition": shapley_records,
+        "feature_delta_magnitudes_per_transition": feat_delta_records,
+        "priority_ladder": ("Route exists? -> Route changes temporally? "
+                            "-> Route explains drift? -> Route owns "
+                            "accuracy pool? (review round 2): if the "
+                            "first two steps die, do NOT rescue DTCPR -- "
+                            "read the 2x2 contents channel instead"),
     }
     summary["verdicts"] = verdicts
 
-    # ---- FINAL (Sec.30.4 frozen tree) ----------------------------------
+    # ---- FINAL (Sec.30.4 frozen tree, review round 2 wording) -----------
     if not f1_pass:
-        final = ("DTCPR_DEAD_F1: route switching below non-trivial level "
-                 f"(flip rates {f1_flip_rates}; no majority-slot "
-                 "rotation across states). fast/slow dual routing would "
-                 "stay identical on the deployment path and the consensus "
-                 "gate never fires -- structurally inert. The 2x2 "
-                 "factorial attributes the cross-state drift pool to the "
-                 f"CONTENTS channel (content "
+        final = ("HYPOTHESIS_REJECTED: the discrete temporal "
+                 "route-switching hypothesis is REJECTED (flip rates "
+                 f"{f1_flip_rates}; no majority-slot rotation; keyH per "
+                 "state "
+                 f"{[s['keyH_bits'] for s in summary['states']]} bits). "
+                 "This rejects OUR OWN mechanism hypothesis, it is not a "
+                 "probe failure. DTCPR is dead -- no training arm: "
+                 "fast/slow dual routing would stay identical on the "
+                 "deployment path and the consensus gate never fires "
+                 "(structurally inert). The 2x2 factorial attributes the "
+                 "cross-state drift pool to the CONTENTS channel (content "
                  f"{verdicts['content_pool_mean_pp']}pp vs route "
-                 f"{round(mean_route_pool, 3)}pp).")
+                 f"{round(mean_route_pool, 3)}pp) -- the representation-"
+                 "side narrative moves to prompt-content evolution "
+                 "(recorded; NOT auto-promoted to a candidate).")
     elif f3b_verdict == "FAIL":
         final = ("DTCPR_DEAD_F3: flips exist but own no accuracy pool "
                  f"(mean route_pool {round(mean_route_pool, 3)}pp < "
@@ -1170,6 +1503,15 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
         final = ("DTCPR_YELLOW_REVIEW: route pool isolated in a single "
                  "transition and below the mean gate -- escalate to "
                  "external review with the per-transition numbers.")
+    elif f5_verdict == "PASS_NET_REVIEW":
+        final = ("DTCPR_SUPPORTED_CONDITIONAL: F3b route pool and Oracle-"
+                 "2b both pass on the flip population, but the "
+                 "deployment-wide net pool P(flip)*G_flip = "
+                 f"{f5_detail['net_pool_pp']}pp does not clear the "
+                 f"{args_cli.oracle_gain_gate}pp engineering floor -- "
+                 "escalate to external review before writing the Sec.31 "
+                 "arm (A2-R precedent: the always-on soft mixture itself "
+                 "cost -1.9pp; the gate must be disagreement-gated).")
     elif not o2_pass:
         if o1_pass:
             final = ("DTCPR_STRUCTURE_DOUBT: Oracle-1 shows dual-path "
@@ -1183,12 +1525,59 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
     else:
         final = ("DTCPR_SUPPORTED: F1 flips non-trivial, F3b route pool "
                  f">= {args_cli.route_pool_gate}pp, Oracle-2b beats the "
-                 "hard switch -- write the Sec.31 training-arm "
+                 "hard switch on the flip population AND the net pool "
+                 f"({f5_detail.get('net_pool_pp')}pp) clears the "
+                 "engineering floor -- write the Sec.31 training-arm "
                  "pre-registration.")
     if not head_clean:
         final += (" WARNING: cross-state head drift detected (F3 "
                   "CONTAMINATED) -- see annex.head_drift_events.")
     summary["verdicts"]["FINAL"] = final
+
+    # ---- batch-composition sensitivity annex (review round 2, item 2) --
+    # Same checkpoints, ALTERNATIVE fixed batch partitions (circular
+    # shifts of the canon order): if merely regrouping the same samples
+    # changes batch majorities, the temporal "route" is not a stable
+    # population statistic and the flip analysis itself is confounded.
+    bcs = []
+    for st in states:
+        rows = st["rows"]
+        key = rows["client"] * 100 + rows["task"]
+        pref = rows["slot_pref"]
+        starts = np.nonzero(np.r_[True, key[1:] != key[:-1]])[0]
+        bounds = np.append(starts, len(key))
+        total_changed = 0
+        n_ct = len(starts)
+        n_ct_changed = 0
+        for bi in range(len(starts)):
+            seq = pref[bounds[bi]:bounds[bi + 1]]
+            changed, _ = _alt_partition_majority_changes(
+                seq, args_cli.batch_size)
+            total_changed += changed
+            if changed:
+                n_ct_changed += 1
+        bcs.append({
+            "t_index": st["t_index"], "ckpt": st["ckpt"],
+            "n_client_task_groups": int(n_ct),
+            "n_alt_partition_batches_changed_majority":
+                int(total_changed),
+            "n_client_task_groups_with_any_change": int(n_ct_changed),
+        })
+    any_change = any(x["n_alt_partition_batches_changed_majority"]
+                     for x in bcs)
+    summary["annex"]["batch_composition_sensitivity"] = {
+        "per_state": bcs,
+        "verdict": (
+            "routing is BATCH-COMPOSITION SENSITIVE -- the temporal "
+            "route is not a stable population statistic; DTCPR dies "
+            "harder" if any_change else
+            "routes composition-insensitive under all alternative fixed "
+            "partitions -- the batch majority is a stable population "
+            "statistic on this run"),
+        "note": "alternative partitions = circular shifts 1..B-1 of the "
+                "canon (rel_idx) order per (client, task); zero GPU, "
+                "computed from cached per-sample preferences",
+    }
 
     # ---- informative annex: probe acc(A) vs client CSVs ----------------
     summary["annex"].update(_native_annex(states, run_dir, args_cli))
@@ -1196,16 +1585,22 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
 
 
 def _native_annex(states, run_dir, args_cli):
-    """Informative: probe acc(A, head.eval(), fixed order) vs the run's
-    client CSVs (native evaluate: Dropout ON, shuffle). --native_tol
-    covers the pre-registered dropout-off uplift."""
+    """Informative annex (review round 2, item 4): LOCATE the probe-vs-
+    native gap instead of waving it off. probe acc(A) is deterministic
+    (head.eval(), fixed batch order); the native readout is stochastic
+    (Chead Dropout ON, shuffle=True). With --native_draws > 0 each
+    (state, client, task) carries seeded native-mode draws, so the gap
+    decomposes into (i) native draw stochasticity (dropout), (ii)
+    eval-mode uplift (probe - mean draw), (iii) any unexplained residual.
+    --native_tol is the informative tolerance."""
     annex = {"native_diff_max_pp": None, "native_diff_mean_pp": None,
              "n_compared": 0,
-             "note": "probe uses head.eval() (deterministic; ~1-2pp above "
-                     "the dropout-on native path) and fixed batch order; "
-                     "informative only"}
+             "note": "probe = head.eval() + fixed batch order "
+                     "(deterministic); native = Dropout ON + shuffle "
+                     "(stochastic); draws decompose the gap"}
     run_dir = Path(run_dir)
     diffs = []
+    per_key = []
     for st in states:
         rows = st["rows"]
         correct, _ = _state_correct_ce(st)
@@ -1213,6 +1608,7 @@ def _native_annex(states, run_dir, args_cli):
         for i in range(len(rows["client"])):
             keys.setdefault((int(rows["client"][i]),
                              int(rows["task"][i])), []).append(correct[i])
+        draws_map = st.get("native_draws", {}) or {}
         for (cid, task), corr in keys.items():
             csv_path = run_dir / "metrics" / f"client_{cid}_accuracy.csv"
             if not csv_path.is_file():
@@ -1226,17 +1622,63 @@ def _native_annex(states, run_dir, args_cli):
                         break
             if native is None:
                 continue
-            diffs.append(_acc(np.array(corr, dtype=bool)) - native)
+            probe_acc = _acc(np.array(corr, dtype=bool))
+            diffs.append(probe_acc - native)
             annex["n_compared"] += 1
+            d = list(draws_map.get(f"{cid},{task}", []))
+            rec = {"state": st["t_index"], "client": cid, "task": task,
+                   "probe_acc": round(probe_acc, 2), "csv_acc": native,
+                   "draws": d}
+            if d:
+                pool = d + [native]
+                rec["draw_spread_pp"] = round(max(pool) - min(pool), 2)
+                rec["eval_uplift_pp"] = round(
+                    probe_acc - float(np.mean(d)), 2)
+                rec["residual_pp"] = round(probe_acc - native, 2)
+                rec["residual_within_draw_spread"] = bool(
+                    abs(probe_acc - native) <= rec["draw_spread_pp"] + 1e-9)
+            per_key.append(rec)
     if diffs:
         annex["native_diff_max_pp"] = round(
             float(np.max(np.abs(diffs))), 2)
         annex["native_diff_mean_pp"] = round(float(np.mean(diffs)), 2)
-        if annex["native_diff_max_pp"] > args_cli.native_tol:
-            annex["warning"] = (
-                "probe-vs-native diff exceeds tolerance -- batch "
-                "composition sensitivity or head/dropout semantics "
-                "divergence; investigate before trusting gate readouts")
+    with_draws = [r for r in per_key if "draw_spread_pp" in r]
+    if with_draws:
+        spreads = [r["draw_spread_pp"] for r in with_draws]
+        uplifts = [r["eval_uplift_pp"] for r in with_draws]
+        annex["n_with_draws"] = len(with_draws)
+        annex["draw_spread_max_pp"] = round(float(np.max(spreads)), 2)
+        annex["draw_spread_mean_pp"] = round(float(np.mean(spreads)), 2)
+        annex["eval_uplift_mean_pp"] = round(float(np.mean(uplifts)), 2)
+        annex["frac_residual_within_draw_spread"] = round(float(np.mean(
+            [r["residual_within_draw_spread"] for r in with_draws])), 3)
+        unexpl = [abs(r["residual_pp"]) - r["draw_spread_pp"]
+                  for r in with_draws]
+        annex["max_unexplained_pp"] = round(float(max(unexpl)), 2)
+        worst = with_draws[int(np.argmax(unexpl))]
+        annex["worst_key"] = (f"state={worst['state']} "
+                              f"client={worst['client']} "
+                              f"task={worst['task']}")
+        annex["gap_location_conclusion"] = (
+            "probe-vs-native residuals are within the native Dropout "
+            "draw stochasticity (same checkpoint/head/test rows); the "
+            "gap is located, not a semantics divergence"
+            if annex["frac_residual_within_draw_spread"] >= 0.9
+            and annex["max_unexplained_pp"] <= 0.2 else
+            "residual NOT fully explained by native draw stochasticity "
+            f"(max unexplained {annex['max_unexplained_pp']}pp at "
+            f"{annex['worst_key']}) -- investigate before trusting F3 "
+            "verdicts")
+    else:
+        annex["gap_location_conclusion"] = (
+            "no native draws available (set --native_draws > 0 and "
+            "re-extract) -- gap NOT located yet")
+    if annex.get("native_diff_max_pp") is not None \
+            and annex["native_diff_max_pp"] > args_cli.native_tol:
+        annex["warning"] = (
+            "probe-vs-native diff exceeds tolerance -- batch "
+            "composition sensitivity or head/dropout semantics "
+            "divergence; investigate before trusting gate readouts")
     return annex
 
 
@@ -1249,7 +1691,9 @@ AGG_FIELDS = ["level", "transition", "client", "task", "n_rows",
               "flip_rate", "acc_A_tm1", "acc_A_t", "drift_pool",
               "route_pool", "content_pool", "interaction_pool",
               "E_derr_flip", "E_derr_stable", "med_d_rel_flip",
-              "med_d_rel_stable", "med_d_cos_flip", "med_d_cos_stable"]
+              "med_d_rel_stable", "med_d_cos_flip", "med_d_cos_stable",
+              "ci_drel_lo", "ci_drel_hi", "ci_dcos_lo", "ci_dcos_hi",
+              "ci_derr_lo", "ci_derr_hi"]
 
 ROW_FIELDS = ["transition", "client", "task", "rel_idx", "bseq",
               "slot_major_tm1", "slot_major_t", "flip", "flip_pref",
@@ -1315,6 +1759,16 @@ def main():
     print(f"{TAG} F5: Oracle-1 complementary="
           f"{v['F5_oracle1_complementary']}; Oracle-2b -> "
           f"{v['F5_oracle2b']} (curves in summary json)")
+    f5d = v["F5_detail"]
+    if f5d.get("net_pool_pp") is not None:
+        print(f"{TAG} F5 net (A2-R constraint): P(flip)="
+              f"{f5d['flip_fraction_pooled']}, G_net="
+              f"{f5d['net_pool_pp']}pp -- a deployable gate must be "
+              "disagreement-gated (G_stable = 0 by design)")
+    print(f"{TAG} batch-composition sensitivity: "
+          f"{summary['annex']['batch_composition_sensitivity']['verdict']}")
+    print(f"{TAG} native gap location: "
+          f"{summary['annex'].get('gap_location_conclusion')}")
     print(f"{TAG} FINAL: {v['FINAL']}")
     print(f"{TAG} rows -> {args_cli.out_rows_csv}; aggregates -> "
           f"{args_cli.out_csv}; summary -> {args_cli.out_json}")
