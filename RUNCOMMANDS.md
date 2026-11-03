@@ -1486,3 +1486,57 @@ python main.py datasets_delay --data_name ImageNet-R --data-path ./local_dataset
 ```
 
 主判读场 = cifar（`cifar_a5v2_M2_feat_full` 为 M2' 对照，92.58 T2 / 94.22→96.90 见 §27.7-1）；INR 对照 = `inr_a5v2_M2_feat_p40`（81.93 corrected，task_num 5 / private 40 / surrogate 5）。GREEN 后种子扩展同 §23.2 惯例。
+
+## 29. DHT 可行性判死探针（历史头跨状态迁移候选，2026-11-03 预注册，探针先行）
+
+> 候选动机：M2'' 只解决**当前头**的即时错配；历史头在"出生边界校准后随部署状态演化而老化"（M2'' 未覆盖的时间尺度）。候选方案 DHT（Deployment-state Head Transport）：在相邻部署状态间用当前任务样本拟合 near-identity ridge 仿射映射 `z_{r-1} ≈ (I+ΔA) z_r + b`，把旧头第一层解析迁移（`W1'←W1·A`，部署时可吸收、0 推理开销）。**判死链先行，探针不过不写训练臂。**
+
+### 29.0 F4 重叠审计（硬 gate，已完成）
+
+巩固臂（M5，存档 §23.6-3 / git e7d7a42）= 边界轮用当前接口状态 + 旧任务 train split（**replay**）直接重 refit 旧头——即 DHT 目标池的"有数据直接版"（上界）。判死理由两条：
+
+1. **replay 档位代价**（用户定案 2026-11-02：带轻 replay 代价，放弃，要 no-replay 方案）——DHT 恰好 no-replay（当前任务样本只作 probing 点），**不重叠于死因**；
+2. **池上界被论证为 1.4–1.7pp，低于独立 GREEN 门**（"残余轨迹分量…不立项"）——这条**封顶** DHT：DHT（无数据仿射近似）≤ F4（有数据直接 refit）≤ 池。探针直接实测该上界（`acc_refit` 项）。
+
+结论：不算重蹈 F4，但生死门必须按 ≤1.4–1.7pp 的池量级设计（拿 ≥1.0pp = 池的 ≥60%，紧但非不可能）。
+
+### 29.1 判死链（`diagnostics/probe_dht_feasibility.py`，离线零训练，只读保留 run）
+
+| 层 | 检验 | 判死区分 |
+|---|---|---|
+| Probe-A 仿射可行性 | 相邻部署 checkpoint 对（task_XX_end = 广播后状态）当前任务 train 行拟合 `I+ΔA` ridge；held-out 残差比 | 残差比 ≥1 = 漂移非仿射，仿射假设死 |
+| Probe-B 跨任务外推三臂 | B0 identity / B1 当前任务拟合（可部署，no-replay）/ B2 旧任务拟合（仅诊断 oracle）；旧任务 test 行特征恢复比 | B1≈B2 且 <1 = probing 分布成立；B2 有效 B1 无效 = probing 死；均无效 = 仿射死 |
+| Probe-C 头级因果老化 | `H_j^sync` = 出生边界 j 的 M2'' 同配方头（hidden 512 / standardize False / 稳定种子），之后不再见任务 j 数据；各后续边界 r 比较 stale / 递归迁移 / 直接迁移 / refit 上界四读数 | Δ(acc_rec−acc_stale) = DHT 净效应；Δ(acc_refit−acc_stale) = 池上界（F4 等价，仅诊断） |
+| Probe-D 递归 vs 直接 | 递归复合迁移 vs 单步直接拟合 | direct 好而 recursive 差 = 复合误差累积，非原理死 |
+
+**不变式**：探针只用 z_op 缓存特征（`ensure_features` 复用既有提取，行对齐 fail-closed）；不触碰训练代码；所有种子派生稳定可复现。transport 在特征空间评估（与第一层吸收数学等价，`W1'←W1·A` 等价于对输入做逆迁移）。
+
+### 29.2 判读（预注册，先于数据）
+
+| 判读项 | 门 |
+|---|---|
+| 仿射可行性（门 1） | held-out B1 残差比中位数 ≤ 0.8 |
+| 主签名（门 2） | 末边界旧任务列 client-mean Δ(acc_rec) ≥ +1.0pp = GREEN / ≤ +0.5pp = RED |
+| 迁移效率（对账） | Δ_rec / Δ_refit ≥ 0.5（拿不到池的一半则"近恒等仿射"叙事不成立） |
+| 机制签名（对账） | corr(gain, drift) ≥ corr(gain, age)：真理论变量是累计特征位移而非任务数 |
+| 约束 | 当前任务头读数不受迁移影响（transport 只作用于历史头路径） |
+
+双门全过 → DHT 写训练臂（`M2'' + DHT` 单变量叠加，沿用 §23 范式：RNG 中立 / fail-closed / T0 回归）；门 1 过门 2 RED → 机制成立但池不够，按 F4 预案降级为约束手段不立项；门 1 不过 → 仿射死，当天关闭，不写臂。
+
+### 29.3 命令（GPT 审核通过后执行；与 M2'' 训练无 GPU 抢占——特征提取为轻前向，建议错峰）
+
+```bash
+# cifar 主判读场（保留 run 的 5 个边界 checkpoint；特征已缓存则秒级复用）
+python diagnostics/probe_dht_feasibility.py \
+    --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
+    --data_path ./local_datasets --device cuda \
+    --out_csv diagnostics_output/dht_cifar.csv
+
+# INR 复核（同划分保留 run）
+python diagnostics/probe_dht_feasibility.py \
+    --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
+    --data_path ./local_datasets --device cuda \
+    --out_csv diagnostics_output/dht_inr.csv
+```
+
+产物：`dht_{ds}.csv`（逐 client/born_task/boundary 行）+ `dht_{ds}.summary.json`（门读数 + verdict + 相关性）。判级声明：探针级诊断，产判据不产数字；GREEN 后的训练臂另立 §30 预注册。

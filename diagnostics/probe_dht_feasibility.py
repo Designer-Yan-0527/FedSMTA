@@ -1,0 +1,371 @@
+"""DHT feasibility death-check probe (RUNCOMMANDS Sec.29, offline only).
+
+Zero-training offline probe for the DHT (Deployment-state Head Transport)
+candidate: fits near-identity ridge affine transports between adjacent
+deployment-state checkpoints (task_XX_end.pth = post-broadcast states) on
+cached z_op features, and measures whether transported historical heads
+recover aged-readout accuracy. Nothing here touches training code; the
+probe only READS preserved runs.
+
+Four-layer death chain (pre-registered, Sec.29):
+  Probe-A  affine feasibility of the drift on probing (current-task)
+           rows: held-out residual ratio must be clearly < 1.
+  Probe-B  cross-task extrapolation, 3 arms:
+             B0 identity (do nothing),
+             B1 transport fitted on CURRENT-task train rows (deployable,
+               no replay),
+             B2 transport fitted on OLD-task train rows (diagnostic
+               oracle only, never a method).
+           Old-task feature recovery separates "affine dead" from
+           "probing distribution dead".
+  Probe-C  head-level causal aging: H_j^sync is born post-broadcast at
+           boundary j (M2'' recipe: hidden 512, standardize False --
+           identical semantics to the arm's refit head), then never sees
+           task-j data again. At every later boundary r we compare
+             acc_stale  (H_j^sync on z_r, un-transported),
+             acc_rec    (H_j^sync on recursively transported z_r),
+             acc_dir    (direct transport fitted on task-r train rows),
+             acc_refit  (diagnostic pool ceiling: refit head at S_r on
+               task-j train rows -- the F4/consolidation upper bound,
+               replay access level, NEVER a method).
+  Probe-D  recursive-vs-direct: composition error is visible as
+           acc_rec < acc_dir on the same rows.
+
+Gates (frozen defaults; do not weaken without external review):
+  feasibility: median held-out B1 recovery ratio <= 0.8
+  signature  : mean old-task Delta(acc_rec - acc_stale) over clients at
+               the final boundary >= green (1.0pp) / <= red (0.5pp)
+  transport efficiency (informative): Delta_rec / Delta_refit >= 0.5
+
+F4 overlap audit context (Sec.29.0): the consolidation arm (M5) died for
+(a) replay access-level cost and (b) an argued 1.4-1.7pp pool ceiling.
+DHT is no-replay so death (a) does not apply, but (b) caps the pool this
+probe measures -- acc_refit is exactly that ceiling, measured directly.
+"""
+
+import argparse
+import csv
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from diagnostics.ncm_probe import ensure_features  # noqa: E402
+from diagnostics.probe_oracle_headroom import (  # noqa: E402
+    fit_head, head_predict, _acc, stable_seed)
+
+# M2'' refit head recipe (Client_DF A5_REFIT_*; kept in sync with the arm)
+HIDDEN = 512
+EPOCHS = 100
+LR = 1e-3
+WD = 1e-4
+DROPOUT = 0.1
+BATCH = 64
+
+
+def parse_args():
+    p = argparse.ArgumentParser("DHT feasibility death-check probe")
+    p.add_argument("--run_dir", required=True)
+    p.add_argument("--checkpoints",
+                   default="task_00_end.pth,task_01_end.pth,"
+                           "task_02_end.pth,task_03_end.pth,"
+                           "task_04_end.pth")
+    p.add_argument("--features_dir", default="diagnostics_output")
+    p.add_argument("--feat", default="z_op", choices=["z_op", "z_ref"])
+    p.add_argument("--data_path", default=None,
+                   help="forwarded to extract_features.py if extraction "
+                        "is needed")
+    p.add_argument("--device", default="cpu",
+                   help="'cpu' (deterministic) or 'cuda' (also used for "
+                        "feature extraction)")
+    p.add_argument("--prompt_task_mode", default="current",
+                   choices=["test", "current"])
+    p.add_argument("--lam", default=1.0, type=float,
+                   help="ridge strength on the residual map dA; effective "
+                        "lambda = lam * trace(Zn^T Zn)/d (scale-invariant)")
+    p.add_argument("--seed_base", default=20261103, type=int)
+    p.add_argument("--out_csv", required=True)
+    p.add_argument("--feas_ratio_gate", default=0.8, type=float)
+    p.add_argument("--gate_green", default=1.0, type=float)
+    p.add_argument("--gate_red", default=0.5, type=float)
+    p.add_argument("--no_pool_ceiling", action="store_true",
+                   help="skip the diagnostic refit ceiling (faster)")
+    return p.parse_args()
+
+
+def fit_transport(z_old, z_new, lam):
+    """Near-identity ridge affine: z_old ~ (I + dA) z_new + b.
+    Closed form on centered rows; scale-invariant lambda. Returns (A, b)
+    with A = I + dA. Deterministic (pure linear algebra)."""
+    zo = torch.as_tensor(z_old, dtype=torch.float64)
+    zn = torch.as_tensor(z_new, dtype=torch.float64)
+    n, d = zn.shape
+    mo, mn = zo.mean(0), zn.mean(0)
+    oc, nc = zo - mo, zn - mn
+    lam_eff = lam * (nc.T @ nc).trace() / d
+    eye = torch.eye(d, dtype=torch.float64)
+    # centered fit: oc ~ nc @ dA^T  ->  dA^T = (nc^T nc + lam I)^-1 nc^T oc
+    dat = torch.linalg.solve(nc.T @ nc + lam_eff * eye, nc.T @ oc)
+    A = eye + dat.T
+    b = mo - A @ mn
+    return A.numpy().astype(np.float32), b.numpy().astype(np.float32)
+
+
+def apply_transport(z, A, b):
+    return z @ A.T + b
+
+
+def compose(ts):
+    """Compose a chain of (A, b): z -> A1(A2(...(Ak z + bk)...) + b1)."""
+    A, b = ts[0]
+    for A2, b2 in ts[1:]:
+        A = A @ A2
+        b = A2 @ b + b2
+    return A, b
+
+
+def resid_ratio(z_old, z_new, A, b):
+    """||old - T(new)||^2 / ||old - new||^2: 1 = no better than identity."""
+    drift = float(np.sum((z_old - z_new) ** 2))
+    if drift <= 0:
+        raise RuntimeError("zero drift between deployment states -- "
+                           "checkpoint pair is not two states")
+    resid = float(np.sum((z_old - apply_transport(z_new, A, b)) ** 2))
+    return resid / drift
+
+
+def load_boundary(run_dir, ckpt, feat_dir, data_path, device, mode, feat):
+    npz_path, meta_path = ensure_features(
+        run_dir, ckpt, feat_dir, data_path,
+        device if device != "cpu" else None, mode)
+    data = np.load(npz_path)
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    masks = {int(cid): [list(map(int, ts)) for ts in tmask]
+             for cid, tmask in meta["client_class_masks"].items()}
+    return data, masks
+
+
+def main():
+    args = parse_args()
+    run_dir = Path(args.run_dir)
+    feat_dir = Path(args.features_dir)
+    ckpts = [c.strip() for c in args.checkpoints.split(",") if c.strip()]
+    bounds = []
+    for c in ckpts:
+        m = re.fullmatch(r"task_(\d+)_end\.pth", Path(c).name)
+        if not m:
+            raise SystemExit(f"--checkpoints only accepts task_XX_end.pth, "
+                             f"got {c!r}")
+        bounds.append(int(m.group(1)))
+    order = np.argsort(bounds)
+    ckpts = [ckpts[i] for i in order]
+    bounds = [bounds[i] for i in order]
+
+    # load every deployment state once; fail closed on row misalignment
+    states, masks = {}, None
+    for t, ck in zip(bounds, ckpts):
+        data, msk = load_boundary(run_dir, ck, feat_dir, args.data_path,
+                                  args.device, args.prompt_task_mode,
+                                  args.feat)
+        states[t] = data
+        masks = msk
+    ref = states[bounds[0]]
+    for key in ("labels", "client_ids", "task_ids", "splits"):
+        for t in bounds[1:]:
+            if not np.array_equal(ref[key], states[t][key]):
+                raise RuntimeError(f"feature files are not row-aligned on "
+                                   f"{key} across checkpoints -- join key "
+                                   f"mismatch, do not trust this probe run")
+
+    clients = sorted(masks)
+    hp = dict(hidden=HIDDEN, epochs=EPOCHS, lr=LR, wd=WD, dropout=DROPOUT,
+              batch_size=BATCH, device=args.device)
+    rows = []
+    feas_rows = []
+
+    for cid in clients:
+        cids = ref["client_ids"]
+        tids = ref["task_ids"]
+        splits = ref["splits"]
+        tr = splits == 0
+        te = splits == 1
+        mine_tr = tr & (cids == cid)
+        mine_te = te & (cids == cid)
+
+        # ---- transports per adjacent pair (deployable B1 = current-task
+        # train rows; diagnostic B2 = old-task train rows) ----
+        trans_cur, trans_old = {}, {}
+        for t, nxt in zip(bounds[:-1], bounds[1:]):
+            zo = states[t][args.feat]
+            zn = states[nxt][args.feat]
+            cur = mine_tr & (tids == nxt)          # probing: task being learned
+            if not cur.any():
+                raise RuntimeError(f"client {cid}: no train rows for task "
+                                   f"{nxt} -- wrong checkpoint ladder")
+            A1, b1 = fit_transport(zo[cur], zn[cur], args.lam)
+            trans_cur[(t, nxt)] = (A1, b1)
+            old = mine_tr & (tids <= t)            # diagnostic oracle fit
+            A2, b2 = fit_transport(zo[old], zn[old], args.lam)
+            trans_old[(t, nxt)] = (A2, b2)
+
+            # Probe-A: probing-distribution feasibility (held-out rows)
+            cur_te = mine_te & (tids == nxt)
+            r_tr = resid_ratio(zo[cur], zn[cur], A1, b1)
+            r_te = (resid_ratio(zo[cur_te], zn[cur_te], A1, b1)
+                    if cur_te.any() else float("nan"))
+            dA = float(np.linalg.norm(A1 - np.eye(A1.shape[0]), "fro"))
+            feas_rows.append({
+                "client_id": cid, "pair": f"{t}->{nxt}",
+                "n_probe": int(cur.sum()),
+                "resid_ratio_train": round(r_tr, 4),
+                "resid_ratio_heldout": round(r_te, 4) if cur_te.any() else None,
+                "dA_fro": round(dA, 4),
+            })
+
+            # Probe-B: old-task feature recovery, 3 arms (test rows)
+            for j in [b for b in bounds if b <= t]:
+                oj = mine_te & (tids == j)
+                if not oj.any():
+                    continue
+                r1 = resid_ratio(zo[oj], zn[oj], A1, b1)
+                r2 = resid_ratio(zo[oj], zn[oj], A2, b2)
+                rows.append({
+                    "client_id": cid, "born_task": j, "boundary": nxt,
+                    "kind": "feature_recovery",
+                    "age": nxt - j,
+                    "drift": round(float(np.mean(
+                        np.linalg.norm(zo[oj] - zn[oj], axis=1))), 4),
+                    "resid_B1_cur": round(r1, 4),
+                    "resid_B2_old": round(r2, 4),
+                })
+
+        # ---- Probe-C/D: causal head aging ----
+        for j in [b for b in bounds if b < bounds[-1]]:
+            zj = states[j][args.feat]
+            trj = mine_tr & (tids == j)
+            if not trj.any():
+                continue
+            allowed = masks[cid][j]
+            H = fit_head(zj[trj], ref["labels"][trj], allowed,
+                         seed=stable_seed(args.seed_base, "sync", cid, j),
+                         standardize=False, **hp)
+            for r in [b for b in bounds if b > j]:
+                zr = states[r][args.feat]
+                te_jr = mine_te & (tids == j)
+                z_te = zr[te_jr]
+                if len(z_te) == 0:
+                    continue
+                y_te = ref["labels"][te_jr]
+                acc_stale = _acc(head_predict(H, z_te, allowed), y_te)
+                chain = [trans_cur[(t, t2)] for t, t2 in
+                         zip(bounds[:-1], bounds[1:]) if j <= t < r]
+                A_rec, b_rec = compose(chain)
+                acc_rec = _acc(head_predict(
+                    H, apply_transport(z_te, A_rec, b_rec), allowed), y_te)
+                # direct: fit on task-r train rows (still no old data)
+                zj2 = states[j][args.feat]
+                cur_r = mine_tr & (tids == r)
+                A_d, b_d = fit_transport(zj2[cur_r], zr[cur_r], args.lam)
+                acc_dir = _acc(head_predict(
+                    H, apply_transport(z_te, A_d, b_d), allowed), y_te)
+                acc_refit = float("nan")
+                if not args.no_pool_ceiling:
+                    H2 = fit_head(zr[trj], ref["labels"][trj], allowed,
+                                  seed=stable_seed(args.seed_base, "refit",
+                                                   cid, j, r),
+                                  standardize=False, **hp)
+                    acc_refit = _acc(head_predict(H2, z_te, allowed), y_te)
+                rows.append({
+                    "client_id": cid, "born_task": j, "boundary": r,
+                    "kind": "head_aging",
+                    "age": r - j,
+                    "drift": round(float(np.mean(
+                        np.linalg.norm(zr[te_jr] - zj2[te_jr], axis=1))), 4),
+                    "acc_stale": round(acc_stale, 2),
+                    "acc_rec": round(acc_rec, 2),
+                    "acc_dir": round(acc_dir, 2),
+                    "acc_refit": round(acc_refit, 2),
+                    "d_rec": round(acc_rec - acc_stale, 2),
+                    "d_dir": round(acc_dir - acc_stale, 2),
+                    "d_refit": round(acc_refit - acc_stale, 2),
+                })
+
+    # ---- aggregation + gates ----
+    last = bounds[-1]
+    aging = [r for r in rows if r["kind"] == "head_aging"
+             and r["boundary"] == last and r["born_task"] < last]
+    feat_rows = [r for r in rows if r["kind"] == "feature_recovery"]
+
+    def colmean(rs, key):
+        per = {}
+        for r in rs:
+            per.setdefault(r["born_task"], []).append(r[key])
+        return {k: round(float(np.mean(v)), 2) for k, v in sorted(per.items())}
+
+    sig_rec = float(np.mean([r["d_rec"] for r in aging])) if aging else float("nan")
+    sig_refit = float(np.mean([r["d_refit"] for r in aging])) if aging else float("nan")
+    held = [f["resid_ratio_heldout"] for f in feas_rows
+            if f["resid_ratio_heldout"] is not None]
+    feas_med = float(np.median(held)) if held else float("nan")
+    feas_ok = feas_med <= args.feas_ratio_gate
+
+    if not np.isnan(sig_rec):
+        verdict = ("GREEN" if (sig_rec >= args.gate_green and feas_ok)
+                   else "RED" if sig_rec <= args.gate_red else "YELLOW")
+    else:
+        verdict = "N/A"
+
+    ages = np.array([r["age"] for r in aging], dtype=float)
+    gains = np.array([r["d_rec"] for r in aging], dtype=float)
+    drifts = np.array([r["drift"] for r in aging], dtype=float)
+    corr_age = (float(np.corrcoef(ages, gains)[0, 1])
+                if len(ages) > 2 and np.std(ages) > 0 else float("nan"))
+    corr_drift = (float(np.corrcoef(drifts, gains)[0, 1])
+                  if len(drifts) > 2 and np.std(drifts) > 0 else float("nan"))
+
+    out_csv = Path(args.out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=sorted(
+            {k for r in rows for k in r}))
+        w.writeheader()
+        w.writerows(rows)
+    with open(out_csv.with_suffix(".summary.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({
+            "hyper": vars(args),
+            "gates": {"feasibility_ratio": feas_med,
+                      "feasibility_gate": args.feas_ratio_gate,
+                      "feasibility_pass": bool(feas_ok),
+                      "signature_d_rec": round(sig_rec, 2),
+                      "pool_ceiling_d_refit": round(sig_refit, 2),
+                      "transport_efficiency": (round(sig_rec / sig_refit, 3)
+                                               if sig_refit else None),
+                      "green_pp": args.gate_green, "red_pp": args.gate_red,
+                      "verdict": verdict,
+                      "corr_gain_age": round(corr_age, 3),
+                      "corr_gain_drift": round(corr_drift, 3)},
+            "per_born_task_rec": colmean(aging, "d_rec"),
+            "per_born_task_refit": colmean(aging, "d_refit"),
+            "feasibility_rows": feas_rows,
+        }, f, indent=2)
+
+    print(f"[dht-probe] rows -> {out_csv}")
+    print(f"[dht-probe] feasibility: held-out B1 resid median "
+          f"{feas_med:.3f} (gate <= {args.feas_ratio_gate}) -> "
+          f"{'PASS' if feas_ok else 'FAIL'}")
+    print(f"[dht-probe] signature (boundary {last}, old tasks): "
+          f"d_rec {sig_rec:+.2f}pp vs pool ceiling d_refit "
+          f"{sig_refit:+.2f}pp -> {verdict}")
+    print(f"[dht-probe] corr(gain, age) = {corr_age:.3f}; "
+          f"corr(gain, drift) = {corr_drift:.3f}")
+
+
+if __name__ == "__main__":
+    main()
