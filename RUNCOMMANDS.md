@@ -1576,3 +1576,125 @@ python diagnostics/probe_dht_feasibility.py \
 ```
 
 产物：`dht_{ds}.csv`（逐 client/born_task/boundary 行）+ `dht_{ds}.summary.json`（门读数 + verdict + 相关性）。判级声明：探针级诊断，产判据不产数字；GREEN 后的训练臂另立 §30 预注册。
+
+## 30. Probe-F：路由不连续机制识别（`probe_routing_flip.py`，预注册 2026-11-03）
+
+> §29 判死后 §30 按用户+GPT 终审冻结方向重立为 **Probe-F**（原"§29 GREEN 后训练臂预注册"路径已随 §29 判死作废）。候选结构 = **DTCPR**（Dual-Timescale Consensus Prompt Router：fast/slow 双 key 池 + consensus gate + 分歧感知过渡混合），是最后一个结构候选，不再设计第三个。定位（GPT 冻结措辞）：
+> **Probe-F = routing-discontinuity mechanism identification**——先回答 `non-affine drift ←?— discrete routing transition` 因果链是否成立；成立后 DTCPR 才获得设计依据。探针零训练、只读保留 run、fail-closed、预注册先于数据。
+
+### 30.0 F0：A2-R 死因审计（硬前置）
+
+先例记录（§20/§20.6，2026-10-28，Track A 关闭）：四臂同协议 **D 官方 94.50 > E1 92.69 ≈ E2 ≈92.5 > B 92.38 > A 92.15**；kill criterion 触发（E2 几何全绿——key 有效秩 96+、范数健康、路由熵复活——准确率仍 ≤ D）。因果结论原文：**"塌缩与当前任务准确率双向解耦：E1 塌着 92.69 / E2 修干净 ≈92.5——修复 key 池一分准确率不还"**；关闭措辞："key 池健康与当前任务准确率无因果通路（双向解耦实测）"。
+
+| 项目 | A2-R（已判死） | DTCPR（本探针服务对象） |
+|---|---|---|
+| 攻击对象 | routing geometry / 可导性 / **当下**检索质量 | **跨 deployment state** 的时序路由稳定性 |
+| 目标 | 路由熵复活、key 池健康 | 抑制相邻状态离散换路 |
+| route 类型 | 软/正交（R1 init + softmax 全池） | fast-slow temporal consensus（未实现） |
+| 是否改 z_op 生成路径 | 是 | **是** |
+| 主失败指标 | **实测：routing metric↑ 但 Acc −1.9~−2pp** | 待 F3 实测 |
+| accuracy pool | 与 Acc 解耦（历史先例） | F3 直接测 |
+
+**先例含义（冻结）**：routing 侧指标与准确率解耦是实测先例，非推测——因此 **F1 为显式判死门**（换路不存在 → DTCPR 当天关闭，不写臂），**F3 主门 ≥1pp 不放宽**。A2-R 的死因不直接否证 DTCPR（"状态内路由质量" ≠ "跨状态路由稳定性"，对象不同），但它把 DTCPR 的举证责任抬高：必须证明**跨状态** route change 拥有**跨状态**性能退化池（F3b 因果口径），而非"换路样本更难"（F3a 观测口径须防的混杂）。
+
+### 30.1 实际路由语义审计（代码事实，2026-11-03 实读冻结；探针以此为准）
+
+读 `Models/global_prompt.py` + `vision_transformer__l2p.py` + `Client_DF.evaluate` + 保留 run `args.json`：
+
+1. **保留 run 配置**（cifar_a5v2_M2_feat_full）：pool_size=100、length=10、**top_k=1**、prompt_key=True（uniform init）、**use_prompt_mask=False**、**batchwise_prompt=True**、embedding_key='cls'、head_type='prompt'、ViT 骨干全冻结（freeze=blocks/patch_embed/cls_token/norm/pos_embed）、weight_decay=0。
+2. **use_prompt_mask=False ⇒ 训练与推理（含 native evaluate）都走全池 top-k 相似度路由**（prompt_mask≡None、task_id 完全不参与路由；L2P 式 task-mask 路径在这些 run 上是死代码）。GPT 的"离散 top-k 路由"前提成立，但按事实修正三处：
+   - **K=1**：FlipSeverity_i ∈ {0,1}，无 3/4→2/4 连续剂量；连续剂量改由 **batch vote margin** 承担（F2/F4）；
+   - **batchwise 多数投票**：路由是 batch 级量——同 batch 全体样本共享同一 top-1 槽。per-sample FlipSeverity 以其 batch 多数槽为准（部署真相）；per-sample 自身 top-1 偏好翻转另记参考量；
+   - **§20 先验**：官方硬路由结构性单槽垄断（keyH≈0.004 bits、全样本命中单槽）→ F1 很可能直接判死；预注册退化分支见 30.4。
+3. **路由只依赖 key 池漂移**：query q(x) = 冻结 original model 的 CLS 特征（状态无关）；`sim = l2norm(q)·l2norm(prompt_key)^T`——R_{t−1}≠R_t 完全由 prompt_key 漂移驱动。
+4. **z_op 完全由注入 prompt token 决定**：head_type='prompt' 下 z_op = prompt token 输出均值（`x[:,1:1+L].mean(1)`），骨干冻结 ⇒ 部署特征 = `FrozenViT(x ⊕ prompt[R])`。由此 **route × contents 2×2 因子分解穷尽全部漂移通道**（route=选哪个槽；contents=槽内 prompt 值）——比纯翻转相关更强的机制武器，且零训练可测。
+5. **native evaluate 语义**：heads[task]（各任务训练结束存的头；M2 臂只 refit 当前任务头，旧任务头跨边界应恒定——探针逐边界记录 heads[j] 张量哈希验证"同头"前提）+ 当前状态路由特征 + class_mask[task] 掩码 + **batch_size=8、shuffle=True**；且全程不调 `.eval()`（Chead Dropout 0.5 保持激活 = Track E 已定性的 evaluation-mode implementation bug）。**探针偏差（有意，预注册）**：同一人群（test_loader[t] ≡ data_split_indices[t]['test']）、固定顺序、batch=8——跨状态/跨臂同 batch 配对成立的前提；读数固定 `head.eval()`（确定性优先；绝对值较 native matrix 系统性高 ~1-2pp，已知偏置，门全部作用于跨状态/跨臂差值故偏置消去；与 accuracy_matrix 对账为 informative annex，容差 3pp）。
+6. **Debt-C 部分解答（代码事实落地）**：prompt 为 token 前拼接（`cat([batched_prompt, x_embed])`），DTCPR 的 consensus 融合若在 token 层合成单一 prompt 集，则 ViT 主体只 forward 一次——推理预算 = **2×routing（廉价）+ 1×transformer**，非 2× full model；诊断探针（Oracle 双路完整 forward）可以 2×，正式架构不必。
+
+### 30.2 假设措辞（冻结，先于数据）
+
+> **Hypothesis: discrete top-k route switching may contribute to non-affine deployment-state drift.**
+
+不写 "drift is caused by top-k switching"——因果判定按 30.4 判决树出，措辞不抢跑。
+
+### 30.3 探针设计
+
+**人群与配对**：4 个相邻状态对（task_00→01 … 03→04）；每对分析人群 = 全部 5 client 的旧任务（j ≤ t−1）test 行；跨状态按 (client, task, rel_idx) 规范化对齐（§29.1c 同款 canon）。
+
+**逐状态臂表**（每边界 checkpoint；B/C/λ 臂仅对翻转批次追加）：
+
+| 臂 | route | contents | 作用 |
+|---|---|---|---|
+| A 天然 | R_t（本状态多数投票） | prompt_t | 部署真相；F2 跳变与 F3 ΔErr 的跨状态两端（t−1 侧的 A 即 D） |
+| B 换路隔离 | R_{t−1}（强制旧槽） | prompt_t | 同状态强制旧路 → **route 通道因果量（F3b 主门）** |
+| C 内容隔离 | R_t | prompt_{t−1} | 槽不变换值 → contents 通道（2×2 补全） |
+| D 全旧路 | R_{t−1} | prompt_{t−1} | = state t−1 的 A（天然臂直接复用，零额外 forward） |
+
+2×2 读法：A−B = route 效应；A−C = contents 效应；(A−B)−(D−C) = 交互；无翻转时 B≡A、C≡D，因子分解退化为 A vs D 的 contents 归因——依然穷尽。
+
+**F1 换路存在性（显式判死门）**：逐 (client, transition) 的 FlipRate（多数槽变更批次占比）+ per-sample 偏好翻转率 + **逐状态路由使用熵（keyH 复刻，直接对照 §20 的 0.004 bits）**。门（第一版工程门，外审可调）：任一状态对 flip 批次占比 ≥5% **或**全局多数槽跨状态轮换 ≥1 次 → F1 过；全部状态对零翻转且全局单槽恒定 → F1 死。
+
+**F2 归一化特征跳变（佐证门）**：per-sample `D_rel = ‖z_t−z_{t−1}‖₂/(‖z_{t−1}‖₂+ε)`、`D_cos = 1−cos(z_t,z_{t−1})`（天然臂跨状态）。检验 flip vs stable 分布差异（K=1 下剂量二值；连续剂量由 t−1 状态 batch vote margin 分层承担）。门（第一版）：flip 中位数 ≥1.2× stable 中位数且 D_rel/D_cos 双指标同向 → F2 过。
+
+**F3 跨状态预测退化（主门，GPT 冻结）**：
+- **F3a 观测版**（防"flip 样本本来就难"混杂）：per-sample ΔErr_i = ℓ_t(x_i) − ℓ_{t−1}(x_i)（同头 heads[j]、class_mask[j] 掩码后的 CE）与正确性变化 C_{t−1}−C_t；比较 E[ΔErr|flip] vs E[ΔErr|stable]。要证的是**跨状态 route change 与跨状态性能退化相关**，不是"换路样本更难"。
+- **F3b 因果版（主门）**：`route_pool = Acc(B at t) − Acc(A at t)`（同状态、同头、同人群，唯一差异 = 强制旧槽 vs 天然槽）。**门：过渡均值 ≥ +1.0pp**（逐过渡值并报；孤立单过渡超阈且均值 <0.5pp 判 YELLOW 转外审）。
+- **1.4–1.7pp 定位修正（GPT 冻结措辞）**：F4 审计的 1.4–1.7pp 是 **readout-side recoverable margin 的历史参考，不是 representation-side routing 干预的上界**；DTCPR 的真上界参考 = F3b 自测池。
+
+**F4 路由边界前兆（增强门，不作硬判死门）**：t−1 状态 per-sample cutoff margin `m_i = s₍₁₎−s₍₂₎`（K=1 即 top1−top2 相似度差）+ batch 级 vote margin（多数票−次多票票数差/B）。检验 m↓ ⇒ P(flip)↑ 分层曲线。论文目标形态的完整机制链：small margin → route flip → feature jump → accuracy drop → smooth transition oracle repairs。
+
+**F5 两层 λ-mix oracle（区分冻结）**：λ ∈ {0, 0.25, 0.5, 0.75, 1}；人群 = 翻转旧任务行；判读用 heads[j] + class_mask[j]：
+- **Oracle-1 预测层诊断 oracle**：`l_λ = λ·l(A at t) + (1−λ)·l(D)`——两端点 = 两条部署路径的完整 forward logits，**离线可算**。只回答"两条路径间有无互补信息"，**不构成 DTCPR 结构依据**。
+- **Oracle-2 结构合法 prompt 过渡（DTCPR 判据）**：token 层 `P_λ = λ·prompt_t[R_t] + (1−λ)·prompt_{t−1}[R_{t−1}]`（子臂 2a = 同状态两槽混合 λ·C_t[R_t]+(1−λ)·C_t[R_{t−1}]，route-only 参照）。结构合法性：prompt 是 embedding 空间 token 前拼接，凸混合是合法前向；它不对应任何离散路由状态——**这正是 DTCPR consensus gate 会计算的量**（off-manifold 警告由此在语义上消解，仍记录在案）。**判据：Oracle-2b 存在 λ∈(0,1) 使 Acc ≥ max(两端点)+0.25pp 才支持 DTCPR**；仅 Oracle-1 过而 2b 不过 = "互补信息存在但平滑过渡结构不可行"，须换结构而非 prompt 插值。
+
+**fail-closed**：`use_prompt_mask=True` 即中止（探针语义只对 top-k 路由路径定义）；bootstrap 复刻训练划分（checkpoint manifest 校验内置）；跨状态 heads[j] 哈希不一致 → 报告头漂移通道并将 F3 标记 CONTAMINATED（M2 臂预期恒定）；逐边界记录 client 间 key 池哈希（广播后应一致，不一致报告为发现）；A 臂与 accuracy_matrix R[t][j] 对账（informative annex，容差 3pp = dropout 偏置 + batch 组成）。缓存落独立目录 `diagnostics_output/routeflip_{ds}/`（防 §29 同名缓存串用踩坑重演）。
+
+### 30.4 判决树（冻结）
+
+```
+F0  A2 先例成立（routing 指标↔Acc 解耦实测）→ F1 显式判死 + F3 ≥1pp 不放宽
+F1  换路非平凡？—— 否 → DTCPR 判死（措辞：route switching 未达非平凡水平；
+    fast/slow 双路由在部署路径上将恒一致，consensus gate 恒不激活，结构 inert）。
+    2×2 因子分解同时给出 contents 通道归因（预期主通道）；representation-side
+    叙事记录为"prompt 内容时序稳定性"，不自动立项。
+F2  FlipSeverity ↔ D_rel/D_cos 剂量关系（佐证，须与 F1 同向）
+F3  主门：F3b route_pool 过渡均值 ≥1pp（F3a 同向佐证）
+F4  margin 前兆（增强，论文价值，不作死门）
+F5  Oracle-2b > hard switch +0.25pp → DTCPR 获得设计依据，写 §31 训练臂预注册；
+    仅 Oracle-1 过 → 互补信息在、平滑过渡结构存疑，换结构再审；
+    两者皆不过 → 判死。
+```
+
+全链成立形态（论文级）：margin↓ → flip → feature jump → accuracy drop → oracle 修复——**由实测机制直接推出的 representation-side 结构创新**，立项依据硬于 PBRS/TABB/STBB/DS-TBB 全家族。
+
+### 30.5 三债务预注册（GPT 冻结；DTCPR 过 F5 时生效）
+
+- **Debt-A 归因重置**：DTCPR 改 z_op 生成路径 ⇒ F^{DTCPR} ≠ F^{Baseline}，§28 的 bit-identical attribution framework 不再自动适用；M2'' 的 2pp 归因须重建单变量链 Baseline → DTCPR → DTCPR+M2''，T0 逐位 Gate 不适用（改分布级回归 + 逐位锚点子集）。
+- **Debt-B 联邦语义**：K^slow 采用 `K^slow_t = μ·K^slow_{t−1} + (1−μ)·K^{fast,global}_t`（对**广播后的全局 key** 做 EMA——"slow 分支 = global deployment routing state 的时间平均"，非各 client 私有历史；GPT 倾向，μ 待训练臂预注册冻结）。
+- **Debt-C 推理预算**：见 30.1-6——2×routing + 1×transformer；不写死 2× full forward。
+
+### 30.6 命令（GPT 审核通过后执行；GPU 轻前向，与 M2'' 训练错峰）
+
+```bash
+# cifar 主判读场（保留 run 5 边界 checkpoint；天然臂 5 次全量 test 前向 + 翻转批次追加臂）
+python diagnostics/probe_routing_flip.py \
+    --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
+    --data_path ./local_datasets --device cuda \
+    --cache_dir diagnostics_output/routeflip_cifar \
+    --out_csv diagnostics_output/routeflip_cifar.csv \
+    --out_rows_csv diagnostics_output/routeflip_cifar_rows.csv \
+    --out_json diagnostics_output/routeflip_cifar.summary.json
+
+# INR 复核（判死不需双确认；DTCPR 过 F1 后立项前补）
+python diagnostics/probe_routing_flip.py \
+    --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
+    --data_path ./local_datasets --device cuda \
+    --cache_dir diagnostics_output/routeflip_inr \
+    --out_csv diagnostics_output/routeflip_inr.csv \
+    --out_rows_csv diagnostics_output/routeflip_inr_rows.csv \
+    --out_json diagnostics_output/routeflip_inr.summary.json
+```
+
+产物：`routeflip_{ds}.csv`（过渡×client×task 聚合 + 2×2 因子分解读数）+ `routeflip_{ds}_rows.csv`（per-row 分析即用表：FlipSeverity / D_rel / D_cos / ΔErr / TopKMargin / vote margin）+ `routeflip_{ds}.summary.json`（F0–F5 门读数 + verdict + 机制链判定）。判级声明：探针级诊断，产判据不产数字；F5 全链成立才写 DTCPR 训练臂预注册（§31）。
+
+> **工程冒烟记录（2026-11-03，2 状态 task_00→01，cifar 保留 run；工程验证非正式判读）**：链路全通（提取 / canon 对齐 / 缓存复现 / shim 强制槽=天然槽时与官方路由**逐位一致** maxdiff 0.0）。过渡 0→1 **零翻转批次、零多数槽轮换**；keyH = 0.0079 / 0.0058 bits（与 §20 单槽垄断先验 ≈0.004 bits 一致，垄断槽 = slot 6，份额 99.94/99.95%）；annex 与 client CSV 最大差 0.59pp；跨状态 heads[0] 哈希恒定（F3 同头前提成立）。正式判读仍以 5 状态全量跑为准——但单槽垄断若在全部 5 状态成立，F1 将按预注册判死分支触发（2×2 因子分解同时给出 contents 通道归因）。
