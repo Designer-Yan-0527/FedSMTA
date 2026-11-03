@@ -1915,3 +1915,123 @@ python diagnostics/probe_prompt_content_drift.py \
 > **However, the damage is not yet parametrized: prompt drift magnitude does not predict it (Spearman −0.2), the first-order old-sensitive gradient subspace does not localize it (frac at 2→3 is the lowest, 0.0141), and the lambda interpolation is non-monotone with an interior blend (λ=0.25) dominating both deployment endpoints on BOTH old and current tasks.**
 
 > **The pre-registered verdict is CONTENT_CONFIRMED_REVIEW: the causal mechanism stands, the dose-response structure is falsified, and any Sec.32 candidate (Stable–Plastic Factorized Prompt) — whose naive linear-orthogonal premise is now weakened on both the G2 and G4 sides — must pass external review before candidacy.**
+
+### 31.9 判后复核修订（GPT，2026-11-03；§31.8 原文全文保留作审计痕迹，本节只做修订记录）
+
+**判决标签改写（冻结）**：`CONTENT_CONFIRMED_REVIEW` → **`CONTENT-CAUSAL / DIRECTION-MECHANISM-UNRESOLVED / OVERSHOOT-HYPOTHESIS-PROMOTED`**。三层含义：
+
+1. **第一层确认**：same-slot prompt content → representation state 因果链成立；2→3 过渡它承担 +2.646pp 历史性能损失且 CI 离零（[+2.126, +3.150]）。**G3 措辞收紧**：swap 恢复 100% 漂移池在 backbone/head/route 恒定条件下本质是恒等干预的预期结果（D_rel^swap = 0 逐位复原），不包装为独立发现；科学价值在于**性能差随 prompt swap 被恢复且 CI 明确离零**。
+2. **第二层否定**：大范数（G1）与 old-sensitive 线性子空间（G2）都不能解释"为何某些更新有害"——2→3 的 frac_old_sensitive = 0.0141 反而是四过渡最低（0→1 = 0.1389 最高），一阶预测 ΔCE −0.0135 nats 与实测 +0.1369 nats 连方向都不一致。**"carried by old-task-sensitive directions" 从 hypothesis 措辞中删除**。修订后 hypothesis（冻结）：
+   > **Same-slot prompt-content evolution causally controls the deployment-state representation change, while raw update magnitude does not explain its boundary-dependent accuracy effect.**
+   （有害方向目前未知。）
+3. **第三层（G4 "FAIL" 中的主信号，新机制候选）**：**interior prompt states repeatedly outperform the learned endpoint**。逐过渡当前任务 test 最优 λ（probe-G 粗网格，test-oracle 口径）：
+
+   | Transition | 当前任务最优 λ | 相对 λ=1 old gain | 相对 λ=1 cur gain |
+   |---|---:|---:|---:|
+   | 0→1 | 1.00 | 0 | 0 |
+   | 1→2 | **0.50** | **+0.84pp** | **+0.74pp** |
+   | 2→3 | **0.25** | **+3.52pp** | **+1.87pp** |
+   | 3→4 | **0.75** | **+0.69pp** | **+0.79pp** |
+
+   后三个过渡中，仅按当前任务最优点选出的中间 prompt **双侧同时改善**（均值 old +1.26pp / cur +0.85pp）⇒ 新 prompt 不是"为当前任务牺牲旧任务"，连当前任务都次优于中间态 ⇒ 机制从 stability–plasticity conflict 改写为 **the learned prompt endpoint is temporally miscalibrated**（temporal prompt update overshoot）；最优步长逐边界不同（1 / 0.5 / 0.25 / 0.75）⇒ 需 **state-adaptive temporal step calibration**，而非固定 EMA。
+
+**处置决定（冻结）**：
+- **§32 Stable–Plastic Factorized Prompt 不立项**（G2 未提供其线性正交分解前提的任何机制支撑）。
+- 下一轮 = **§32 Probe-H: Temporal Prompt Step Calibration**——唯一核心问题：**Can the harmful endpoint be avoided using current-task information alone?**
+- Probe-H 过门后的方法候选名（浮名，仍须 INR 机制复核 + 外审才立项）：**CTRP (Calibrated Temporal Residual Prompt)**——P_t^deploy = P_{t−1} + α_t·ΔP_t，0 ≤ α_t ≤ 1，α_t 由当前任务训练信号自适应确定（不依赖 replay/old validation、非固定超参）。
+
+## 32. Probe-H：temporal prompt step calibration（`probe_prompt_step_calibration.py`，预注册 2026-11-03）
+
+> §31.9 判后复核冻结方向设立。探针零训练、只读保留 run、fail-closed、预注册先于数据。**本节不预注册任何结构/训练臂**：CTRP 仅在 Probe-H 过主门后获得 §33 立项资格，且须先过 INR 机制复核 + 外审。
+
+### 32.0 机制衔接
+
+§31 判决链已给出：prompt content 是跨状态漂移的唯一因果载体（G3）、幅值与 old-sensitive 线性子空间都不定位损伤（G1/G2）、同槽内点 prompt 反复双侧优于学习端点（G4，§31.9 表）。剩下的**可部署性问题只有一个**：G4 的最优 λ 是 test-oracle 选的（看了历史 test，不能部署）。若**完全不碰旧任务数据**、仅凭当前任务信号就能找到 α < 1 的步长且双侧不劣于端点，则 overshoot 是 current-task-signal 可修复的部署缺陷 ⇒ CTRP 立项依据直接建立在实测的 endpoint overshoot 上，无需假设任何 G2 未找到的"旧任务敏感子空间"。若合法选择器找不到（而 oracle 找得到），则 overshoot 记录为 selector-blind、同样不可部署。
+
+### 32.1 代码事实审计（probe-G 5 状态实测 + 官方代码实读冻结；探针以此为准）
+
+1. **slot-6 prompt 值每状态单一全局张量**（跨 client 逐位一致，哈希 0fdd1457/5b497b8b/9f1f2033/18075eda/d07c1e4a 逐状态互异）⇒ P_{6,t} 良定义，λ 臂无需 per-client 分支；池形状 (100, 10, 768)。
+2. **路由只读 prompt_key 不读值** ⇒ 只改 slot-6 值不改变路由身份（逐 batch 断言进 fail-closed）；非 slot-6 路由行份额 ≈0.06%。
+3. **同槽 token 插值语义合法**（§31.1-3 同款：embedding 空间 token 前拼接的凸混合）。
+4. **heads 跨状态哈希恒定**（probe-G 漂移事件 0）⇒ 同头对比前提成立；backbone 全冻结 + weight_decay=0 ⇒ slot-6 值是该部署路径唯一实质演化的表征输入。
+5. **inner train 划分**：`Client_DF.get_data` 用 `random_split(trainset, [70%, 30%])` 落 `data_split_indices[task_id]['train'/'test']`（Client_DF.py L147-155）——划分由 bootstrap_server 复刻的训练 RNG 流锁定；**Probe-H 选择行 = 当前任务 `data_split_indices[t]['train']`**（与训练同 manifest，无二次划分随机性；test 行读数人群沿用 `['test']`，与 probe-G 逐位同源，行数应复现 3324/6487/9222/12328/14992）。
+6. **probe-vs-native gap 已在 probe-G 于本 run 定位**（75/75 组、max_unexplained ≈ 0.0pp、Dropout draw 噪声主导）⇒ Probe-H 沿用同一确定性前向协议（head.eval() + 固定 batch 8 + 固定顺序；门全部作用于跨臂差值、偏置消去），**native-draw annex 不重复执行**（GPU 预算；声明沿用 §31.3）。
+7. **探针口径天然臂应逐位复现 probe-G 读数**（同 run/同 ckpt/同协议/同种子派生）：2→3 天然 95.12→92.47、λ 粗网格臂值（0.25 处 old 95.99 / cur 96.56）——不一致即工程 bug，fail-closed 对照（分析层对账，容差 0.0：确定性前向必须逐位）。
+
+### 32.2 假设措辞（冻结，先于数据）
+
+> **Hypothesis: the learned prompt endpoint is temporally miscalibrated — a current-task-signal-calibrated interior step α ∈ [0,1) avoids the endpoint's harm on BOTH the old and the current tasks, without accessing any old-task data.**
+
+判读措辞冻结：
+- 过门只把 overshoot 晋升为 **current-task-signal-exploitable mechanism**；CTRP 仍是浮名，本探针不写任何训练臂。
+- 判负措辞（冻结）：**OVERSHOOT_NOT_EXPLOITABLE** —— "the interior gain is not locatable by current-task signals (or does not exist at the fine grid); the overshoot is recorded but not deployable"。
+
+### 32.3 探针设计（H0 前提门 + H1 细网格扫描与合法选择器）
+
+**臂与人群**：每过渡 (s→s+1) 在状态 s+1 前向（其余一切不动）；P_λ = (1−λ)·P_{6,s} + λ·P_{6,s+1}，**λ ∈ {0, 0.05, …, 1}（21 点细网格）**；臂覆盖 = slot-6 多数票 batch（§31 垄断前提）；读数人群 = 状态 s+1 全部 (client, task ≤ s+1) test 行（acc_old 取 task ≤ s，acc_cur 取 task = s+1，均限臂覆盖行）。
+
+**选择信号（部署合法、零旧任务信息）**：每 client 从当前任务 `data_split_indices[t]['train']` 作**按类分层、派生种子稳定子采样**，上限 512 行/client（`--select_rows_per_client`，纯 GPU 预算控制；统计上 2560 行池化 CE 均值已远超比较 21 个 λ 所需功效），再按类分层拆 **20% val / 80% train**（`--val_frac`；类内行数 ≥2 时 val ≥1 行，行数 =1 时留 train）。选择行与非 slot-6 batch 剔除计数（占比 >1% 拒）。信号前向与读数同协议（head.eval() 确定性、掩码后 CE = logsumexp − logit[y]）。
+
+**选择器（冻结）**：
+- **λ̂_val-current（主）** = argmin 跨 client 池化当前任务 val CE；
+- **λ̂_train-current（次级佐证）** = argmin 池化 train CE；
+- 并列取最小 λ；对照（非法、仅报告）：**λ\*_current** = argmax 当前任务 test acc。
+
+**主门（GPT 冻结，2→3 主判场，primary selector = λ̂_val-current）**：
+
+> **λ̂ < 1 且 Acc_cur(λ̂) ≥ Acc_cur(λ=1) 且 Acc_old(λ̂) > Acc_old(λ=1)**，且 old gain 配 paired batch bootstrap 95% CI（B=1000，单位 = batch，重抽样覆盖旧任务行）**下界 > 0**。
+
+其余过渡全部同表报告（逐过渡 λ̂/λ\* 与双侧增益 = state-adaptive 校准必要性的直接证据），门只在 2→3 上作用。
+
+### 32.4 判决树（冻结）
+
+```
+H0  前提门 fail（部署路径 flags / 垄断 / prompt 值跨 client 单值 / heads 恒定 /
+    canon join / 选择行垄断校验，任一违反）→ REFUSED（fail-closed，无判决）
+主门（2→3，λ̂ = λ̂_val-current）：
+    λ̂ < 1 且 Acc_cur(λ̂) ≥ Acc_cur(λ=1) 且 old_gain > 0 ？
+        是 → CI95_lo(old_gain) > 0 ？
+            是 → OVERSHOOT_EXPLOITABLE_CURRENT_ONLY：
+                temporal overshoot 可仅凭当前任务信号修复；
+                CTRP 获得 §33 立项资格（仍须 INR 机制复核 + 外审；本探针不写臂）
+            否 → YELLOW_REVIEW（方向成立但显著性不足，转外审）
+        否 → OVERSHOOT_NOT_EXPLOITABLE
+            annex 注记二分（informative）：
+            · selector-blind：test-oracle λ* < 1 且 λ* 双侧优于 λ=1
+              —— 内点增益存在但合法选择器定位不到；
+            · no-interior-gain：oracle 也取 λ* = 1
+              —— 细网格下端点即最优，§31.9 表在 2→3 之外的推广不成立。
+次级（报告不作门）：train-current selector 同门读数；mean old/cur gain
+    @λ̂_val 跨过渡均值；λ̂ 逐过渡是否相异（state-adaptive 证据）。
+```
+
+### 32.5 fail-closed 清单
+
+1. 部署路径前提（use_prompt_mask=True / top_k≠1 / batchwise_prompt=False）→ 拒；
+2. 垄断前提：任一状态 batch 众数槽 ≠ 6 或非 slot-6 batch 占比 >1% → 拒；
+3. **选择行侧垄断校验**：非 slot-6 batch 选择行占比 >1% → 拒（计数入报告）；选择行为 0（状态 ≥1）→ 拒；
+4. prompt 值跨 client 不一致 → 拒；
+5. heads 跨状态哈希漂移 → 主门标记 CONTAMINATED 不作数；
+6. canon join 缺行/不单调 → 拒（§29.1c/§30/§31 同款）；
+7. 零训练合规：本探针无梯度臂、无 autograd、无 optimizer、无任何参数更新；
+8. 缓存指纹含 PROBE_VERSION=stepcalib-v1 + run/checkpoint/batch/monopoly_slot/λ 网格(21)/select_rows_per_client/val_frac，不匹配即拒；**缓存目录独立 `diagnostics_output/stepcalib_cifar/`**（§29 教训；不复用也不读 contentdrift_cifar）；
+9. `--device cuda` 必须（Tail_Anchor 硬编码 .to('cuda')）。
+
+### 32.6 命令（GPT 审核通过后执行；21 臂 + 选择行 ≈ probe-G 前向量的 2–2.5×，预计 1.5–2.5 小时；逐状态缓存、可断点续跑）
+
+```bash
+# cifar 主判读场（保留 run 5 边界 checkpoint）
+python diagnostics/probe_prompt_step_calibration.py \
+    --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
+    --data_path ./local_datasets --device cuda \
+    --cache_dir diagnostics_output/stepcalib_cifar \
+    --out_csv diagnostics_output/stepcalib_cifar.csv \
+    --out_rows_csv diagnostics_output/stepcalib_cifar_rows.csv \
+    --out_json diagnostics_output/stepcalib_cifar.summary.json
+```
+
+产物：`stepcalib_cifar.csv`（过渡级聚合 + 逐客户端 old gain + 21 点 acc_old/acc_cur 曲线）+ `stepcalib_cifar_rows.csv`（per-row 分析即用表：覆盖行 correct@{λ 21 点}，old/current 两人口）+ `stepcalib_cifar.summary.json`（H0 前提 + 选择器读数 + 主门判决 + oracle annex + probe-G 对照对账）。判级声明：探针级诊断，单 run 单种子，产判据不产数字；INR 复核仅在 Probe-H 过门且拟立项 §33 时需要（判负不需双确认，延续 §30/§31 惯例）。
+
+### 32.7 / 32.8 工程冒烟记录 / 正式判决
+
+（预注册占位：跑完后按惯例补记。）
