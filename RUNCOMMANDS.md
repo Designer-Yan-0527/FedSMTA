@@ -1769,3 +1769,149 @@ DTCPR **判死，不写训练臂**：fast/slow 双路由在部署路径上将恒
 - **最大单次漂移（2→3 过渡 +2.646pp，95.12→92.47）100% content-owned**——本 run 最重的一次遗忘事件与路由零相关。
 - 新机制叙事（**记录在案，不自动立项**，§30.4 冻结）：非仿射部署漂移由 **prompt 内容演化**主导，而非离散槽位切换——DHT 探针（§29）观察到的非仿射漂移由此获得更扎实的解释。
 - 方向指向（非承诺）：representation-side 干预若未来立项，目标应为 **prompt 值的时序内容稳定性**（EMA/正则/锚定一类），而非任何路由结构；路由侧结构创新在本 run 部署路径上结构性 inert。§31 训练臂预注册按 F5 未过**不触发**。
+
+### 30.9 Probe-F 封档记录（GPT 冻结三句式，2026-11-03）
+
+> 1. **Probe-F rejects the discrete temporal route-switching hypothesis. Across all four deployment transitions, the selected prompt slot remained unchanged, with a persistent >99.9% monopoly of slot 6.**
+> 2. **Despite invariant routing identities, substantial representation drift remained, and the 2×2 intervention assigned the observed deployment drift entirely to the prompt-content channel rather than route identity.**
+> 3. **However, content evolution is not uniformly detrimental: the accuracy effect is strongly boundary-dependent and is concentrated at the 2→3 transition (+2.646pp recoverable degradation). Therefore, prompt-content evolution is promoted to a mechanism hypothesis, not yet to a method candidate.**
+
+## 31. Probe-G：同槽 prompt 内容漂移机制解剖（`probe_prompt_content_drift.py`，预注册 2026-11-03）
+
+> §30.8 判死后按 GPT 判后复核冻结方向设立 **Probe-G = same-slot prompt content drift**——只解剖 slot 6，不再碰任何 routing 侧（A2-R + Probe-F 已从两个独立方向证明 routing 不是干预面）。**本节不预注册任何结构**：Stable–Plastic Factorized Prompt（P_t = P^S_t + P^P_t，正交/子空间解耦）仅在 G3 GREEN 后才获得 §32 立项资格，且须先过 INR 机制复核 + 外审。探针零训练、只读保留 run、fail-closed、预注册先于数据。
+
+### 31.0 机制衔接（判死链推进，非重立候选）
+
+两次判死（DHT §29 / DTCPR §30）的净产出 = 机制定位上移一层：Probe-F 的 2×2 把全部漂移池归给 contents 通道（content 0.74pp vs route 0.00pp，interaction ≡ 0），且 route 侧结构性 inert（flip=0、keyH 0.0058–0.0079 bits、slot 6 垄断 99.94–99.96%、batch 组成不敏感）。问题已从"模型换了哪个 prompt"改为**"同一个 prompt 自己变了会怎样"**：
+
+> R_{t−1}(x) = R_t(x), P_{6,t−1} ≠ P_{6,t} → representation drift（same prompt identity + evolving prompt content）
+
+且 §30.8 已实测**内容演化非均匀有害**（0→1 受益 −0.481pp；2→3 集中损伤 +2.646pp），真正的科学问题冻结为：**When does prompt-content evolution become destructive?**——2→3 为主解剖对象，0→1 为良性对照。
+
+### 31.1 代码事实审计（Probe-F 5 状态实测冻结 + 官方代码实读；探针以此为准）
+
+1. **slot-6 prompt 值是每状态单一全局张量**：probe-F meta `prompt_value_hashes` 5/5 状态跨 client 单值（广播后逐位一致）；池形状 (100, 10, 768) = (pool_size, length, embed_dim) ⇒ P_{6,t} 良定义，swap/λ 臂不需要 per-client 分支。
+2. **路由只读 prompt_key、不读 prompt 值**（`Global_Prompt.forward`：sim = l2norm(q)·l2norm(prompt_key)^T，`self.prompt[idx]` 只消费值）⇒ **只改 slot-6 值不改变路由身份**，swap/λ 臂与天然臂逐 batch 同 route（前提断言进 fail-closed）。
+3. **同槽 token 插值语义合法**（GPT 冻结）：P_λ = (1−λ)·P_{6,t−1} + λ·P_{6,t} 是**同一 slot 的 prompt tensor** 凸混合；prompt 是 embedding 空间 token 前拼接（`cat([batched_prompt, x_embed])`），一一对应语义成立——与 DTCPR 跨槽混合的 off-manifold 问题不同类。
+4. **Probe-F 实测基线（本探针对照锚点）**：slot-6 值逐边界 rel_norm 漂移 0→1 **0.9767** / 1→2 0.7323 / 2→3 0.6548 / 3→4 0.6645——**幅值不预测损伤**（0→1 漂移最大却是受益过渡）；天然臂特征漂移中位数 D_rel/D_cos：0→1 0.613/0.188、1→2 0.580/0.163、2→3 0.809/0.343、3→4 **0.851/0.349**（3→4 特征漂移最大却只伤 0.365pp）；探针口径天然臂 Acc 2→3 95.12→92.47；非 slot-6 路由行份额 ≈0.06%。⇒ **G1 预注册预期 = 幅值剂量响应 FAIL**（非探针缺陷，是 G2/G3 方向假说的立项动机，见 31.2）。
+5. **heads 跨状态恒定**（probe-F 哈希漂移事件 = 0）⇒ 同头因果对比前提成立；本探针复刻断言。
+6. **backbone 全冻结 + weight_decay=0** ⇒ 部署状态间除 prompt 池（值+key）外无其它可变前向输入，key 只影响选槽（恒 slot 6）⇒ **slot-6 prompt 值是该部署路径上唯一实质演化的表征输入**。
+
+### 31.2 假设措辞（冻结，先于数据）
+
+> **Hypothesis: same-slot prompt-content evolution causally owns the boundary-dependent deployment accuracy drift (concentrated at the 2→3 transition), and the damage is carried by the old-task-sensitive directions of the prompt update rather than its raw magnitude.**
+
+判读措辞冻结：
+- G1 是**可证伪臂**：预期措辞预注册为 "magnitude is not the dose"（§30.8 先验）；若幅值反而单调对应损伤 → 写 "magnitude-dominant (unexpected)" 转外审（机制比方向假说更简单）。
+- **content evolution 晋升为 mechanism hypothesis，而非 method candidate**——即便 G3 GREEN，措辞也只写到 causal mechanism 为止。
+- **G3 判负 ⇒ prompt content 不是干预面**（冻结措辞）："prompt-content evolution explains representation-state change but is not the recoverable-accuracy intervention surface; the structure path remains closed"——结构继续判死，不写 §32 臂。
+- Stable–Plastic Factorized Prompt 仅作为 G3 GREEN 后的 §32 候选浮名，**本节不预注册其任何设计细节**。
+
+### 31.3 探针设计（G0–G4）
+
+**人群与臂覆盖**：每边界 (s→s+1) 在状态 s+1 上前向（F_{s+1} 其余状态不动）；人群 = 状态 s+1 全部 (client, task) test 行（旧任务 j ≤ s + 当前任务 j = s+1——G4 塑性侧需要当前任务行）；**臂覆盖 = slot-6 多数票 batch**（垄断前提，fail-closed），非 slot-6 batch（实测 ≈0.06% 行）不进臂、份额报告、天然臂照常含全部行；跨状态 canon join 沿用 §29.1c/§30 同款（(client, task, rel_idx)，fail-closed 单调断言）。
+
+| 臂 | slot-6 token | 语义 |
+|---|---|---|
+| natural (λ=1) | P_{6,s+1} | 部署真相（G1 特征漂移跨状态两端；0→1 时 D 侧复用 s 状态天然臂） |
+| swap (λ=0) | P_{6,s} | **G3 因果臂**：same route, old content |
+| λ∈{0.25, 0.5, 0.75} | (1−λ)P_{6,s} + λP_{6,s+1} | **G4 剂量臂**（同槽插值，语义合法） |
+
+**G0 前提门（fail-closed，任一违反即拒）**：top_k=1 + batchwise_prompt=True + use_prompt_mask=False（部署路径）；每状态 batch 多数票众数槽 == slot 6 且非 slot-6 batch 占比 ≤1%；垄断槽跨状态恒定；prompt 值跨 client 单值；heads 跨状态哈希恒定（违反则 G3 标记 CONTAMINATED，不作数）。
+
+**G1 prompt 自身漂移（可证伪臂，无门）**：逐边界 rel_norm = ‖ΔP_6‖₂/(‖P_{6,s}‖₂+ε)、cos drift = 1−cos(P_{6,s}, P_{6,s+1})，与天然臂跨状态特征漂移中位数 D_rel/D_cos 并列成表。预期 "magnitude is not the dose"。
+
+**G2 old-sensitive 方向分解（描述性，佐证）**：把 ΔP_6 分解为 ΔP_∥（会改变历史任务损失的方向）+ ΔP_⊥——真正要修的不是 |ΔP| 而是 |Π_old-sensitive ΔP|。估计器（冻结）：在状态 s、head.eval() 确定性前向下，对旧任务行 masked CE 逐行求 g_i = ∂CE_i/∂P_{6,s}（autograd 仅用于分析、零训练合规、不写任何参数）；行梯度集合 G（种子派生稳定、(client, task) 分层、≤256 行、只取 slot-6 batch 行）；SVD 取累积能量 ≥90% 的前 k（k≤128）方向张成 old-sensitive 子空间；报 **frac_old_sensitive = ‖Π_G ΔP‖²/‖ΔP‖²**、一阶预测 mean(g_i^T ΔP)（nats）与同子样本行实测 ΔCE 对照 + 逐行 Pearson。判读：2→3 的 frac/pred 应高于 0→1（方向剂量假说）；无硬门，喂 G3 判读。
+
+**G3 prompt-swap causal oracle（主门，GPT 冻结）**：状态 s+1 前向、同 route、同 heads、同人群，唯一差异 = slot-6 值换 P_{6,s}。
+recovery = Acc(swap, 旧任务行) − Acc(natural, 旧任务行)（pp，配对逐行差）。
+**门（冻结）：2→3 过渡 recovery ≥ +0.5pp 且 paired batch bootstrap 95% CI 下界 > 0**（重抽样单位 = batch，B=1000，稳定种子）→ G3 PASS（因果证据：new prompt content → historical performance loss，而非相关）；recovery ≥ 门但 CI 含 0 → YELLOW_REVIEW；否则 FAIL。并报 recovery 占该边界 drift 池比例（2→3 池 = +2.646pp，预期显著占比）及其余过渡 recovery（0→1 预期 ≈0 或负 = 良性/受益演化的对照证据）。
+
+**G4 同槽 λ 插值（剂量-响应佐证）**：λ ∈ {0, 0.25, 0.5, 0.75, 1}；旧任务 + 当前任务两条 acc(λ) 曲线。判读（冻结）：2→3 上 Spearman(acc_old, λ) < 0 且 Spearman(acc_cur, λ) > 0 → G4 PASS（stability–plasticity trajectory 实测）；任一曲线全程极差 <0.05pp 记 FLAT。G3 PASS + G4 PASS/FLAT → 机制确认；G3 PASS + G4 FAIL → PASS_REVIEW 转外审；**G4 单独不救 G3 FAIL**。
+
+**Annex（informative）**：swap 臂特征恢复（旧行 median ‖z_swap−z_s‖/‖z_s‖ vs 天然 D_rel——swap 若同时恢复特征坐标则因果链完整）；native draw annex 沿用 §30.7-4 同款（probe-vs-CSV gap 定位，容差 3pp，`--native_draws`，正式跑 4）。
+
+### 31.4 判决树（冻结）
+
+```
+G0  前提门 fail → REFUSED（fail-closed，无判决）
+G3  2→3 recovery ≥ +0.5pp 且 CI_lo > 0？
+    是 → G4 佐证？
+        单调（old 随 λ↓、cur 随 λ↑）或 FLAT → CONTENT_MECHANISM_CONFIRMED：
+            same-slot prompt-content evolution 因果拥有 2→3 集中损伤；
+            晋升 mechanism hypothesis（冻结措辞，仍非 method candidate）；
+            Stable–Plastic Factorized Prompt 获得 §32 立项资格——
+            前置 = INR 机制复核 + 外审，本探针不写臂。
+        G4 FAIL → CONTENT_CONFIRMED_REVIEW（因果在、剂量-响应不单调）→ 转外审
+    否（<门 或 CI 含 0）→ CONTENT_NOT_INTERVENTION_SURFACE：
+        prompt-content evolution explains representation-state change but is
+        not the recoverable-accuracy intervention surface——结构路径继续关闭，
+        不写 §32 臂。
+```
+
+### 31.5 fail-closed 清单
+
+1. 部署路径前提（use_prompt_mask=True / top_k≠1 / batchwise_prompt=False）→ 拒；
+2. 垄断前提：任一状态众数槽 ≠ 6、非 slot-6 batch 占比 >1%、或垄断槽跨状态变化 → 拒（G 系列语义只对该部署路径定义）；
+3. prompt 值跨 client 不一致 → 拒（P_{6,t} 全局张量前提破坏）；
+4. heads 跨状态哈希漂移 → G3 标记 CONTAMINATED，不作数；
+5. canon join 缺行 / 不单调 → 拒（沿用 §30）；
+6. G2 梯度只走分析路径（torch.autograd.grad，不写 .grad、无 optimizer、无任何参数更新）；梯度 batch 若多数槽 ≠ 6 → 该批子样本行剔除并报告数量；
+7. 缓存指纹含 PROBE_VERSION=contentdrift-v1 + run/checkpoint/batch/monopoly_slot/lambdas/g2_rows，不匹配即拒；缓存目录独立 `diagnostics_output/contentdrift_cifar/`（§29 串用教训）；
+8. `--device cuda` 必须（Tail_Anchor 硬编码 .to('cuda')）。
+
+### 31.6 命令（GPT 审核通过后执行；GPU 轻前向 ≈5×天然臂 + 256 行梯度/边界，预计 25–45 分钟）
+
+```bash
+# cifar 主判读场（保留 run 5 边界 checkpoint）
+python diagnostics/probe_prompt_content_drift.py \
+    --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
+    --data_path ./local_datasets --device cuda \
+    --cache_dir diagnostics_output/contentdrift_cifar \
+    --native_draws 4 \
+    --out_csv diagnostics_output/contentdrift_cifar.csv \
+    --out_rows_csv diagnostics_output/contentdrift_cifar_rows.csv \
+    --out_json diagnostics_output/contentdrift_cifar.summary.json
+```
+
+产物：`contentdrift_cifar.csv`（过渡×client 聚合 + G1–G4 读数）+ `contentdrift_cifar_rows.csv`（per-row：d_rel/d_cos、correct@{tm1, t, swap, λ}、特征恢复）+ `contentdrift_cifar.summary.json`（G0–G4 门 + verdict + annex）。判级声明：探针级诊断，单 run 单种子，产判据不产数字；INR 复核仅在 G3 GREEN 且拟立项 §32 时才需要（判负不需双确认，延续 §30 惯例）。
+
+### 31.7 工程冒烟记录（2026-11-03）
+
+用户指令跳过独立冒烟、直接正式跑（GPU 共享时段）。正式跑中发现并修复一处工程 bug（不影响任何门读数）：`extract_state` 末状态（`is_last_state=True`）跳过 G2 时走的兜底 dict 键名少 `_rows` 后缀（`n_dropped_batches` vs `n_dropped_batches_rows`），致 state 4 保存时 KeyError；修复后原命令重跑，state 0–3 从缓存秒级加载（14:35–15:17 已落盘），state 4 重抽取，全量完成。此前另有一处冒烟期已修的 `retain_graph=True`（G2 批内逐行 backward 二次通过图崩溃）。两处均为分析/序列化路径，臂前向、门逻辑、统计口径未动。
+
+### 31.8 正式判决（2026-11-03，5 状态全量，probe `contentdrift-v1`，`--native_draws 4`）
+
+**判决：CONTENT_CONFIRMED_REVIEW（预注册判决树 G3 PASS + G4 FAIL 分支）——same-slot prompt-content evolution 因果拥有跨边界部署精度漂移，但剂量-响应不单调，转外审后才谈 §32 立项。**
+
+**G0 前提门 OK**：5/5 状态众数槽 = 6、非 slot-6 batch 占比 0.0%、prompt 值跨 client 单值（哈希逐状态互异：0fdd1457/5b497b8b/9f1f2033/18075eda/d07c1e4a，证实 P_{6,t} 逐状态全局演化）、heads 跨状态哈希漂移事件 0、行数 3324/6487/9222/12328/14992 与 probe-F 逐位一致。
+
+**主结果（G3 swap causal oracle，主门 PASS）**：逐边界 swap recovery（pp，paired batch bootstrap B=1000）：
+
+| Transition | drift 池 | recovery | CI95 | 占池比 | swap Acc（=t−1 天然 Acc，逐位复原） |
+|---|---:|---:|---|---:|---|
+| 0→1 | −0.481 | −0.481 | [−1.054, +0.090] | 100% | 96.15 |
+| 1→2 | +0.432 | **+0.432** | [+0.031, +0.832] | 100% | 96.65 |
+| 2→3 | **+2.646** | **+2.646** | **[+2.126, +3.150]** | **100%** | **95.12** |
+| 3→4 | +0.365 | +0.365 | [−0.113, +0.836] | 100% | 93.03 |
+
+- 2→3 过 +0.5pp 门且 CI 下界远大于 0 → **因果确认**（冻结措辞：new prompt content → historical performance loss，非相关）。
+- **每个边界 swap 都复原该边界 100% 漂移池**，且 swap 臂特征中位 rel drift = 0.0（旧行 z_swap ≡ z_{t−1} 逐位复原；frozen backbone + 同 route + 同 heads 下的解析必然，实测坐实）⇒ **slot-6 prompt 值是该部署路径上跨状态精度漂移的唯一因果载体**——损伤（2→3）与收益（0→1）都由它承载，方向是边界依赖的（§30 结论的强化版）。
+
+**G1（幅值，可证伪臂，按预期 FAIL）**：P_6 逐边界 rel_norm 0.9767/0.7323/0.6548/0.6645、cos drift 0.6715/0.2568/0.2227/0.2318；幅值-损伤 Spearman = −0.2 → **"magnitude is not the dose" 确认**（0→1 漂移近 100% 范数却是受益过渡；预注册措辞照记）。顺带关键读数：**每边界 prompt 值近乎全量重写（0→1 cos drift 0.67）而路由从不翻转**——key 演化与值演化彻底解耦，值演化才是部署实质。
+
+**G2（old-sensitive 方向分解，描述性预期不成立）**：frac_old_sensitive 逐边界 0.1389/0.0208/**0.0141**/0.1061——2→3 反而**最低**；一阶预测 mean(g_i^TΔP) 与实测 ΔCE 对照（2→3：预测 −0.0135 nats vs 实测 +0.1369 nats，逐行 Pearson 0.19）⇒ **一阶梯度子空间投影也不定位损伤**。损伤方向不可由线性 old-sensitive 投影刻画（弱化 Stable–Plastic 的朴素线性正交分解版本，转外审的理由之一）。
+
+**G4（λ 插值，2→3 剂量臂 FAIL=非单调）**：acc_old(λ=0→1) = 95.12 / **95.99** / 95.41 / 93.76 / 92.47（Spearman −0.7）；acc_cur(λ) = 95.94 / **96.56** / 96.46 / 95.81 / 94.69（Spearman **同为 −0.7**）——两条曲线都在 λ=0.25 处峰值：**凸混合 prompt 在旧任务与当前任务两侧同时优于两个部署端点**。损伤集中在 λ∈[0.5, 1] 段，不是平滑剂量-响应。其余过渡（对照）：0→1 两条曲线随 λ 单调上升（Spearman +0.82/+0.90，新内容对旧任务有益）；1→2 双 FLAT（±0.2 内）；3→4 cur 单调 +0.90。
+
+**Annex（informative）**：native gap 定位复刻 §30 结论——75 组对照 max 未解释残差 0.0pp（97.3% 组落 Dropout draw 传播范围内），probe-vs-CSV 差异是随机性非语义分歧；头身份恒定。
+
+**机制注记（喂外审）**：因果链已完整闭合——same route + evolving same-slot content → 全部特征漂移 → 全部边界精度漂移（含损伤与收益），swap 完全可逆。但**"何时成为破坏性"仍未参数化**：幅值不预测（G1）、一阶敏感子空间不预测（G2）、λ 剂量非单调且混合点优于端点（G4）。G4 内点占优（λ=0.25 双侧同时最好）提示损伤不是"新内容剂量"的单调函数，更像新内容某分段（λ≥0.5）与旧判别几何的非线性相互作用。**content evolution 维持 mechanism hypothesis 措辞、不升 method candidate**；Stable–Plastic Factorized Prompt 不因 G3 PASS 自动立项——其线性正交分解前提已被 G2/G4 两侧削弱，是否以及何种形式的 §32 臂交外审裁决。
+
+**封档记录（GPT 三句式，2026-11-03）**：
+
+> **Probe-G causally confirms same-slot prompt-content evolution as the sole carrier of the cross-state deployment accuracy drift: the swap oracle recovers 100% of the drift pool at every boundary (2→3: +2.646pp, CI95 [+2.13, +3.15]) with bit-identical feature restoration, establishing new prompt content as the cause of historical performance loss.**
+
+> **However, the damage is not yet parametrized: prompt drift magnitude does not predict it (Spearman −0.2), the first-order old-sensitive gradient subspace does not localize it (frac at 2→3 is the lowest, 0.0141), and the lambda interpolation is non-monotone with an interior blend (λ=0.25) dominating both deployment endpoints on BOTH old and current tasks.**
+
+> **The pre-registered verdict is CONTENT_CONFIRMED_REVIEW: the causal mechanism stands, the dose-response structure is falsified, and any Sec.32 candidate (Stable–Plastic Factorized Prompt) — whose naive linear-orthogonal premise is now weakened on both the G2 and G4 sides — must pass external review before candidacy.**
