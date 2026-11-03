@@ -127,7 +127,11 @@ def parse_args():
                         "fixed order is the pre-registered pairing)")
     p.add_argument("--monopoly_slot", default=6, type=int,
                    help="the monopoly slot this probe dissects (Sec.30.8/"
-                        "31.8: slot 6 held >99.9% on all 5 states)")
+                        "31.8: slot 6 held >99.9% on all 5 states). Pass "
+                        "-1 for AUTO-DISCOVERY from the initial checkpoint "
+                        "(Sec.32.9 INR protocol: mode slot of state 0; all "
+                        "later states must keep the same mode slot or the "
+                        "probe refuses)")
     p.add_argument("--max_nonslot_batch_frac", default=0.01, type=float,
                    help="H0 premise: max fraction of batches whose majority "
                         "slot is not the monopoly slot (applied to BOTH "
@@ -137,7 +141,17 @@ def parse_args():
                         "ascending unique")
     p.add_argument("--gate_transition", default=3, type=int,
                    help="1-based transition index of the main gate "
-                        "(3 = states 2 -> 3)")
+                        "(3 = states 2 -> 3); used only when "
+                        "--gate_mode single")
+    p.add_argument("--gate_mode", default="single",
+                   choices=["single", "all"],
+                   help="single = the frozen CIFAR gate at "
+                        "--gate_transition (Sec.32.4). all = Sec.32.9 INR "
+                        "replication protocol: gate on the EQUAL-WEIGHTED "
+                        "MEAN old gain across ALL eligible adjacent "
+                        "transitions (no boundary cherry-picking), with a "
+                        "hierarchical paired batch-bootstrap CI that never "
+                        "pools rows across transitions")
     p.add_argument("--select_rows_per_client", default=512, type=int,
                    help="per-client cap on the class-stratified "
                         "current-task train subsample used as the "
@@ -296,6 +310,39 @@ def _paired_boot_ci(diffs, batch_ids, n_boot, seed):
     return (round(float(lo), 4), round(float(hi), 4), len(stats))
 
 
+def _aggregate_boot_ci(per_tr, n_boot, seed):
+    """Hierarchical paired BATCH bootstrap 95% CI (in pp) for the
+    EQUAL-WEIGHTED MEAN of per-transition gains (Sec.32.9 all-mode gate).
+
+    per_tr = [(diffs, batch_ids), ...] one entry per transition. Each
+    replicate resamples batches WITHIN every transition independently and
+    then averages the per-transition gains with equal weights -- rows are
+    never pooled across transitions (external-review requirement). A
+    transition whose selector step is the endpoint contributes a
+    deterministic 0. Returns (lo, hi, n_reps) or None."""
+    prepped = []
+    for diffs, batch_ids in per_tr:
+        diffs = np.asarray(diffs, dtype=np.float64)
+        groups = _batch_groups(batch_ids)
+        prepped.append((diffs, groups))
+    if not prepped:
+        return None
+    rng = np.random.default_rng(seed)
+    stats = []
+    for _ in range(n_boot):
+        vals = []
+        for diffs, groups in prepped:
+            if not groups:
+                vals.append(0.0)
+                continue
+            pick = rng.integers(0, len(groups), len(groups))
+            rows = np.concatenate([groups[i] for i in pick])
+            vals.append(100.0 * float(diffs[rows].mean()))
+        stats.append(float(np.mean(vals)))
+    lo, hi = np.percentile(stats, [2.5, 97.5])
+    return (round(float(lo), 4), round(float(hi), 4), len(stats))
+
+
 def _stratified_pick(labels, cap, rng):
     """Class-stratified subsample: per class, round(cap * n_c / N) rows
     (>=1 if the class is non-empty); returns positions into `labels`."""
@@ -424,6 +471,12 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, lam_grid,
     server.origin_model.eval()
 
     slot_id = int(args_cli.monopoly_slot)
+    auto_slot = slot_id < 0
+    if auto_slot and t_index > 0:
+        raise RuntimeError(
+            "monopoly_slot=-1 (auto-discovery) is only valid for the "
+            "INITIAL state (t_index 0); main() resolves the discovered "
+            "slot before extracting later states (Sec.32.9 fail-closed)")
     n_lams = len(lam_grid)
     # grid strings -> column positions (the selection-CE matrix is indexed
     # by GRID POSITION; floats are only for interpolation math)
@@ -707,11 +760,12 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, lam_grid,
     if len(slots) == 0:
         raise RuntimeError(f"state {stem}: no evaluation batches extracted")
     mode_slot = int(np.bincount(slots).argmax())
-    nonslot_frac = float(np.mean(slots != slot_id))
-    if mode_slot != slot_id or nonslot_frac > args_cli.max_nonslot_batch_frac:
+    slot_eff = mode_slot if auto_slot else slot_id
+    nonslot_frac = float(np.mean(slots != slot_eff))
+    if mode_slot != slot_eff or nonslot_frac > args_cli.max_nonslot_batch_frac:
         raise RuntimeError(
             f"state {stem}: monopoly premise violated (batch-majority "
-            f"mode slot {mode_slot} != {slot_id}, non-slot batch frac "
+            f"mode slot {mode_slot} != {slot_eff}, non-slot batch frac "
             f"{nonslot_frac:.4f} > {args_cli.max_nonslot_batch_frac}) -- "
             "Probe-H semantics are only defined for this deployment "
             "path. Refusing (Sec.32 fail-closed).")
@@ -819,6 +873,7 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, lam_grid,
     state = {
         "t_index": t_index,
         "ckpt": ckpt_name,
+        "slot_effective": int(slot_eff),
         "rows": {
             "client": npa("client", np.int64),
             "task": npa("task", np.int64),
@@ -849,6 +904,7 @@ def extract_state(args_cli, run_dir, ckpt_name, prev_state, lam_grid,
         "n_rows": int(n_rows),
         "n_batches": int(len(batch["client"])),
         "batch_mode_slot": mode_slot,
+        "slot_effective": int(slot_eff),
         "nonslot_batch_frac": round(nonslot_frac, 5),
         "masks": class_masks,
         "head_hashes": head_hashes,
@@ -956,6 +1012,8 @@ def _load_state(npz_path, meta):
     return {
         "t_index": meta["t_index"],
         "ckpt": meta["checkpoint"],
+        "slot_effective": int(meta.get("slot_effective",
+                                       meta.get("batch_mode_slot", -1))),
         "rows": rows,
         "batch": batch,
         "arms": arm,
@@ -1045,6 +1103,7 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
     summary = {"probe_version": PROBE_VERSION, "run_dir": str(run_dir),
                "gates": {
                    "monopoly_slot": args_cli.monopoly_slot,
+                   "gate_mode": str(args_cli.gate_mode),
                    "gate_transition": args_cli.gate_transition,
                    "lambdas": [float(x) for x in lam_grid],
                    "select_rows_per_client": args_cli.select_rows_per_client,
@@ -1054,6 +1113,14 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
                "states": [], "transitions": [],
                "verdicts": {}, "annex": {}}
     slot_id = int(args_cli.monopoly_slot)
+    if slot_id < 0 and states:
+        # auto-discovery fallback (analysis-level; main() normally
+        # resolves the slot right after state 0 -- Sec.32.9)
+        slot_id = int(states[0].get("slot_effective", -1))
+    if slot_id < 0:
+        raise RuntimeError(
+            "monopoly slot unresolved (auto-discovery produced no slot) "
+            "-- cannot analyze (fail-closed)")
     lam_f_grid = [float(x) for x in lam_grid]
 
     # ---- per-state premise bookkeeping (H0 material) --------------------
@@ -1102,6 +1169,7 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
     agg_rows = []
     per_rows = []
     tr_recs = {}
+    agg_material = {}   # transition -> {"val": (diffs, b_ids), "train": ...}
 
     for i in range(1, len(states)):
         st_old, st_new = states[i - 1], states[i]
@@ -1240,6 +1308,44 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
         drift_pool_all = 100.0 * float(correct_old.sum()
                                        - c_new.sum()) / n_old
 
+        # G1 annex (Sec.32.9): prompt-update magnitude on the monopoly
+        # slot row (prompt VALUES are one global tensor -- client 0 by
+        # the cross-client identity premise)
+        pd = None
+        c0 = sorted(st_old["pv"])[0] if st_old.get("pv") else None
+        if c0 is not None and c0 in st_new.get("pv", {}):
+            p_prev = np.asarray(st_old["pv"][c0],
+                                dtype=np.float64)[slot_id]
+            p_now = np.asarray(st_new["pv"][c0],
+                               dtype=np.float64)[slot_id]
+            pd = {
+                "rel_norm": round(float(
+                    np.linalg.norm(p_now - p_prev)
+                    / (np.linalg.norm(p_prev) + 1e-12)), 5),
+                "cosine": round(float(
+                    np.dot(p_prev.ravel(), p_now.ravel())
+                    / ((np.linalg.norm(p_prev) * np.linalg.norm(p_now))
+                       + 1e-12)), 5),
+            }
+        summary.setdefault("annex", {}).setdefault(
+            "prompt_drift_slot", {})[str(tr)] = pd
+
+        # aggregate-gate material (Sec.32.9 all mode): covered-old-row
+        # paired diffs + batch ids at this transition's OWN selector
+        # steps (endpoint picks contribute a deterministic 0)
+        b_ids_cov = (new_rows["client"][cov_new] * 10_000_000
+                     + new_rows["task"][cov_new] * 10_000
+                     + new_rows["bseq"][cov_new])
+
+        def _agg_diffs(lam):
+            if lam is None or float(lam) == 1.0 or not len(cov_new):
+                return np.zeros(int(covered.sum()), dtype=np.float64)
+            return (_corr_cov(lam).astype(np.float64)
+                    - c_new[covered].astype(np.float64))
+
+        agg_material[tr] = {"val": (_agg_diffs(lam_hat_val), b_ids_cov),
+                            "train": (_agg_diffs(lam_hat_train), b_ids_cov)}
+
         rec = {
             "transition": tr, "t_from": st_old["t_index"],
             "t_to": st_new["t_index"],
@@ -1260,6 +1366,7 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
             "ci95_old_gain_hat_val": ci_val,
             "ci95_old_gain_hat_train": ci_train,
             "ci95_old_gain_oracle": ci_oracle,
+            "prompt_drift_slot": pd,
             "selection": rec_sel,
         }
         tr_recs[tr] = rec
@@ -1358,89 +1465,201 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
         for s in summary["states"])
 
     gate_tr = int(args_cli.gate_transition)
-    gate = {"transition": gate_tr, "present": gate_tr in tr_recs,
-            "primary_selector": "lam_hat_val"}
-    gate_verdict = "N/A"
-    if gate_tr in tr_recs:
-        rec = tr_recs[gate_tr]
-        lam_hat = rec["lam_hat_val"]
-        if lam_hat is None:
+    gate_mode = str(args_cli.gate_mode)
+    eligible = sorted(tr_recs)
+    if gate_mode == "all":
+        # ---- Sec.32.9 all-mode gate: equal-weighted mean over ALL
+        # eligible adjacent transitions (no boundary cherry-picking);
+        # hierarchical CI never pools rows across transitions.
+        gate = {"mode": "all", "eligible_transitions": eligible,
+                "primary_selector": "lam_hat_val"}
+        gate_verdict = "N/A"
+        bad = [t for t in eligible
+               if tr_recs[t]["lam_hat_val"] is None
+               or tr_recs[t]["gains_at_hat_val"]["old_gain_pp"] is None]
+        if not eligible:
+            pass   # stays N/A (smoke runs)
+        elif bad:
             gate_verdict = "REFUSED"
-            gate["note"] = ("no val split rows at the gate transition -- "
-                            "selection signal degenerate")
+            gate["note"] = (f"selection signal degenerate at transition(s) "
+                            f"{bad} -- cannot calibrate (fail-closed)")
         else:
-            g = rec["gains_at_hat_val"]
-            cond = (float(lam_hat) < 1.0
-                    and g["cur_gain_pp"] is not None
-                    and g["cur_gain_pp"] >= -EPS
-                    and g["old_gain_pp"] > 0)
-            ci = rec["ci95_old_gain_hat_val"]
-            if cond and ci and ci[0] > 0:
+            o_gains = [tr_recs[t]["gains_at_hat_val"]["old_gain_pp"]
+                       for t in eligible]
+            c_gains = [tr_recs[t]["gains_at_hat_val"]["cur_gain_pp"]
+                       for t in eligible]
+            mean_old = float(np.mean(o_gains))
+            mean_cur = (float(np.mean(c_gains))
+                        if all(g is not None for g in c_gains)
+                        else float("nan"))
+            agg_ci = _aggregate_boot_ci(
+                [agg_material[t]["val"] for t in eligible],
+                args_cli.n_boot, args_cli.boot_seed)
+            cond = (mean_old > 0
+                    and not math.isnan(mean_cur) and mean_cur >= -EPS)
+            if cond and agg_ci and agg_ci[0] > 0:
                 gate_verdict = "OVERSHOOT_EXPLOITABLE_CURRENT_ONLY"
             elif cond:
                 gate_verdict = "YELLOW_REVIEW"
             else:
                 gate_verdict = "OVERSHOOT_NOT_EXPLOITABLE"
+            n_int = sum(1 for t in eligible
+                        if float(tr_recs[t]["lam_hat_val"]) < 1.0)
+            oracle_int = sum(
+                1 for t in eligible
+                if tr_recs[t]["lam_oracle_current"] is not None
+                and float(tr_recs[t]["lam_oracle_current"]) < 1.0
+                and (tr_recs[t]["gains_at_oracle"]["old_gain_pp"] or 0) > 0
+                and tr_recs[t]["gains_at_oracle"]["cur_gain_pp"] is not None
+                and tr_recs[t]["gains_at_oracle"]["cur_gain_pp"] >= -EPS)
             gate.update({
-                "lam_hat_val": lam_hat,
-                "acc_old_at_hat": rec["acc_old_by_lambda"][str(lam_hat)],
-                "acc_cur_at_hat": rec["acc_current_by_lambda"][
-                    str(lam_hat)],
-                "acc_old_lam1": rec["acc_old_lam1"],
-                "acc_cur_lam1": rec["acc_current_lam1"],
-                "old_gain_pp": g["old_gain_pp"],
-                "cur_gain_pp": g["cur_gain_pp"],
-                "ci95_old_gain": ci,
+                "mean_old_gain_pp": round(mean_old, 3),
+                "mean_cur_gain_pp": (None if math.isnan(mean_cur)
+                                      else round(mean_cur, 3)),
+                "agg_ci95_old_gain": agg_ci,
+                "n_interior_lam_hat": n_int,
+                "n_oracle_interior_dominates": oracle_int,
+                "per_transition": {str(t): {
+                    "lam_hat_val": tr_recs[t]["lam_hat_val"],
+                    "old_gain_pp":
+                        tr_recs[t]["gains_at_hat_val"]["old_gain_pp"],
+                    "cur_gain_pp":
+                        tr_recs[t]["gains_at_hat_val"]["cur_gain_pp"],
+                    "ci95_old_gain": tr_recs[t]["ci95_old_gain_hat_val"],
+                    "lam_oracle_current":
+                        tr_recs[t]["lam_oracle_current"],
+                } for t in eligible},
             })
-            # annex: selector-blind vs no-interior-gain (informative)
-            lo = rec["lam_oracle_current"]
-            oracle_interior = (lo is not None and float(lo) < 1.0
-                               and rec["gains_at_oracle"]["old_gain_pp"]
-                               is not None
-                               and rec["gains_at_oracle"]["old_gain_pp"]
-                               > 0
-                               and rec["gains_at_oracle"]["cur_gain_pp"]
-                               is not None
-                               and rec["gains_at_oracle"]["cur_gain_pp"]
-                               >= -EPS)
-            gate["oracle_interior_dominates"] = bool(oracle_interior)
-            gate["lam_oracle_current"] = lo
-            note = ""
             if gate_verdict == "OVERSHOOT_NOT_EXPLOITABLE":
-                if oracle_interior:
-                    note = ("selector-blind: the test-oracle interior "
-                            "step dominates both endpoints "
-                            f"(lam*={lo}) but no legal selector finds it")
-                else:
-                    note = ("no-interior-gain: even the test oracle "
-                            f"picks the endpoint (lam*={lo})")
-            gate["annex_note"] = note
-    gate["verdict"] = gate_verdict
+                gate["annex_note"] = (
+                    f"legal selectors pick interior steps at {n_int}/"
+                    f"{len(eligible)} transitions; the test-oracle "
+                    f"interior dominates at {oracle_int}/{len(eligible)}")
+        gate["verdict"] = gate_verdict
 
-    # secondary: same readout on the train selector (report only)
-    sec = {"transition": gate_tr, "present": gate_tr in tr_recs}
-    if gate_tr in tr_recs:
-        rec = tr_recs[gate_tr]
-        lam_t = rec["lam_hat_train"]
-        if lam_t is None:
-            sec["verdict"] = "N/A"
-        else:
-            g = rec["gains_at_hat_train"]
-            cond = (float(lam_t) < 1.0
-                    and g["cur_gain_pp"] is not None
-                    and g["cur_gain_pp"] >= -EPS
-                    and g["old_gain_pp"] > 0)
-            ci = rec["ci95_old_gain_hat_train"]
-            if cond and ci and ci[0] > 0:
+        # secondary (report only): same aggregate readout on the train
+        # selector
+        sec = {"mode": "all"}
+        if eligible and gate_verdict not in ("N/A", "REFUSED"):
+            o_t = [tr_recs[t]["gains_at_hat_train"]["old_gain_pp"]
+                   for t in eligible
+                   if tr_recs[t]["lam_hat_train"] is not None
+                   and tr_recs[t]["gains_at_hat_train"]["old_gain_pp"]
+                   is not None]
+            c_t = [tr_recs[t]["gains_at_hat_train"]["cur_gain_pp"]
+                   for t in eligible
+                   if tr_recs[t]["lam_hat_train"] is not None
+                   and tr_recs[t]["gains_at_hat_train"]["cur_gain_pp"]
+                   is not None]
+            mean_ot = float(np.mean(o_t)) if o_t else None
+            mean_ct = float(np.mean(c_t)) if c_t else None
+            agg_ci_t = _aggregate_boot_ci(
+                [agg_material[t]["train"] for t in eligible],
+                args_cli.n_boot, args_cli.boot_seed + 137)
+            cond_t = (mean_ot is not None and mean_ct is not None
+                      and mean_ot > 0 and mean_ct >= -EPS)
+            if cond_t and agg_ci_t and agg_ci_t[0] > 0:
                 sec["verdict"] = "OVERSHOOT_EXPLOITABLE_CURRENT_ONLY"
-            elif cond:
+            elif cond_t:
                 sec["verdict"] = "YELLOW_REVIEW"
             else:
                 sec["verdict"] = "OVERSHOOT_NOT_EXPLOITABLE"
-            sec.update({"lam_hat_train": lam_t,
-                        "old_gain_pp": g["old_gain_pp"],
-                        "cur_gain_pp": g["cur_gain_pp"],
-                        "ci95_old_gain": ci})
+            sec.update({
+                "mean_old_gain_pp": None if mean_ot is None
+                else round(mean_ot, 3),
+                "mean_cur_gain_pp": None if mean_ct is None
+                else round(mean_ct, 3),
+                "agg_ci95_old_gain": agg_ci_t,
+                "lam_hat_train_per_transition": {
+                    str(t): tr_recs[t]["lam_hat_train"]
+                    for t in eligible},
+            })
+        else:
+            sec["verdict"] = "REFUSED" if gate_verdict == "REFUSED" else "N/A"
+    else:
+        gate = {"transition": gate_tr, "present": gate_tr in tr_recs,
+                "primary_selector": "lam_hat_val"}
+        gate_verdict = "N/A"
+        if gate_tr in tr_recs:
+            rec = tr_recs[gate_tr]
+            lam_hat = rec["lam_hat_val"]
+            if lam_hat is None:
+                gate_verdict = "REFUSED"
+                gate["note"] = ("no val split rows at the gate transition -- "
+                                "selection signal degenerate")
+            else:
+                g = rec["gains_at_hat_val"]
+                cond = (float(lam_hat) < 1.0
+                        and g["cur_gain_pp"] is not None
+                        and g["cur_gain_pp"] >= -EPS
+                        and g["old_gain_pp"] > 0)
+                ci = rec["ci95_old_gain_hat_val"]
+                if cond and ci and ci[0] > 0:
+                    gate_verdict = "OVERSHOOT_EXPLOITABLE_CURRENT_ONLY"
+                elif cond:
+                    gate_verdict = "YELLOW_REVIEW"
+                else:
+                    gate_verdict = "OVERSHOOT_NOT_EXPLOITABLE"
+                gate.update({
+                    "lam_hat_val": lam_hat,
+                    "acc_old_at_hat": rec["acc_old_by_lambda"][str(lam_hat)],
+                    "acc_cur_at_hat": rec["acc_current_by_lambda"][
+                        str(lam_hat)],
+                    "acc_old_lam1": rec["acc_old_lam1"],
+                    "acc_cur_lam1": rec["acc_current_lam1"],
+                    "old_gain_pp": g["old_gain_pp"],
+                    "cur_gain_pp": g["cur_gain_pp"],
+                    "ci95_old_gain": ci,
+                })
+                # annex: selector-blind vs no-interior-gain (informative)
+                lo = rec["lam_oracle_current"]
+                oracle_interior = (lo is not None and float(lo) < 1.0
+                                   and rec["gains_at_oracle"]["old_gain_pp"]
+                                   is not None
+                                   and rec["gains_at_oracle"]["old_gain_pp"]
+                                   > 0
+                                   and rec["gains_at_oracle"]["cur_gain_pp"]
+                                   is not None
+                                   and rec["gains_at_oracle"]["cur_gain_pp"]
+                                   >= -EPS)
+                gate["oracle_interior_dominates"] = bool(oracle_interior)
+                gate["lam_oracle_current"] = lo
+                note = ""
+                if gate_verdict == "OVERSHOOT_NOT_EXPLOITABLE":
+                    if oracle_interior:
+                        note = ("selector-blind: the test-oracle interior "
+                                "step dominates both endpoints "
+                                f"(lam*={lo}) but no legal selector finds it")
+                    else:
+                        note = ("no-interior-gain: even the test oracle "
+                                f"picks the endpoint (lam*={lo})")
+                gate["annex_note"] = note
+        gate["verdict"] = gate_verdict
+
+        # secondary: same readout on the train selector (report only)
+        sec = {"transition": gate_tr, "present": gate_tr in tr_recs}
+        if gate_tr in tr_recs:
+            rec = tr_recs[gate_tr]
+            lam_t = rec["lam_hat_train"]
+            if lam_t is None:
+                sec["verdict"] = "N/A"
+            else:
+                g = rec["gains_at_hat_train"]
+                cond = (float(lam_t) < 1.0
+                        and g["cur_gain_pp"] is not None
+                        and g["cur_gain_pp"] >= -EPS
+                        and g["old_gain_pp"] > 0)
+                ci = rec["ci95_old_gain_hat_train"]
+                if cond and ci and ci[0] > 0:
+                    sec["verdict"] = "OVERSHOOT_EXPLOITABLE_CURRENT_ONLY"
+                elif cond:
+                    sec["verdict"] = "YELLOW_REVIEW"
+                else:
+                    sec["verdict"] = "OVERSHOOT_NOT_EXPLOITABLE"
+                sec.update({"lam_hat_train": lam_t,
+                            "old_gain_pp": g["old_gain_pp"],
+                            "cur_gain_pp": g["cur_gain_pp"],
+                            "ci95_old_gain": ci})
     # cross-transition state-adaptive readout at the primary selector
     lam_hats = [tr_recs[t]["lam_hat_val"] for t in sorted(tr_recs)
                 if tr_recs[t]["lam_hat_val"] is not None]
@@ -1474,15 +1693,63 @@ def analyze(states, args_cli, lam_grid, interior_lams, run_dir):
                        "old-task data"),
     }
 
-    # ---- FINAL (Sec.32.4 frozen tree) ----------------------------------
+    # ---- FINAL (Sec.32.4 / Sec.32.9 frozen trees) ------------------------
     if not premise_ok:
         final = ("REFUSED: H0 premise violated (monopoly / deployment "
                  "path / selection coverage / prompt-value premise) -- "
                  "no verdict (fail-closed).")
     elif gate_verdict == "N/A":
-        final = ("INCOMPLETE_STATES: the pre-registered gate transition "
-                 f"{gate_tr} is not present in the extracted state list "
-                 "-- no formal verdict (smoke runs only).")
+        if gate_mode == "all":
+            final = ("INCOMPLETE_STATES: no adjacent transitions present "
+                     "in the extracted state list -- no formal verdict "
+                     "(smoke runs only).")
+        else:
+            final = ("INCOMPLETE_STATES: the pre-registered gate transition "
+                     f"{gate_tr} is not present in the extracted state list "
+                     "-- no formal verdict (smoke runs only).")
+    elif gate_mode == "all":
+        if gate_verdict == "OVERSHOOT_EXPLOITABLE_CURRENT_ONLY":
+            final = (
+                "OVERSHOOT_EXPLOITABLE_CURRENT_ONLY (INR replication): "
+                "across ALL "
+                f"{len(gate['eligible_transitions'])} eligible adjacent "
+                "transitions the val-current selectors (zero old-task "
+                "information) pick steps with equal-weighted mean "
+                f"old-task gain +{gate['mean_old_gain_pp']}pp "
+                f"(hierarchical paired batch-bootstrap 95% CI "
+                f"{gate['agg_ci95_old_gain']}, lower bound > 0) and mean "
+                f"current-task gain {gate['mean_cur_gain_pp']:+}pp >= 0 "
+                f"(interior lam_hat at {gate['n_interior_lam_hat']}/"
+                f"{len(gate['eligible_transitions'])} transitions) -- the "
+                "temporal prompt-update overshoot replicates cross-"
+                "dataset and CTRP's Sec.33 candidacy condition (INR "
+                "mechanism replication) is satisfied, pending external "
+                "review; no training arm is pre-registered by this probe.")
+        elif gate_verdict == "YELLOW_REVIEW":
+            final = (
+                "YELLOW_REVIEW (INR replication): across ALL "
+                f"{len(gate['eligible_transitions'])} transitions the "
+                "aggregate old-task gain is "
+                f"+{gate['mean_old_gain_pp']}pp with mean current-task "
+                f"gain {gate['mean_cur_gain_pp']:+}pp, but the "
+                "hierarchical paired batch-bootstrap 95% CI "
+                f"{gate['agg_ci95_old_gain']} does not exclude zero -- "
+                "escalate to external review.")
+        elif gate_verdict == "OVERSHOOT_NOT_EXPLOITABLE":
+            final = (
+                "OVERSHOOT_NOT_EXPLOITABLE (INR replication): across ALL "
+                f"{len(gate['eligible_transitions'])} transitions the "
+                "current-task selectors do not locate a dominating "
+                f"aggregate step (mean old gain {gate.get('mean_old_gain_pp')}"
+                f"pp, mean current gain {gate.get('mean_cur_gain_pp')}pp, "
+                f"agg CI95 {gate.get('agg_ci95_old_gain')}) -- the "
+                "overshoot does not replicate as current-task-signal "
+                "exploitable on this dataset. Frozen wording: the "
+                "interior gain is not locatable by current-task signals "
+                "in the aggregate. Annex: "
+                f"{gate.get('annex_note') or 'n/a'}.")
+        else:
+            final = f"REFUSED: {gate.get('note', 'gate degenerate')}"
     elif gate_verdict == "OVERSHOOT_EXPLOITABLE_CURRENT_ONLY":
         g = gate
         final = (
@@ -1570,6 +1837,19 @@ def main():
         st = extract_state(args_cli, args_cli.run_dir, ckpt, prev,
                            lam_grid, interior_lams, t_index)
         states.append(st)
+        if t_index == 0 and int(args_cli.monopoly_slot) < 0:
+            # Sec.32.9 auto-discovery: the INITIAL checkpoint defines the
+            # monopoly slot; later states must keep it (fail-closed in
+            # extract_state) or the probe refuses.
+            discovered = int(st.get("slot_effective", -1))
+            if discovered < 0:
+                raise RuntimeError(
+                    "auto monopoly-slot discovery failed on the initial "
+                    "checkpoint -- no batches extracted?")
+            args_cli.monopoly_slot = discovered
+            print(f"{TAG} auto-discovered monopoly slot {discovered} "
+                  f"(from {Path(ckpt).stem}; all later states must keep "
+                  "the same batch-majority mode slot or the probe refuses)")
 
     summary, agg_rows, per_rows = analyze(
         states, args_cli, lam_grid, interior_lams, args_cli.run_dir)
@@ -1606,16 +1886,33 @@ def main():
               f"{rec['gains_at_oracle']['old_gain_pp']}pp), CI95(val) "
               f"{rec['ci95_old_gain_hat_val']}")
     g = v["gate"]
-    print(f"{TAG} MAIN GATE (transition {args_cli.gate_transition}, "
-          f"primary lam_hat_val): {g.get('verdict')} "
-          f"[lam_hat={g.get('lam_hat_val')}, old_gain "
-          f"{g.get('old_gain_pp')}pp CI95 {g.get('ci95_old_gain')}, "
-          f"cur_gain {g.get('cur_gain_pp')}pp] "
-          f"{g.get('annex_note', '')}")
+    if str(args_cli.gate_mode) == "all":
+        print(f"{TAG} MAIN GATE (all-transitions aggregate, primary "
+              f"lam_hat_val): {g.get('verdict')} [mean_old "
+              f"{g.get('mean_old_gain_pp')}pp, agg CI95 "
+              f"{g.get('agg_ci95_old_gain')}, mean_cur "
+              f"{g.get('mean_cur_gain_pp')}pp, interior lam_hat "
+              f"{g.get('n_interior_lam_hat')}/"
+              f"{len(g.get('eligible_transitions', []))}] "
+              f"{g.get('annex_note', '')}")
+    else:
+        print(f"{TAG} MAIN GATE (transition {args_cli.gate_transition}, "
+              f"primary lam_hat_val): {g.get('verdict')} "
+              f"[lam_hat={g.get('lam_hat_val')}, old_gain "
+              f"{g.get('old_gain_pp')}pp CI95 {g.get('ci95_old_gain')}, "
+              f"cur_gain {g.get('cur_gain_pp')}pp] "
+              f"{g.get('annex_note', '')}")
     sec = v["secondary_train_selector"]
-    print(f"{TAG} secondary (train selector): {sec.get('verdict')} "
-          f"[lam_hat_train={sec.get('lam_hat_train')}, old_gain "
-          f"{sec.get('old_gain_pp')}pp]")
+    if str(args_cli.gate_mode) == "all":
+        print(f"{TAG} secondary (train selector, aggregate): "
+              f"{sec.get('verdict')} [mean_old "
+              f"{sec.get('mean_old_gain_pp')}pp, agg CI95 "
+              f"{sec.get('agg_ci95_old_gain')}, mean_cur "
+              f"{sec.get('mean_cur_gain_pp')}pp]")
+    else:
+        print(f"{TAG} secondary (train selector): {sec.get('verdict')} "
+              f"[lam_hat_train={sec.get('lam_hat_train')}, old_gain "
+              f"{sec.get('old_gain_pp')}pp]")
     print(f"{TAG} state-adaptive annex: {summary['annex']['state_adaptive']}")
     print(f"{TAG} FINAL: {v['FINAL']}")
     print(f"{TAG} rows -> {args_cli.out_rows_csv}; aggregates -> "

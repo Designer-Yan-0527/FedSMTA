@@ -2081,3 +2081,78 @@ python diagnostics/probe_prompt_step_calibration.py \
 > **The effect is boundary-general and state-adaptive: at ALL four boundaries the current-task selectors find interior steps that improve BOTH populations with CI lower bounds > 0 (λ̂_val = 0.85/0.95/0.30/0.70; mean old +1.165pp / cur +0.715pp), the optimal step differs per boundary (fixed-EMA insufficient), and the fine grid upgrades Probe-G's coarse-grid "λ\*=1 at 0→1" to a grid-resolution artifact (acc_old 97.20 @ λ=0.8 vs 96.63 endpoint) — interior dominance holds at every transition.**
 >
 > **The pre-registered verdict is OVERSHOOT_EXPLOITABLE_CURRENT_ONLY: the temporal prompt-update overshoot is a deployment-repairable, current-task-signal-locatable step-calibration defect rather than a stability–plasticity conflict, and CTRP (Calibrated Temporal Residual Prompt: P_deploy = P_{t−1} + α_t·ΔP_t, α_t calibrated on current-task signals alone) earns Sec.33 candidacy, conditional on INR mechanism replication + external review; no training arm is pre-registered by this probe.**
+
+## 32.9 INR 机制复核（Probe-H replicate，预注册 2026-11-03，GPT 外审批板冻结；先冻结判据后运行，不看结果调门）
+
+**身份**：CTRP §33 立项前置条件之一（§32.8 冻结）。CIFAR-100 的 2→3 主判场是从已观察到的性能损失选出来的；INR 是**跨数据集外部验证**，无先验主判场——若人为挑一个"类似 2→3"的边界即引入选择偏差。因此 INR 采用 **All eligible adjacent transitions**，主统计量为各过渡**等权**的历史任务准确率改善均值：
+
+G_old = (1/T) Σ_{t=1..T} [ Acc_old,t(α̂_val,t) − Acc_old,t(1) ]
+
+每个 transition 单独报告，再算总体；**绝不把所有过渡的样本并成一个超大独立样本池**（CI 用层次 bootstrap 实现：每个 rep 在每个 transition 内独立重抽 batch、rep 内等权平均）。
+
+### 32.9.1 冻结参数（GPT 拍板 + 一处工程修订）
+
+| 参数 | 冻结值 |
+|---|---|
+| run_dir | `output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42` |
+| cache_dir | `diagnostics_output/stepcalib_inr_seed42` |
+| 主判场 | **全部相邻 transition（T=4），等权聚合**，不指定单一边界 |
+| 门模式 | `--gate_mode all` |
+| 其余 | 沿用 §32 原始门槛，**不因外部验证降低标准** |
+
+**与 GPT 拍板的唯一偏离（工程修订，外审可否决）**：cache_dir 由拍板的 `contentdrift_inr_seed42` 改为 **`stepcalib_inr_seed42`**——`contentdrift_*` 是 probe-G 的命名空间，若未来 probe-G 补跑 INR 会用同名；虽然缓存指纹会 fail-closed 拒绝跨探针串用，但按 §29 教训不应主动制造同名冲突。探针版本 `stepcalib-v1`（同一探针的新运行模式，非新探针）。
+
+### 32.9.2 判决条件冻结表
+
+| 检查项 | 预注册要求 |
+|---|---|
+| G0（H0 前提门） | 路由稳定（部署路径 top_k=1/batchwise/无 task mask）、prompt 值跨客户端单值、heads 跨状态恒定；**主导槽由初始 checkpoint 自动发现**（`--monopoly_slot -1`），所有后续状态必须保持同一主导槽且非主导 batch ≤1%，否则判"单槽内容演化前提不成立"拒（不强行套用 CTRP） |
+| G1 | 逐过渡主导槽行的 prompt 更新度量（rel_norm / cosine）+ 状态性能漂移（drift pool） |
+| H1 主门 | 当前任务 val CE 选择的 α̂（逐过渡独立选择，零历史任务信息）改善历史任务：G_old > 0 且层次 paired batch-bootstrap 95% CI 下界 > 0 |
+| H2 | 当前任务非劣效：各过渡 cur gain 等权均值 ≥ 0（沿用原不等式，聚合层级） |
+| H3 | **所有相邻 transition 逐过渡全表单独报告**（λ̂/old gain/cur gain/CI95/oracle），不允许挑选最佳边界 |
+| Oracle | test-oracle 仅作非法参考上界，不参与步长选择；annex 报告逐过渡 oracle 内点占优计数 |
+| 统计 | 沿用 §32.7 方案：paired batch bootstrap，B=1000，seed=20261103（聚合门 +137 派生 train 选择器种子）；选择器 = 当前任务 val/train CE argmin、并列取最小 λ |
+| 选择信号隔离 | α̂ = argmin CE_current,val(α)；历史任务数据不参与步长选择；val/train 与 test 分离（inner-train 分层子采样 80/20） |
+
+### 32.9.3 判决树（`--gate_mode all`，冻结）
+
+```
+H0 fail（含主导槽跨状态漂移 / 任一状态选择信号退化）→ REFUSED
+G_old > 0 且 mean_cur ≥ 0 且层次 CI95_lo(G_old) > 0
+    → OVERSHOOT_EXPLOITABLE_CURRENT_ONLY（INR 复核通过；§33 立项前置条件满足，待外审）
+G_old > 0 且 mean_cur ≥ 0 但 CI95_lo ≤ 0 → YELLOW_REVIEW
+否则 → OVERSHOOT_NOT_EXPLOITABLE（annex：合法选择器内点计数 / oracle 内点占优计数）
+次级：train-current selector 同聚合读数（报告不作门）；
+逐过渡 λ̂ 互异性 + prompt_drift annex（G1）= state-adaptive 复核证据。
+```
+
+### 32.9.4 与 §32 CIFAR 版的实现差异（全部已实现 + 回归验证）
+
+1. `--monopoly_slot -1`：初始状态自动发现主导槽（仅 t_index=0 允许 auto，后续状态模式槽不一致即拒）；发现的槽记入 `slot_effective` 并落盘 meta。
+2. `--gate_mode all`：等权聚合门 + `_aggregate_boot_ci` 层次 bootstrap（rep 内逐过渡独立重抽、等权平均、不并池）。
+3. G1 annex：`annex.prompt_drift_slot`（逐过渡主导槽行 rel_norm/cosine）。
+4. probe-G 对账：probe-G 从未跑过 INR，`--probe_g_csv` 指向不存在的路径 → 检查按预注册降级为 informative note（协议保留，数据无源）。
+5. **回归验证（2026-11-03）**：single 模式在 CIFAR 既有缓存上重分析与正式 run 逐位一致（含 FINAL/gate/secondary/全部过渡记录）；all 模式在同一缓存上读数 mean_old +1.165pp、agg CI95 [0.996, 1.333]、mean_cur +0.715pp、secondary（train）+1.343pp [1.163, 1.517]、interior 4/4——与 §32.8 手算完全吻合。
+
+### 32.9.5 fail-closed 增补
+
+auto 槽仅在 state 0 发现；后续状态 batch-majority 模式槽 ≠ 发现槽即拒；聚合门要求**每个** eligible transition 都有有效选择信号（任一退化 → REFUSED）；其余沿用 §32.5 全部条款。
+
+### 32.9.6 命令（GPT 外审通过 §32.9 后执行；INR 行规模小于 CIFAR，预计 30–60 分钟，GPU 共享时加倍；逐状态缓存可断点续跑）
+
+```bash
+/root/autodl-tmp/users/ych/.conda/envs/FedSMTA/bin/python diagnostics/probe_prompt_step_calibration.py \
+    --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
+    --data_path ./local_datasets --device cuda \
+    --monopoly_slot -1 --gate_mode all \
+    --probe_g_csv diagnostics_output/absent_probe_g_inr.csv \
+    --cache_dir diagnostics_output/stepcalib_inr_seed42 \
+    --out_csv diagnostics_output/stepcalib_inr_seed42.csv \
+    --out_rows_csv diagnostics_output/stepcalib_inr_seed42_rows.csv \
+    --out_json diagnostics_output/stepcalib_inr_seed42.summary.json
+```
+
+### 32.9.7 / 32.9.8 工程记录 / 正式判决
+
+（预注册占位：跑完后按惯例补记；INR 复核通过 → CTRP §33 立项前置条件全部满足，须外审后进入 §33。）
