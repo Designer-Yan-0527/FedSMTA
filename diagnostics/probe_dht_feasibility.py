@@ -120,6 +120,20 @@ def apply_transport(z, A, b):
     return z @ A.T + b
 
 
+def spectral_stats(A, z_new, z_old, ranks=(1, 4, 8, 16, 32, 64)):
+    """Low-rank feasibility of the residual map dA = A - I (Sec.29.1b,
+    STBB low-rank bridge hypothesis). Truncated SVD of dA is its optimal
+    rank-r approximation (Frobenius), so the cumulative-energy curve AND
+    the held-out recovery of the truncated map directly answer 'is the
+    broadcast-induced drift low-dimensional' without any extra fitting."""
+    dA = A - np.eye(A.shape[0], dtype=np.float32)
+    s = np.linalg.svd(dA, compute_uv=False)
+    energy = s ** 2
+    cum = {int(r): round(float(energy[:r].sum() / energy.sum()), 4)
+           for r in ranks if r <= len(s)}
+    return cum
+
+
 def compose(ts):
     """Compose a chain of (A, b): z -> A1(A2(...(Ak z + bk)...) + b1)."""
     A, b = ts[0]
@@ -226,6 +240,7 @@ def main():
                 "resid_ratio_train": round(r_tr, 4),
                 "resid_ratio_heldout": round(r_te, 4) if cur_te.any() else None,
                 "dA_fro": round(dA, 4),
+                "dA_spectrum_cum": spectral_stats(A1),
             })
 
             # Probe-B: old-task feature recovery, 3 arms (test rows)
