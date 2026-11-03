@@ -124,12 +124,12 @@ def apply_transport(z, A, b):
     return z @ A.T + b
 
 
-def spectral_stats(A, z_new, z_old, ranks=(1, 4, 8, 16, 32, 64)):
+def spectral_stats(A, ranks=(1, 4, 8, 16, 32, 64)):
     """Low-rank feasibility of the residual map dA = A - I (Sec.29.1b,
     STBB low-rank bridge hypothesis). Truncated SVD of dA is its optimal
-    rank-r approximation (Frobenius), so the cumulative-energy curve AND
-    the held-out recovery of the truncated map directly answer 'is the
-    broadcast-induced drift low-dimensional' without any extra fitting."""
+    rank-r approximation (Frobenius), so the cumulative-energy curve
+    directly answers 'is the broadcast-induced drift low-dimensional'
+    without any extra fitting."""
     dA = A - np.eye(A.shape[0], dtype=np.float32)
     s = np.linalg.svd(dA, compute_uv=False)
     energy = s ** 2
