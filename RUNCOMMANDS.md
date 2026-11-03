@@ -2032,6 +2032,52 @@ python diagnostics/probe_prompt_step_calibration.py \
 
 产物：`stepcalib_cifar.csv`（过渡级聚合 + 逐客户端 old gain + 21 点 acc_old/acc_cur 曲线）+ `stepcalib_cifar_rows.csv`（per-row 分析即用表：覆盖行 correct@{λ 21 点}，old/current 两人口）+ `stepcalib_cifar.summary.json`（H0 前提 + 选择器读数 + 主门判决 + oracle annex + probe-G 对照对账）。判级声明：探针级诊断，单 run 单种子，产判据不产数字；INR 复核仅在 Probe-H 过门且拟立项 §33 时需要（判负不需双确认，延续 §30/§31 惯例）。
 
-### 32.7 / 32.8 工程冒烟记录 / 正式判决
+### 32.7 工程记录（正式跑 2026-11-03）
 
-（预注册占位：跑完后按惯例补记。）
+- **执行**：用户终端跑正式 5 状态全量（§32.6 命令原样），17:07–19:09 约 2 小时。GPU 与 8 进程共享（用户自有 `cifar_a5v2_M2pb_full` / `inr_a5v2_M2pb_p40` 两训练 + 其它租户 6 任务，100% util），逐状态耗时 ~2 / 21 / 26 / 32 / 40 分钟（行数 3324/6487/9222/12328/14992 + 21 臂 + 选择行 2561/2559/2562/2562）。
+- **零 bug**：无 crash、无 fail-closed 触发；H0 全过（nonslot batch frac = 0.0、选择行 drop frac = 0.0/剔除 0 行、prompt 值跨 client 单值、heads 跨状态恒定）；探针无运行期修补，§31.7 两个已知坑（retain_graph / 兜底键名）因臂结构不同未复现。
+- **跨探针对账**：probe-G 连续性检查 8/8 天然读数逐位一致（`contentdrift_cifar.csv` 的 acc_nat_tm1/acc_nat_t，全部 bit-identical）——确定性前向协议在两探针间可复现，分析层对账通过。
+- **缓存**：`stepcalib_cifar/` 5 状态 180MB，逐状态落盘正常；正式跑一次通过，未用到断点续跑。
+- **冒烟说明**：我侧沙箱拦截 CUDA 设备访问（cudaGetDeviceCount error 304，两次尝试含非沙箱模式均被 /proc 限制），冒烟改由正式跑直接覆盖验证——正式跑零 bug 反证代码路径完好。
+- 产物：`stepcalib_cifar.csv`（4 过渡行 + 12 client 行 + 42 曲线列）、`stepcalib_cifar_rows.csv`（覆盖行 × 21 点 correct，old/current 两人口）、`stepcalib_cifar.summary.json`（判决 + 选择器读数 + CE 曲线 + oracle annex）。
+
+### 32.8 正式判决（2026-11-03，判级：探针级诊断，单 run 单种子，产判据不产数字）
+
+**`OVERSHOOT_EXPLOITABLE_CURRENT_ONLY`**（主门 PASS，且以压倒性余量通过）。
+
+主门（2→3，primary = λ̂_val-current）：
+
+| 读数 | λ̂ | Acc_old | old gain | CI95 (paired batch bootstrap) | Acc_cur gain |
+|---|---:|---:|---:|---|---:|
+| **λ̂_val（主）** | **0.30** | 95.98 | **+3.51pp** | **[+3.02, +4.00]** | **+1.67pp** |
+| λ̂_train（次级） | 0.40 | 95.73 | +3.26pp | [+2.79, +3.74] | +1.90pp |
+| λ\* test-oracle（非法对照） | 0.35 | 96.02 | +3.55pp | [+3.07, +4.05] | +1.96pp |
+
+两个合法选择器几乎精确命中 test-oracle 区域（0.3/0.4 vs 0.35），且 **train 与 val 双选择器独立同向**。
+
+逐过渡全表（全部 CI 下界 > 0）：
+
+| 过渡 | λ̂_val | old gain | cur gain | λ̂_train | old / cur gain |
+|---|---:|---:|---:|---:|---|
+| 0→1 | 0.85 | +0.42pp [0.06, 0.81] | +0.10pp | 0.95 | +0.36 / +0.16 |
+| 1→2 | 0.95 | +0.19pp [0.06, 0.32] | +0.11pp | 0.65 | +0.84 / +0.52 |
+| 2→3 | **0.30** | **+3.51pp [3.02, 4.00]** | +1.67pp | 0.40 | +3.26 / +1.90 |
+| 3→4 | 0.70 | +0.54pp [0.20, 0.90] | +0.98pp | 0.65 | +0.91 / +1.01 |
+
+@λ̂_val 跨过渡均值：old +1.165pp / cur +0.715pp。**λ̂ 逐过渡互异（0.85/0.95/0.30/0.70）⇒ state-adaptive 校准必要性再次确证**，固定 EMA 不可替代。
+
+细网格对 probe-G 粗网格的两点修正/升级（informative annex）：
+1. **0→1 的"λ\*=1"是网格分辨率伪影**——细网格下 0→1 同样内点占优（acc_old 在 λ=0.8 达 97.20 vs 端点 96.63，oracle λ\*=0.9）。内点占优从"后三过渡"升级为**四过渡全部成立**。
+2. 2→3 的 oracle 最优从粗网格 0.25 修正为 0.35，且 acc_old 与 acc_cur 的内点峰同位（都在 0.35 附近）——overshoot 是两侧共认的次优点，不存在 stability–plasticity 交换。
+
+**机制结论（§32.2 hypothesis 确认）**：the learned prompt endpoint is temporally miscalibrated，且该 miscalibration **完全可由当前任务信号定位与修复**（val CE argmin 即可，零旧任务信息、零 replay、零 test-oracle）。联邦持续学习把 prompt 更新推到了一个连当前任务都次优的 temporal endpoint；这不是 stability–plasticity 冲突，而是**步长校准缺陷**。
+
+**CTRP 立项资格（§33）**：Calibrated Temporal Residual Prompt——`P_deploy = P_{t−1} + α_t·ΔP_t`，α_t 由当前任务信号（当前任务 val/train CE 在 {0, 0.05, …, 1} 网格 argmin）自适应确定。前置条件不变：**须先过 INR 机制复核（同一探针、ImageNet-R p40 保留 run）+ 外审**；本探针不写任何训练臂。
+
+**GPT 三句式封档记录（frozen for external review）**：
+
+> **The pre-registered main gate at the 2→3 transition PASSES with decisive margin: the val-current selector (current-task validation CE only, zero old-task information) picks λ̂=0.30<1 with Acc_old +3.51pp over the natural endpoint (paired batch-bootstrap 95% CI [+3.02, +4.00], lower bound ≫ 0) and Acc_cur +1.67pp, and the independent train-current selector concurs (λ̂=0.40, +3.26pp CI [+2.79, +3.74], +1.90pp) — both legal selectors land on the test-oracle region (λ\*=0.35).**
+>
+> **The effect is boundary-general and state-adaptive: at ALL four boundaries the current-task selectors find interior steps that improve BOTH populations with CI lower bounds > 0 (λ̂_val = 0.85/0.95/0.30/0.70; mean old +1.165pp / cur +0.715pp), the optimal step differs per boundary (fixed-EMA insufficient), and the fine grid upgrades Probe-G's coarse-grid "λ\*=1 at 0→1" to a grid-resolution artifact (acc_old 97.20 @ λ=0.8 vs 96.63 endpoint) — interior dominance holds at every transition.**
+>
+> **The pre-registered verdict is OVERSHOOT_EXPLOITABLE_CURRENT_ONLY: the temporal prompt-update overshoot is a deployment-repairable, current-task-signal-locatable step-calibration defect rather than a stability–plasticity conflict, and CTRP (Calibrated Temporal Residual Prompt: P_deploy = P_{t−1} + α_t·ΔP_t, α_t calibrated on current-task signals alone) earns Sec.33 candidacy, conditional on INR mechanism replication + external review; no training arm is pre-registered by this probe.**
