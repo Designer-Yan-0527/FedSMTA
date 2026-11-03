@@ -1545,6 +1545,16 @@ python main.py datasets_delay --data_name ImageNet-R --data-path ./local_dataset
 
 判级预声明：若走 DS-TBB 臂，§28 的"不作方法创新主张"在 §30 预注册中**明文升级**为 architecture-level 主张，升级依据 = Probe-B 外推 + Probe-E 阶梯 + 谱曲线三组证据；若 Probe-E 首行成立（线性充分），判级保持协议/机制级，不拔高。
 
+### 29.4 判决（2026-11-03，cifar 4 边界 T3 口径 seed 42；commit c9db197 探针）
+
+读数：门 1 held-out B1 残差比中位数 **1.944**（>1 = 劣于 identity）→ **硬 FAIL**；签名 d_rec +1.72pp（YELLOW，但受门 1 约束不作数）；oracle 分布 direct full-affine 头级 +2.44 vs refit 上界 +2.74；lowrank(r=16) **−75.17pp** / dynamic **−48.65pp**（灾难性摧毁，准确率崩至随机量级）；corr(gain,age)=−0.668 与 corr(gain,drift)=+0.663 方向打架，n=15 不作机制依据。
+
+**判决：门 1 不过 → temporal bridge 全家族（DHT/TABB/STBB/DS-TBB）判死关闭，不写训练臂**（§29.2 预注册条款）。Probe-E 同时实测死掉低秩与动态假设：截断 SVD 保留的主导奇异方向是拟合噪声，r=16 截断即摧毁读数——"广播位移低维"假设无数据支持。
+
+机制注记（写作素材）：z_op 来自离散 top-k prompt 检索路由，跨部署状态漂移含离散跳变成分，非平滑仿射位移——768 维 ridge 在 task-t train 行上过拟合（同任务 held-out 残差即 >1），外推必然失败。头级正效应（rec +1.72 / oracle direct +2.44）解释为 near-identity 正则下温和收缩的判别鲁棒性收益，非可控坐标对齐；且 +2.44 仅在 oracle 分布（旧任务数据拟合）下成立——与 F4 replay 判死口径一致，不可部署。**结论：修复层级选择 = 读出头时点重校准（M2''）优于特征空间 transport 家族**——此负结果直接支撑论文"修复层级"论证（附录：仿射家族排除记录）。
+
+INR 复核：可选存档级（判死不需双确认；若为论文附录完整性补跑一次，成本 ~10 分钟）。
+
 ### 29.3 命令（GPT 审核通过后执行；与 M2'' 训练无 GPU 抢占——特征提取为轻前向，建议错峰）
 
 ```bash
