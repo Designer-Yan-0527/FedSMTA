@@ -1,4 +1,5 @@
 import random
+import json
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -20,6 +21,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from runtime_utils import (module_state_or_none, clone_prompt_template,
                            rng_state_dict, restore_rng_state,
                            atomic_save_checkpoint, load_checkpoint_file)
+from Models.ctrp import (CTRP_MODES, parse_alpha_grid, hash_prompt_module,
+                         hash_tensor, select_alpha)
 
 
 def rebuild_global_head(global_head_state, vit_head, nb_classes):
@@ -127,6 +130,67 @@ class Server_DF(object):
                 "(nothing to refit; "
                 "fail-closed, RUNCOMMANDS Sec.28)")
 
+        # ------------------------------------------------------------------
+        # §33 CTRP v1（pre-registered 2026-11-03；GPT 冻结 9 节裁决）。
+        # off = 完整 legacy 路径，逐位一致（本块之外不执行任何 CTRP 代码）。
+        # ------------------------------------------------------------------
+        self._ctrp_mode = str(getattr(args, 'ctrp_mode', 'off') or 'off')
+        if self._ctrp_mode not in CTRP_MODES:
+            raise SystemExit(
+                f"CTRP: unknown ctrp_mode {self._ctrp_mode!r} "
+                f"(valid: {CTRP_MODES})")
+        if self._ctrp_mode != 'off':
+            # 裁决 §1.1：post-broadcast refit 会在 CTRP calibration 之后
+            # 改写部署 head，selector 与 deployment semantics 不一致 ->
+            # CTRP v1 不支持，fail-closed（off 不受影响）
+            if str(getattr(args, 'refit_timing', 'local')) == 'post_broadcast':
+                raise SystemExit(
+                    "CTRP_V1_UNSUPPORTED_REFIT_TIMING: ctrp_mode != off is "
+                    "incompatible with --refit_timing post_broadcast "
+                    "(post-broadcast refit rewrites the deployed head AFTER "
+                    "CTRP calibration, so the selector would disagree with "
+                    "the final deployment semantics). Use "
+                    "--refit_timing local or --ctrp_mode off.")
+            self._ctrp_alpha_grid = parse_alpha_grid(
+                getattr(args, 'ctrp_alpha_grid', None))
+            self._ctrp_alpha = getattr(args, 'ctrp_alpha', None)
+            self._ctrp_val_frac = float(getattr(args, 'ctrp_val_frac', 0.20))
+            if self._ctrp_mode == 'fixed_alpha':
+                if self._ctrp_alpha is None:
+                    raise SystemExit(
+                        "--ctrp_mode fixed_alpha requires --ctrp_alpha "
+                        "(the fixed step size, in [0, 1]; fail-closed)")
+                if not (0.0 <= float(self._ctrp_alpha) <= 1.0):
+                    raise SystemExit(
+                        f"--ctrp_alpha must lie in [0, 1], got "
+                        f"{self._ctrp_alpha}")
+            elif self._ctrp_alpha is not None:
+                raise SystemExit(
+                    "--ctrp_alpha is only valid with --ctrp_mode "
+                    "fixed_alpha (fail-closed: no dual source of truth)")
+            if not (0.0 < self._ctrp_val_frac < 1.0):
+                raise SystemExit(
+                    f"--ctrp_val_frac must lie strictly within (0, 1), "
+                    f"got {self._ctrp_val_frac}")
+        else:
+            self._ctrp_alpha_grid = None
+            self._ctrp_alpha = None
+            self._ctrp_val_frac = None
+
+        # anchor 状态机（裁决 §D/§2）：state 0 不校准，
+        # P_0_deploy = P_0_cand；t>=1 时 DeltaP 相对 deployed anchor。
+        # _ctrp_prev_deployed = 上一 task 的 deployed prompt VALUES（完整
+        # pool 张量；prompt_key 不参与——CTRP 不改 key）。
+        self._ctrp_prev_deployed = None
+        self._ctrp_prev_dominant_slot = None
+        self._ctrp_dominant_slot = None
+        self._ctrp_selected_alpha = None
+        self._ctrp_val_ce_by_alpha = None
+        self._ctrp_candidate_prompt_hash = None
+        self._ctrp_prev_deployed_prompt_hash = None
+        self._ctrp_deployed_prompt_hash = None
+        self._ctrp_history = []
+
     def init_client(self):
         print('Initialize clients')
         for i in range(self.client_num):    #
@@ -223,6 +287,16 @@ class Server_DF(object):
                 self.kd_fusion_prompt(self.thisclients, round_i=i)
 
             self.fed_avg_head(self.thisclients)
+
+            # §33 CTRP v1：任务末 temporal prompt calibration。冻结插入点 =
+            # fed_avg_head 之后、broadcast（get_global_proto_and_head）之前，
+            # 使任务末 native evaluate / full evaluation / task_XX_end.pth
+            # 全部看到 P_t^deploy 而非 P_t^cand。candidate = 原算法正常产生的
+            # task-end candidate（不修改任务末轮跳过 fusion 的语义）。
+            # ctrp_mode=off = 精确 no-op（legacy 路径逐位一致）。
+            if (self._ctrp_mode != 'off'
+                    and (i + 1) % self.global_epoch == 0):
+                self._ctrp_calibrate_task_end(i)
 
             print('Server aggregation Compelte, results are ()：')
             # Phase 0: collect the (already existing) post-broadcast
@@ -721,6 +795,9 @@ class Server_DF(object):
         # A5-v2（RUNCOMMANDS §23）：跨 ON/OFF resume 会静默改变接口语
         # 义与 joint-head 轨迹管理；two-sided 检查保持老 checkpoint 兼容
         "head_refit", "head_standardize", "refit_input", "refit_timing",
+        # §33 CTRP v1：任何会改变 CTRP 语义的参数都必须匹配（two-sided：
+        # pre-CTRTP 老 checkpoint 不含这些 key，自动跳过保持兼容）
+        "ctrp_mode", "ctrp_alpha", "ctrp_alpha_grid", "ctrp_val_frac",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):
@@ -787,6 +864,31 @@ class Server_DF(object):
 
             "args": vars(self.args),
         }
+        # §33 CTRP v1：anchor 状态机等 CTRP 状态收进单一 ctrp_state dict
+        #（off 臂不加 key = pre-CTRTP checkpoint schema 逐位不变）。
+        # calibration_done：当前 task 的 hook 是否已跑（task 末 checkpoint
+        # = True；round 中途 = False）。
+        if self._ctrp_mode != 'off':
+            checkpoint["ctrp_state"] = {
+                "mode": self._ctrp_mode,
+                "current_task": self.task_id,
+                "calibration_done": bool(
+                    (round_id + 1) % self.global_epoch == 0),
+                "prev_deployed_prompt": (
+                    self._ctrp_prev_deployed.detach().cpu()
+                    if self._ctrp_prev_deployed is not None else None),
+                "prev_dominant_slot": self._ctrp_prev_dominant_slot,
+                "dominant_slot": self._ctrp_dominant_slot,
+                "selected_alpha": self._ctrp_selected_alpha,
+                "alpha_grid": ([float(a) for a in self._ctrp_alpha_grid]
+                               if self._ctrp_alpha_grid else None),
+                "val_ce_by_alpha": self._ctrp_val_ce_by_alpha,
+                "candidate_prompt_hash": self._ctrp_candidate_prompt_hash,
+                "prev_deployed_prompt_hash":
+                    self._ctrp_prev_deployed_prompt_hash,
+                "deployed_prompt_hash": self._ctrp_deployed_prompt_hash,
+                "history": list(self._ctrp_history),
+            }
         return checkpoint
 
     def maybe_save_checkpoint(self, round_id):
@@ -881,6 +983,9 @@ class Server_DF(object):
         for client_state in checkpoint.get("clients", []):
             cid = client_state["id"]
             self.clients[cid].load_checkpoint_state(client_state)
+
+        # ---- §33 CTRP v1 resume (frozen cases A/B/C, Sec.2) -------------
+        self._ctrp_resume(checkpoint)
 
         # RNG state must be restored LAST: model creation and split rebuild
         # above must not consume the restored random stream.
@@ -1039,6 +1144,354 @@ class Server_DF(object):
 
         self.global_head = deepcopy(self.clients[0].vit.head)
         self.global_head.load_state_dict(result_head)
+
+    # ------------------------------------------------------------------
+    # §33 CTRP v1: task-end temporal prompt calibration
+    # (RUNCOMMANDS Sec.33, pre-registered 2026-11-03, GPT-frozen verdict)
+    # ------------------------------------------------------------------
+
+    # premise gate threshold (frozen Sec.7): actual nonslot batch fraction
+    # (forward-returned prompt_idx, NOT preference statistics) <= 1%
+    CTRP_MAX_NONSLOT_BATCH_FRAC = 0.01
+
+    def _ctrp_persist_event(self, record):
+        """Append a CTRP event record to the run dir (immediate flush:
+        append_jsonl opens/writes/closes). run_manager=None (diagnostics
+        / unit tests) -> print only, so the reason is never lost."""
+        if self.run_manager is not None:
+            self.run_manager.append_jsonl(
+                self.run_manager.metrics_dir / "ctrp_events.jsonl", record)
+        print("[CTRP] " + json.dumps(record, default=str))
+
+    def _ctrp_log_transition(self, record):
+        if self.run_manager is not None:
+            self.run_manager.append_jsonl(
+                self.run_manager.metrics_dir / "ctrp_transitions.jsonl",
+                record)
+        self._ctrp_history.append(record)
+        print("[CTRP] transition " + json.dumps(record, default=str))
+
+    def _ctrp_fail_premise(self, record):
+        """Frozen Sec.3: log the premise failure reason to disk FIRST,
+        then raise. Never silently fall back to alpha=1."""
+        record = dict(record)
+        record["event"] = "CTRP_PREMISE_FAIL"
+        self._ctrp_persist_event(record)
+        raise RuntimeError(
+            "CTRP_PREMISE_FAIL: " + str(record.get("reason")))
+
+    def _ctrp_calibrate_task_end(self, round_id):
+        """CTRP hook body. Runs at the task-end round only, between
+        fed_avg_head and the broadcast loop. Frozen semantics:
+
+          state 0 : no temporal calibration (P_0_deploy = P_0_cand);
+                    record the discovered dominant slot s_0* and the
+                    anchor = deepcopy of the candidate VALUES.
+          t >= 1  : premise gate on the FORWARD-actual route (prompt_idx
+                    from Global_Prompt.forward, modal slot over the
+                    pooled current-task validation batches; nonslot batch
+                    fraction <= 1%; s_t* == s_{t-1}*). endpoint = matched
+                    baseline, premise failures only logged; every other
+                    matched arm fails closed. alpha from --ctrp_alpha
+                    (fixed_alpha), pooled val/train CE argmin with the
+                    Probe-H tie-break (ctrp_val / ctrp_train), or 1
+                    (endpoint). Deploy = dominant-row-only calibration
+                    P_deploy[s*] = (1-a) P_prev[s*] + a P_cand[s*] with
+                    every other slot keeping the candidate value; the
+                    prompt_key is NEVER modified (route(alpha=0) ==
+                    route(alpha=1) by construction; asserted via key-hash
+                    invariance around the whole hook).
+        """
+        t = round_id // self.global_epoch
+        if self.prompt is None:
+            raise RuntimeError(
+                "CTRP: no server candidate prompt at the task end round "
+                f"(round {round_id}) -- cannot calibrate (fail-closed)")
+        # resume 边角：restored server prompt 可能在 CPU（load 时 vit 尚
+        # 在 CPU；正常首跑时它来自 kd_fusion 的 vit clone，已在设备上，
+        # 此处为 no-op）。校准/broadcast 必须与 client vit 同设备。
+        vit_device = next(self.clients[0].vit.parameters()).device
+        if next(self.prompt.parameters()).device != vit_device:
+            self.prompt = self.prompt.to(vit_device)
+        key_hash_before = hash_tensor(self.prompt.prompt_key)
+        cand_state_hash = hash_prompt_module(self.prompt)
+        cand_values = self.prompt.prompt.detach().clone()
+
+        # pass 1: route discovery under the SERVER CANDIDATE prompt state
+        # (frozen Sec.4: the sweep's baseline is the server candidate, not
+        # the client's stale local prompt; clients load it and the loaded
+        # state hash is asserted against the server's)
+        batch_slots = []
+        per_client_batches = {}
+        for c in self.clients:
+            slots = c._ctrp_route_slots(self.prompt)
+            per_client_batches[c.id] = len(slots)
+            batch_slots.extend(slots)
+        if not batch_slots:
+            self._ctrp_fail_premise({
+                "round": round_id, "task": t, "mode": self._ctrp_mode,
+                "reason": "zero current-task validation batches under the "
+                          "server candidate state (CTRP_VAL_ROWS_EMPTY)",
+            })
+        slots_arr = np.asarray(batch_slots, dtype=np.int64)
+        modal = int(np.bincount(slots_arr).argmax())
+        nonslot_frac = float(np.mean(slots_arr != modal))
+        n_nonslot = int(np.sum(slots_arr != modal))
+        n_batches = int(len(batch_slots))
+
+        # ---- state 0: no temporal calibration (frozen) ------------------
+        if t == 0:
+            self._ctrp_prev_deployed = cand_values.clone()
+            self._ctrp_prev_dominant_slot = modal
+            self._ctrp_dominant_slot = modal
+            self._ctrp_prev_deployed_prompt_hash = hash_tensor(cand_values)
+            self._ctrp_deployed_prompt_hash = hash_tensor(cand_values)
+            self._ctrp_candidate_prompt_hash = cand_state_hash
+            self._ctrp_log_transition({
+                "round": round_id, "task": t, "mode": self._ctrp_mode,
+                "transition": "state0_init",
+                "dominant_slot": modal,
+                "nonslot_batch_frac": round(nonslot_frac, 6),
+                "n_val_batches": n_batches,
+                "n_nonslot_batches": n_nonslot,
+                "premise_status": "state0_no_calibration",
+                "selector": self._ctrp_mode,
+                "split_seed_schema": "a5_stable_seed(seed,client,task)",
+                "candidate_prompt_hash": cand_state_hash,
+                "prev_deployed_prompt_hash": hash_tensor(cand_values),
+                "deployed_prompt_hash": hash_tensor(cand_values),
+                "selected_alpha": None,
+                "val_ce_by_alpha": None,
+            })
+            if hash_tensor(self.prompt.prompt_key) != key_hash_before:
+                raise RuntimeError(
+                    "CTRP: prompt_key changed during the state-0 hook "
+                    "(route invariance violated; fail-closed)")
+            return
+
+        if self._ctrp_prev_deployed is None:
+            # load-time validation makes this unreachable for resumed
+            # runs (CTRP_RESUME_ANCHOR_MISSING fires at load); a fresh
+            # run always passes through state 0 first
+            raise RuntimeError(
+                "CTRP: anchor state machine broken (task >= 1 but no "
+                "prev_deployed anchor); refusing to guess the anchor "
+                "(fail-closed)")
+
+        prev_slot = self._ctrp_prev_dominant_slot
+        anchor_values = self._ctrp_prev_deployed.to(cand_values.device)
+        anchor_hash = hash_tensor(anchor_values)
+        premise_pass = (nonslot_frac
+                       <= self.CTRP_MAX_NONSLOT_BATCH_FRAC
+                       and modal == prev_slot)
+
+        base_record = {
+            "round": round_id, "task": t, "mode": self._ctrp_mode,
+            "transition": f"{t - 1}->{t}",
+            "dominant_slot": modal,
+            "previous_dominant_slot": prev_slot,
+            "nonslot_batch_frac": round(nonslot_frac, 6),
+            "n_val_batches": n_batches,
+            "n_nonslot_batches": n_nonslot,
+            "dominant_slot_share": round(float(np.mean(slots_arr == modal)),
+                                         6),
+            "per_client_val_batches": per_client_batches,
+            "selector": self._ctrp_mode,
+            "split_seed_schema": "a5_stable_seed(seed,client,task)",
+            "candidate_prompt_hash": cand_state_hash,
+            "prev_deployed_prompt_hash": anchor_hash,
+        }
+
+        # ---- premise gate (frozen Sec.3 / Sec.7) ------------------------
+        if not premise_pass:
+            reason = (
+                f"nonslot batch fraction {nonslot_frac:.4f} > "
+                f"{self.CTRP_MAX_NONSLOT_BATCH_FRAC}"
+                if nonslot_frac > self.CTRP_MAX_NONSLOT_BATCH_FRAC
+                else f"dominant slot changed across states "
+                     f"({prev_slot} -> {modal})")
+            record = dict(base_record)
+            record["premise_status"] = "fail"
+            record["reason"] = reason
+            if self._ctrp_mode == 'endpoint':
+                # matched-split endpoint control: log route premise
+                # diagnostics but NEVER terminate the baseline run
+                self._ctrp_persist_event(dict(
+                    record, event="CTRP_PREMISE_DIAGNOSTIC"))
+            else:
+                self._ctrp_fail_premise(record)
+
+        alpha = None
+        val_ce_by_alpha = None
+        if self._ctrp_mode == 'endpoint':
+            alpha = 1.0
+        elif self._ctrp_mode == 'fixed_alpha':
+            alpha = float(self._ctrp_alpha)
+        else:
+            # ctrp_val / ctrp_train: pooled sample-weighted current-task CE
+            # over the matched split rows, Probe-H selector + tie-break
+            rows_key = ('ctrp_val' if self._ctrp_mode == 'ctrp_val'
+                        else 'ctrp_core')
+            grid = self._ctrp_alpha_grid
+            ce_sum = np.zeros(len(grid), dtype=np.float64)
+            n_rows_total = 0
+            per_client_rows = {}
+            for c in self.clients:
+                res = c._ctrp_alpha_sweep(
+                    self.prompt, anchor_values, modal, grid,
+                    rows_key=rows_key)
+                ce_sum += res["ce_sum_by_alpha"]
+                n_rows_total += res["n_rows"]
+                per_client_rows[c.id] = {
+                    "n_rows": res["n_rows"],
+                    "n_dropped": res["n_dropped"],
+                    "n_batches": res["n_batches"],
+                }
+            if n_rows_total == 0:
+                self._ctrp_fail_premise({
+                    "round": round_id, "task": t, "mode": self._ctrp_mode,
+                    "reason": "zero scored selection rows at a transition "
+                              "(CTRP_VAL_ROWS_EMPTY)",
+                })
+            ce_pool = ce_sum / n_rows_total
+            alpha = select_alpha(ce_pool, grid)
+            val_ce_by_alpha = [float(v) for v in ce_pool]
+            base_record["per_client_sweep"] = per_client_rows
+            base_record["alpha_grid"] = [float(a) for a in grid]
+
+        # ---- deploy: dominant-slot-row-only temporal calibration -------
+        # P_deploy[s*] = P_prev_deploy[s*] + a (P_cand[s*] - P_prev[s*]),
+        # realized in the Probe-H op order; every other slot keeps the
+        # candidate value. alpha == 1 -> deployed IS the candidate, the
+        # write is skipped (avoids float no-op drift).
+        if float(alpha) != 1.0:
+            with torch.no_grad():
+                row_prev = anchor_values[modal]
+                row_cand = cand_values[modal]
+                self.prompt.prompt.data[modal] = (
+                    (1.0 - float(alpha)) * row_prev
+                    + float(alpha) * row_cand)
+        deployed_values = self.prompt.prompt.detach().clone()
+        deployed_hash = hash_tensor(deployed_values)
+
+        # route invariance: CTRP never touches prompt_key, so
+        # route(alpha=0) == route(alpha=1) by construction; assert the
+        # key survived the hook (frozen Sec.7 assertion)
+        if hash_tensor(self.prompt.prompt_key) != key_hash_before:
+            raise RuntimeError(
+                "CTRP: prompt_key changed during calibration "
+                "(route(alpha=0)==route(alpha=1) violated; fail-closed)")
+
+        # ---- anchor state machine update -------------------------------
+        self._ctrp_prev_deployed = deployed_values.clone()
+        self._ctrp_prev_dominant_slot = modal
+        self._ctrp_dominant_slot = modal
+        self._ctrp_selected_alpha = float(alpha)
+        self._ctrp_val_ce_by_alpha = val_ce_by_alpha
+        self._ctrp_candidate_prompt_hash = cand_state_hash
+        self._ctrp_prev_deployed_prompt_hash = anchor_hash
+        self._ctrp_deployed_prompt_hash = deployed_hash
+
+        record = dict(base_record)
+        record.update({
+            # endpoint arm continuing past a logged premise failure
+            # keeps running (diagnostic_only); all other arms raised above
+            "premise_status": ("pass" if premise_pass
+                               else "diagnostic_only"),
+            "selected_alpha": float(alpha),
+            "val_ce_by_alpha": val_ce_by_alpha,
+            "selected_ce": (val_ce_by_alpha[
+                self._ctrp_alpha_grid.index(float(alpha))]
+                if val_ce_by_alpha is not None else None),
+            "ce_at_alpha1": (val_ce_by_alpha[
+                self._ctrp_alpha_grid.index(1.0)]
+                if val_ce_by_alpha is not None else None),
+            "interior_alpha": bool(float(alpha) < 1.0),
+            "deployed_prompt_hash": deployed_hash,
+        })
+        self._ctrp_log_transition(record)
+
+    def _ctrp_resume(self, checkpoint):
+        """§33 CTRP v1 resume (frozen cases A/B/C, Sec.2):
+
+          A) ctrp_mode=off：无 ctrp_state = 正常 legacy 加载（本方法
+             无事可做；RESUME_MUST_MATCH 已拦截 off <-> matched 切换）。
+          B) ctrp_mode!=off 且 checkpoint 早于 state-0 hook 点
+             (completed_round < global_epoch - 1)：resume 后仍会执行
+             task 0 末轮的 hook，anchor 由该次 hook 正确建立 -> 全新
+             初始化状态机，不需要任何猜测。
+          C) ctrp_mode!=off、temporal transitions 已开始（state-0 hook
+             点已过）但缺可靠 prev_deployed_prompt：fail-closed
+             CTRP_RESUME_ANCHOR_MISSING。禁止从当前 server_prompt 猜
+             anchor（mid-task 的 server_prompt 可能已是当前 task 的
+             fusion/candidate 中间状态）、禁止从 candidate 反推、禁止
+             自动退回 endpoint、禁止静默重初始化。
+        """
+        if self._ctrp_mode == 'off':
+            return
+        ctrp_state = checkpoint.get("ctrp_state")
+        completed_round = int(checkpoint["completed_round"])
+        state0_hook_passed = completed_round >= self.global_epoch - 1
+        if ctrp_state is None:
+            if state0_hook_passed:
+                raise RuntimeError(
+                    "CTRP_RESUME_ANCHOR_MISSING: resuming a "
+                    f"ctrp_mode={self._ctrp_mode!r} run at round "
+                    f"{completed_round + 1} (the state-0 calibration "
+                    "point has passed, temporal transitions already "
+                    "started) but the checkpoint carries no "
+                    "ctrp_state.prev_deployed_prompt. Refusing to "
+                    "guess the anchor from server_prompt (mid-task "
+                    "server_prompt may already be this task's fusion/"
+                    "candidate intermediate state), to back-derive it "
+                    "from the candidate, to fall back to endpoint, or "
+                    "to silently re-initialize (fail-closed; resume "
+                    "from a CTRP checkpoint or re-run from task 0).")
+            # case B: the state-0 hook still lies ahead of the
+            # resumed run; it will set the anchor itself
+            print("[CTRP] resume: fresh state machine (the state-0 "
+                  "calibration point is still ahead; anchor will be "
+                  "set by the task-0 end hook)")
+            return
+        ckpt_mode = str(ctrp_state.get("mode", self._ctrp_mode))
+        if ckpt_mode != self._ctrp_mode:
+            raise RuntimeError(
+                f"CTRP resume mode mismatch: checkpoint ctrp_state "
+                f"mode {ckpt_mode!r} != current "
+                f"{self._ctrp_mode!r} (RESUME_MUST_MATCH)")
+        prev_anchor = ctrp_state.get("prev_deployed_prompt")
+        if prev_anchor is None and state0_hook_passed:
+            raise RuntimeError(
+                "CTRP_RESUME_ANCHOR_MISSING: the checkpoint's "
+                "ctrp_state lacks prev_deployed_prompt although "
+                "temporal transitions already started (task "
+                f"{checkpoint.get('server_task_id')}); the anchor "
+                "cannot be reconstructed (fail-closed).")
+        self._ctrp_prev_deployed = (
+            prev_anchor.clone() if prev_anchor is not None else None)
+        self._ctrp_prev_dominant_slot = ctrp_state.get("prev_dominant_slot")
+        self._ctrp_dominant_slot = ctrp_state.get("dominant_slot")
+        self._ctrp_selected_alpha = ctrp_state.get("selected_alpha")
+        self._ctrp_val_ce_by_alpha = ctrp_state.get("val_ce_by_alpha")
+        self._ctrp_candidate_prompt_hash = ctrp_state.get(
+            "candidate_prompt_hash")
+        self._ctrp_prev_deployed_prompt_hash = ctrp_state.get(
+            "prev_deployed_prompt_hash")
+        self._ctrp_deployed_prompt_hash = ctrp_state.get(
+            "deployed_prompt_hash")
+        self._ctrp_history = list(ctrp_state.get("history", []))
+        if (self._ctrp_alpha_grid is not None
+                and ctrp_state.get("alpha_grid") is not None
+                and [float(a) for a in self._ctrp_alpha_grid]
+                    != [float(a) for a in ctrp_state["alpha_grid"]]):
+            raise RuntimeError(
+                "CTRP resume alpha grid mismatch (RESUME_MUST_MATCH "
+                "should have caught this; refusing to continue)")
+        print(f"[CTRP] resume: ctrp_state restored "
+              f"(prev_dominant_slot="
+              f"{self._ctrp_prev_dominant_slot}, "
+              f"anchor={'present' if prev_anchor is not None else 'none'}, "
+              f"history={len(self._ctrp_history)})")
 
 
 

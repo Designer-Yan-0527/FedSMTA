@@ -36,6 +36,9 @@ import hashlib as _a5_hashlib
 
 from Models.classification_head import StandardizedChead as _A5StandardizedChead
 
+from Models.ctrp import (forward_with_prompt, row_ce, hash_prompt_module,
+                        hash_tensor, alpha_blend, stratified_split)
+
 # refit 固定配方（预注册；探针 probe_oracle_headroom.py 的训练日程，
 # 仅 hidden 取 512 以保持 heads 存储 = Chead schema，见 §23.6-2）
 A5_REFIT_HIDDEN = 512
@@ -132,6 +135,12 @@ class Client_DF(object):
         # 广播路径钩子需要 args（get_global_proto_and_head 不透传）
         self.args = args
 
+        # §33 CTRP v1：matched 协议开关（off = 精确 legacy 路径，无
+        # nested split、无 calibration）
+        self._ctrp_on = (
+            str(getattr(args, 'ctrp_mode', 'off') or 'off') != 'off')
+        self._ctrp_val_frac = float(getattr(args, 'ctrp_val_frac', 0.20))
+
 
     def init_local_model(self,model_name,args=None):
         if model_name=='Tail_Anchor':
@@ -158,6 +167,37 @@ class Client_DF(object):
 
         self.traindata = traindata
         print(len(traindata))
+
+        # ------------------------------------------------------------------
+        # §33 CTRP v1 matched protocol（GPT 冻结 §8）：四个 matched 臂
+        # (endpoint / fixed_alpha / ctrp_val / ctrp_train) 逐位共享同一
+        # split —— 从 inner 70% train 内做 deterministic class-stratified
+        # 80% core / 20% val 嵌套切分（≈ 56% core / 14% val / 30% test；
+        # test 与旧任务数据严禁参与 alpha selection）。seed =
+        # a5_stable_seed(seed, client, task)（批准的正式训练协议升级，
+        # 与 Probe-H 的 51/52 派生 seed 不同，后者仅用于 Test 8 replay）。
+        # off 臂不执行本块 = legacy 70/30 路径逐位一致。
+        # ------------------------------------------------------------------
+        if self._ctrp_on:
+            inner_idx = list(traindata.indices)
+            labels = self._ctrp_read_labels(trainset, inner_idx)
+            rng = np.random.default_rng(
+                a5_stable_seed(getattr(self.args, 'seed', 0),
+                               self.id, task_id))
+            flags = stratified_split(labels, self._ctrp_val_frac, rng)
+            core_idx = [inner_idx[i] for i in range(len(inner_idx))
+                        if not flags[i]]
+            val_idx = [inner_idx[i] for i in range(len(inner_idx))
+                       if flags[i]]
+            if not core_idx or not val_idx:
+                raise RuntimeError(
+                    f"CTRP matched split produced an empty side on client "
+                    f"{self.id} task {task_id} (core={len(core_idx)}, "
+                    f"val={len(val_idx)}); fail-closed")
+            # 索引 = trainset 绝对索引（与 "train"/"test" 同一坐标系）
+            self.data_split_indices[task_id]["ctrp_core"] = core_idx
+            self.data_split_indices[task_id]["ctrp_val"] = val_idx
+            self.traindata = Subset(trainset, core_idx)
 
 
     def update_data(self,round, args):
@@ -364,6 +404,300 @@ class Client_DF(object):
         random.setstate(snap["python"])
         np.random.set_state(snap["numpy"])
 
+    # ------------------------------------------------------------------
+    # §33 CTRP v1: client-side alpha evaluator (RUNCOMMANDS Sec.33,
+    # pre-registered 2026-11-03, GPT-frozen verdict Sec.4/5/6)
+    #
+    # The forward/CE/selector kernel is SHARED with Probe-H
+    # (Models/ctrp.py, same-evaluator-kernel + different
+    # row-selection-protocol, NOT a second evaluator). Per the frozen
+    # verdict Sec.4 the sweep's true baseline is the SERVER CANDIDATE
+    # prompt state: each client's full original state is saved, the
+    # server candidate prompt module is loaded (full state: prompt
+    # values + prompt_key + any other Global_Prompt state), the loaded
+    # state hash is asserted == the server's hash BEFORE any sweep step,
+    # only the dominant slot row is temporally calibrated per alpha,
+    # every other slot keeps the candidate value, and the client's
+    # original complete state is restored afterwards.
+    # ------------------------------------------------------------------
+
+    def _ctrp_read_labels(self, dataset, indices):
+        """Label-only pass over the inner-train rows (Probe-H pass-1
+        semantics; no forward). RNG-guarded: loader construction / worker
+        spawning must not perturb the training random stream."""
+        snap = self._a5_rng_snapshot()
+        try:
+            labels = []
+            loader = DataLoader(Subset(dataset, list(indices)),
+                                batch_size=64, shuffle=False,
+                                num_workers=getattr(self.args,
+                                                    'num_workers', 0))
+            for _, tgt in loader:
+                labels.extend(int(v) for v in tgt.numpy())
+        finally:
+            self._a5_rng_restore(snap)
+        if len(labels) != len(indices):
+            raise RuntimeError(
+                f"client {self.id}: label pass returned {len(labels)} "
+                f"labels for {len(indices)} rows (fail-closed)")
+        return labels
+
+    def _ctrp_with_candidate(self, server_prompt_module):
+        """Save the client's complete prompt-module state and load the
+        server candidate (full module state, load_prompts deepcopies).
+        Returns (orig_prompt_module, server_state_hash); the caller
+        restores orig_prompt_module in its finally block and asserts
+        hash_prompt_module(vit.prompt) == server_state_hash before any
+        sweep step (frozen Sec.4 assertion)."""
+        server_hash = hash_prompt_module(server_prompt_module)
+        orig_prompt = self.vit.prompt
+        self.vit.load_prompts(server_prompt_module)
+        loaded_hash = hash_prompt_module(self.vit.prompt)
+        if loaded_hash != server_hash:
+            raise RuntimeError(
+                "CTRP: loaded candidate prompt hash "
+                f"{loaded_hash} != server candidate prompt hash "
+                f"{server_hash} on client {self.id} (frozen Sec.4 "
+                "assertion; fail-closed)")
+        return orig_prompt, server_hash
+
+    def _ctrp_route_slots(self, server_prompt_module, rows_key='ctrp_val',
+                          rows=None, batch_size=8):
+        """Dominant-slot discovery pass: natural forward over the
+        current-task validation rows under the SERVER CANDIDATE prompt
+        state; collects the FORWARD-ACTUAL Global_Prompt route slot per
+        batch (prompt_idx -- deployment route, NOT preference
+        statistics). Asserts the route is constant within each batch
+        (batchwise top-1 routing, top_k=1). Never hardcoded to a dataset
+        slot. Deterministic: fixed row order, shuffle=False, no_grad,
+        full state save/restore + RNG guard."""
+        if rows is None:
+            split = self.data_split_indices.get(self.task_id, {})
+            if rows_key not in split or not split[rows_key]:
+                raise RuntimeError(
+                    f"client {self.id}: task {self.task_id} has no "
+                    f"recorded {rows_key} rows (matched split missing; "
+                    "fail-closed)")
+            rows = list(split[rows_key])
+        t = self.task_id
+        snap = self._a5_rng_snapshot()
+        flags = (self.vit.training, self.model.training,
+                 self.original_model.training
+                 if self.original_model is not None else None)
+        orig_prompt = self.vit.prompt
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            self.model.eval()
+            self._ctrp_with_candidate(server_prompt_module)
+            slots = []
+            loader = DataLoader(Subset(self.train_data[t], list(rows)),
+                               batch_size=batch_size, shuffle=False,
+                               num_workers=getattr(self.args,
+                                                   'num_workers', 0))
+            for inp, tgt in loader:
+                inp = inp.to(self.device, non_blocking=True)
+                with torch.no_grad():
+                    q = self.original_model(inp)["pre_logits"]
+                    out = self.vit(inp, task_id=t, cls_features=q,
+                                   train=True)
+                idx = out["prompt_idx"]
+                if idx is None or idx.dim() != 2 or idx.shape[1] != 1:
+                    raise RuntimeError(
+                        "CTRP: Global_Prompt returned no batchwise "
+                        f"top-1 prompt_idx on client {self.id} (got "
+                        f"{None if idx is None else tuple(idx.shape)}); "
+                        "route discovery needs the deployment route "
+                        "(fail-closed)")
+                if not bool(torch.all(idx == idx[0, 0])):
+                    raise RuntimeError(
+                        "CTRP: prompt_idx is not constant within a batch "
+                        f"on client {self.id} (batchwise top-1 top_k=1 "
+                        "premise violated; fail-closed)")
+                slots.append(int(idx[0, 0].item()))
+            return slots
+        finally:
+            self.vit.prompt = orig_prompt
+            if flags[0] is not None:
+                self.vit.train(flags[0])
+            self.model.train(flags[1])
+            if flags[2] is not None:
+                self.original_model.train(flags[2])
+            self._a5_rng_restore(snap)
+
+    def _ctrp_alpha_sweep(self, server_prompt_module, anchor_values,
+                          dominant_slot, alpha_grid, rows=None,
+                          rows_key='ctrp_val', batch_size=8,
+                          record_row_ce=False):
+        """The alpha-conditioned sweep on ONE client (shared kernel with
+        Probe-H, Models/ctrp.py). Per the frozen Sec.4:
+
+          * save the client's complete original state first, then load
+            the full SERVER CANDIDATE prompt module state (values +
+            prompt_key + all Global_Prompt state); the loaded hash is
+            asserted == server candidate hash BEFORE any sweep step;
+          * every alpha evaluates the server candidate state with ONLY
+            the dominant prompt-value row temporally calibrated,
+            P_s*(a) = (1-a) P^deploy_{t-1,s*} + a P^cand_{t,s*} (Probe-H
+            op order, bitwise the validated kernel); every other slot
+            keeps the candidate value P^cand_{t,j};
+          * alpha == 1 IS the natural forward of the loaded candidate
+            (Probe-H semantics); alpha != 1 arms go through the shim
+            intervention kernel, which bypasses routing -- CTRP never
+            touches prompt_key, so route(a=0) == route(a=1) by
+            construction and the key-hash invariance is asserted below;
+          * head = the client's CURRENT-TASK head snapshot
+            (client.heads[task]), eval mode (Chead dropout OFF);
+            CE = logsumexp(lg,1) - lg.gather(1,y_local) on class-masked
+            fp32 logits, y_local = searchsorted(mask_pos, y) --
+            all Probe-H evaluator semantics;
+          * rows in batches routed to a non-dominant slot (<= 1% premise
+            tail) keep the candidate value and are NOT scored
+            (Probe-H row protocol); the caller aggregates with
+            sample-weighted pooled CE.
+
+        All temporary state (prompt module, train/eval flags, RNG) is
+        restored in finally. record_row_ce=True keeps per-row CE + row
+        alignment meta (Test-8 replay helper layer only)."""
+        t = self.task_id
+        mask = sorted(int(x) for x in self.class_mask[t])
+        mpos = torch.tensor(mask, dtype=torch.long, device=self.device)
+        if rows is None:
+            split = self.data_split_indices.get(t, {})
+            if rows_key not in split or not split[rows_key]:
+                raise RuntimeError(
+                    f"client {self.id}: task {t} has no recorded "
+                    f"{rows_key} rows (matched split missing; "
+                    "fail-closed)")
+            rows = list(split[rows_key])
+        if 1.0 not in [float(a) for a in alpha_grid]:
+            raise RuntimeError(
+                "CTRP: alpha grid must contain the 1.0 natural-arm "
+                "position (Probe-H semantics; fail-closed)")
+        pos_one = [float(a) for a in alpha_grid].index(1.0)
+
+        snap = self._a5_rng_snapshot()
+        flags = (self.vit.training, self.model.training,
+                 self.original_model.training
+                 if self.original_model is not None else None)
+        orig_prompt = self.vit.prompt
+        orig_head = self.model.head
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            # Probe-H mode chain: eval() must come AFTER load_head.
+            # load_head deepcopies the STORED head, which carries the
+            # training-time training=True flags (heads are snapshotted
+            # mid-train via deepcopy); eval()-then-load would silently
+            # run Chead Dropout(p=0.5) in train mode and make the sweep
+            # stochastic (caught by the Test-8 replay gate: row-CE
+            # max|diff| 4.46 with dropout vs 0.0 when aligned).
+            self.model.load_head(self.heads[t])
+            self.model.eval()   # Chead Dropout OFF (Probe-H, pre-registered)
+            self._ctrp_with_candidate(server_prompt_module)
+            # key hash of the LOADED candidate; the whole sweep must not
+            # move it (route(alpha=0) == route(alpha=1) by construction)
+            key_hash_before = hash_tensor(self.vit.prompt.prompt_key)
+
+            cand_values = self.vit.prompt.prompt.detach()
+            cand_row = cand_values[dominant_slot].detach()
+            prev_row = anchor_values.to(cand_row.device)[dominant_slot]
+
+            ce_sum = np.zeros(len(alpha_grid), dtype=np.float64)
+            n_rows = 0
+            n_dropped = 0
+            n_batches = 0
+            batch_slots = []
+            row_ce_rows = [] if record_row_ce else None
+            row_meta = [] if record_row_ce else None
+
+            loader = DataLoader(Subset(self.train_data[t], list(rows)),
+                               batch_size=batch_size, shuffle=False,
+                               num_workers=getattr(self.args,
+                                                   'num_workers', 0))
+            for inp, tgt in loader:
+                inp = inp.to(self.device, non_blocking=True)
+                tgt = tgt.long()
+                with torch.no_grad():
+                    q = self.original_model(inp)["pre_logits"]
+                    out = self.vit(inp, task_id=t, cls_features=q,
+                                   train=True)
+                idx = out["prompt_idx"]
+                if idx is None or idx.dim() != 2 or idx.shape[1] != 1:
+                    raise RuntimeError(
+                        "CTRP: Global_Prompt returned no batchwise top-1 "
+                        f"prompt_idx on client {self.id} (fail-closed)")
+                if not bool(torch.all(idx == idx[0, 0])):
+                    raise RuntimeError(
+                        "CTRP: prompt_idx not constant within a batch "
+                        f"on client {self.id} (fail-closed)")
+                slot = int(idx[0, 0].item())
+                n_batches += 1
+                batch_slots.append(slot)
+                bsz = int(tgt.shape[0])
+                if slot != dominant_slot:
+                    # <= 1% premise tail: keeps the candidate value,
+                    # not calibrated, not scored (Probe-H row protocol)
+                    n_dropped += bsz
+                    continue
+                y_local = torch.searchsorted(mpos, tgt.to(self.device))
+                if int(y_local.max().item()) >= len(mask) or \
+                        bool((y_local < 0).any()):
+                    raise RuntimeError(
+                        "CTRP: label outside the current-task class mask "
+                        f"on client {self.id} (fail-closed)")
+                with torch.no_grad():
+                    lg_nat = (self.model(out["feat"].float(), None)[0]
+                              .index_select(1, mpos).float())
+                ce_rows = np.zeros((bsz, len(alpha_grid)),
+                                   dtype=np.float32)
+                ce_rows[:, pos_one] = row_ce(lg_nat, y_local) \
+                    .detach().cpu().numpy()
+                for a_pos, a in enumerate(alpha_grid):
+                    if a_pos == pos_one:
+                        continue
+                    tok = alpha_blend(prev_row, cand_row, float(a))
+                    with torch.no_grad():
+                        z = forward_with_prompt(
+                            self.vit, t, inp, q, tok)
+                        lg = (self.model(z, None)[0]
+                              .index_select(1, mpos).float())
+                        ce_rows[:, a_pos] = row_ce(lg, y_local) \
+                            .detach().cpu().numpy()
+                ce_sum += ce_rows.sum(axis=0, dtype=np.float64)
+                n_rows += bsz
+                if record_row_ce:
+                    row_ce_rows.append(ce_rows)
+                    row_meta.extend(
+                        {"slot": slot,
+                         "y_local": int(v)}
+                        for v in y_local.detach().cpu().numpy())
+
+            if hash_tensor(self.vit.prompt.prompt_key) != key_hash_before:
+                raise RuntimeError(
+                    "CTRP: prompt_key moved during the alpha sweep "
+                    "(route(alpha=0)==route(alpha=1) violated; "
+                    "fail-closed)")
+            return {
+                "ce_sum_by_alpha": ce_sum,
+                "n_rows": int(n_rows),
+                "n_dropped": int(n_dropped),
+                "n_batches": int(n_batches),
+                "batch_slots": batch_slots,
+                "row_ce": (np.concatenate(row_ce_rows, axis=0)
+                           if record_row_ce else None),
+                "row_meta": row_meta,
+            }
+        finally:
+            self.vit.prompt = orig_prompt
+            self.model.head = orig_head
+            if flags[0] is not None:
+                self.vit.train(flags[0])
+            self.model.train(flags[1])
+            if flags[2] is not None:
+                self.original_model.train(flags[2])
+            self._a5_rng_restore(snap)
+
     def _a5_collect_head_inputs(self, task_id, feat_only=False):
         """refit 特征缓存的只读收集：task 的 train split、当前接口状态
         （vit 用当前任务 prompt = native evaluate 的 task_id=self.task_id
@@ -380,8 +714,7 @@ class Client_DF(object):
                 "tasks must have data_split_indices) -- refusing to "
                 "refit an unseen task (fail-closed)"
                 % (self.id, task_id))
-        dataset = Subset(self.train_data[task_id],
-                        list(self.data_split_indices[task_id]["train"]))
+        dataset = Subset(self.train_data[task_id], self._ctrp_train_indices(task_id))
         loader = DataLoader(dataset, batch_size=16, num_workers=0,
                             shuffle=False)
         xs, ys = [], []
@@ -902,13 +1235,28 @@ class Client_DF(object):
         for task_id in sorted(self.data_split_indices.keys()):
             base_dataset = self.train_data[task_id]
             split = self.data_split_indices[task_id]
-            train_subset = Subset(base_dataset, list(split["train"]))
+            train_subset = Subset(base_dataset, self._ctrp_train_indices(task_id))
             test_subset = Subset(base_dataset, list(split["test"]))
             self.test_loader.append(test_subset)
             if task_id == self.task_id:
                 self.traindata = train_subset
                 self.train_dataset = base_dataset
         print(f'Client {self.id}: restored {len(self.test_loader)} test loader(s) from checkpoint')
+
+    def _ctrp_train_indices(self, task_id):
+        """§33 CTRP v1: under the matched protocol the training budget is
+        the 80% core split of the inner train (the 20% val side NEVER
+        feeds the refit cache -- otherwise the alpha-selection rows leak
+        into the head); off = the full inner-train (legacy) indices."""
+        split = self.data_split_indices[task_id]
+        if self._ctrp_on:
+            if "ctrp_core" not in split or not split["ctrp_core"]:
+                raise RuntimeError(
+                    "client %d: task %d is missing the matched ctrp_core "
+                    "split (CTRP resume requires a CTRP checkpoint; "
+                    "fail-closed)" % (self.id, task_id))
+            return list(split["ctrp_core"])
+        return list(split["train"])
 
     def evaluate_cosin_similarity(self,task=0,nb_classes=None):
         test_data = self.test_loader[task]
