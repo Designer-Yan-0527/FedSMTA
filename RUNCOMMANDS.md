@@ -1540,16 +1540,20 @@ python main.py datasets_delay --data_name ImageNet-R --data-path ./local_dataset
 ### 29.3 命令（GPT 审核通过后执行；与 M2'' 训练无 GPU 抢占——特征提取为轻前向，建议错峰）
 
 ```bash
-# cifar 主判读场（保留 run 的 5 个边界 checkpoint；特征已缓存则秒级复用）
+# cifar 主判读场（保留 run 的 5 个边界 checkpoint）
+# 注意 --features_dir 必须指向独立新目录：缓存文件名不含 run 指纹，
+# 与其他 run 的旧缓存同目录会触发 fail-closed 拒绝（2026-11-03 实跑踩坑）
 python diagnostics/probe_dht_feasibility.py \
     --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
     --data_path ./local_datasets --device cuda \
+    --features_dir diagnostics_output/dht_cifar \
     --out_csv diagnostics_output/dht_cifar.csv
 
 # INR 复核（同划分保留 run）
 python diagnostics/probe_dht_feasibility.py \
     --run_dir output/ImageNet-R/fedta/inr_a5v2_M2_feat_p40/seed_42 \
     --data_path ./local_datasets --device cuda \
+    --features_dir diagnostics_output/dht_inr \
     --out_csv diagnostics_output/dht_inr.csv
 ```
 
