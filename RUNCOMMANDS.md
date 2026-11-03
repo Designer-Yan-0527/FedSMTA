@@ -2153,6 +2153,47 @@ auto 槽仅在 state 0 发现；后续状态 batch-majority 模式槽 ≠ 发现
     --out_json diagnostics_output/stepcalib_inr_seed42.summary.json
 ```
 
-### 32.9.7 / 32.9.8 工程记录 / 正式判决
+### 32.9.7 工程记录（INR 正式跑 2026-11-03）
 
-（预注册占位：跑完后按惯例补记；INR 复核通过 → CTRP §33 立项前置条件全部满足，须外审后进入 §33。）
+- **执行**：用户终端跑 §32.9.6 命令原样，一次通过，零 bug、零 fail-closed 触发。
+- **auto 槽发现是必要的**：INR 的主导槽是 **slot 53**（≠ CIFAR 的 slot 6）——外审"不要硬编码 slot 6"的要求被数据直接证实；5 状态 batch-majority 模式槽恒为 53、非主导 batch frac = 0.0、prompt 值跨客户端单值、heads 跨状态恒定，H0 全过。
+- **覆盖**：选择信号正常，old 行覆盖 1438/3001/4407/5793 = 各过渡全部 old 行（t1–t4，INR 行规模约为 CIFAR 一半以下）。
+- **probe-G 对账**：按 §32.9.4-4 预注册自跳过（CSV 无源，informative note 落盘）。
+- **展示性小瑕疵（不判级、不改判）**：summary 的 per-state 记录未回显 `slot_effective`/`selection_rows`/`selection_drop_frac`（分析层展示键，非判决输入——premise 由模式槽恒定性 + auto 解析 + 缓存指纹把关）；下版可补。
+- 产物：`stepcalib_inr_seed42.csv` / `_rows.csv` / `.summary.json` + 缓存目录（逐状态落盘）。
+
+### 32.9.8 正式判决（2026-11-03，判级：探针级诊断，单 run 单种子，产判据不产数字）
+
+**`OVERSHOOT_EXPLOITABLE_CURRENT_ONLY`（INR replication PASS）**——CTRP §33 立项前置条件（跨数据集机制复核）**全部满足，待最终外审**。
+
+聚合门（primary = λ̂_val-current，`--gate_mode all` 预注册判决树）：
+
+| 读数 | 值 |
+|---|---|
+| G_old（等权均值） | **+0.79pp** |
+| 层次 paired batch-bootstrap CI95 | **[+0.45, +1.13]**（下界 > 0） |
+| mean cur gain（H2 非劣效） | **+0.32pp** ≥ 0 |
+| interior λ̂ | **4/4** 过渡 |
+| oracle 内点占优（非法对照） | 4/4 |
+| 次级（train selector，报告不作门） | **同判 PASS**：+0.53pp CI [+0.24, +0.80]，mean_cur +0.48pp |
+
+逐过渡全表（H3，全部报告、不挑边界）：
+
+| 过渡 | λ̂_val | old gain | 单过渡 CI95 | cur gain | λ\* oracle |
+|---|---:|---:|---|---:|---:|
+| 0→1 | 0.80 | +0.35pp | [−0.49, +1.24]（跨零） | +0.00pp | 0.75 |
+| 1→2 | 0.65 | **+1.67pp** | [+0.84, +2.54] | **+1.49pp** | 0.80 |
+| 2→3 | 0.90 | +0.25pp | [−0.11, +0.61]（跨零） | +0.15pp | 0.90 |
+| 3→4 | 0.80 | **+0.89pp** | [+0.38, +1.40] | −0.36pp | 0.95 |
+
+诚实读数（供外审）：INR 效应弱于 CIFAR（+0.79 vs +1.165pp），t1/t3 单过渡 CI 跨零——**按预注册设计只有层次聚合 CI 有判决权**（这正是全过渡聚合门的意义：不挑边界、也不让单一边界一票否决）；t4 有 −0.36pp 的当前任务小代价但 H2 聚合非劣效通过；state-adaptive 再次成立（λ̂ = 0.80/0.65/0.90/0.80 互异）；G1 annex 首次落盘 INR 逐过渡 prompt 更新度量（rel_norm 0.57–0.68 / cosine 0.73–0.83）。
+
+**累计判决标签更新（待外审确认）**：`CONTENT-CAUSAL / DIRECTION-MECHANISM-UNRESOLVED / OVERSHOOT-HYPOTHESIS-PROMOTED` → **`OVERSHOOT-CONFIRMED-CROSS-DATASET / CTRP-SEC33-READY (pending external review)`**。
+
+**GPT 三句式封档记录（frozen for external review）**：
+
+> **The pre-registered all-transitions aggregate gate PASSES on ImageNet-R: across all 4 eligible adjacent transitions the val-current selectors (zero old-task information) pick interior steps with equal-weighted mean old-task gain +0.79pp (hierarchical paired batch-bootstrap 95% CI [+0.45, +1.13], lower bound > 0) and mean current-task gain +0.32pp, and the independent train-current selector concurs (+0.53pp CI [+0.24, +0.80], mean_cur +0.48pp).**
+>
+> **The effect is weaker but structurally identical to CIFAR-100: per-transition old gains are +0.35/+1.67/+0.25/+0.89pp with individual CIs crossing zero at t1/t3 (by pre-registration only the hierarchical aggregate CI decides, which is exactly why the no-cherry-picking all-transitions design was frozen), the optimal step is again state-adaptive (λ̂ = 0.80/0.65/0.90/0.80), and the auto-discovered monopoly slot is 53 (≠ CIFAR's slot 6) — the no-hardcoding protocol was not just prudent but necessary.**
+>
+> **The verdict is OVERSHOOT_EXPLOITABLE_CURRENT_ONLY (INR replication): the temporal prompt-update overshoot replicates cross-dataset as a deployment-repairable, current-task-signal-locatable step-calibration defect, CTRP's Sec.33 candidacy preconditions (INR mechanism replication) are now all satisfied pending final external review, and no training arm is pre-registered by this probe.**
