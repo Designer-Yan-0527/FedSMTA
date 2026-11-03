@@ -1712,3 +1712,60 @@ python diagnostics/probe_routing_flip.py \
 5. **F5 净收益门（A2-R 先例约束）**：A2-R 死因 = 常开软混合本身 −1.9pp ⇒ flip 子集 oracle 赢不能读作净赢。预注册：可部署 transition gate 必须 **disagreement-gated**（stable batch 上 G_stable ≡ 0 by design，§31 训练臂的证明义务）；探针显式报告 **G_net = P(flip)·G_flip**（部署级期望池）。G_flip 过 0.25pp 但 G_net 不过同一工程底线 → verdict = `PASS_NET_REVIEW`（转外审，不直接立项）。
 
 **判读优先阶梯（审核冻结，替代原线性树的第一读序）**：Route exists? → Route changes temporally? → Route explains drift? → Route owns accuracy pool?——**前两步死则不救 DTCPR，直接读 2×2 的 content channel**。F1 判死措辞升级为**拒绝自身机制假说**（hypothesis rejected，非"探针失败"）：若 5 状态 FlipRate≈0 且 keyH≈0，则写 "the discrete temporal route-switching hypothesis is rejected"，DTCPR 当天判死不写臂；2×2 同时回答 "route fixed + feature still drifts"——若 Δ_route≈0 而 Δ_content≫0，DHT 的非仿射漂移获得全新且更扎实的解释：**非仿射部署漂移由 prompt 内容演化主导，而非离散槽位切换**（探针推翻设计假说后找到的新机制，论文素材）。
+
+### 30.8 正式判决（2026-11-03，5 状态全量，probe v3 `routingflip-v3`，`--native_draws 4`）
+
+按 §30.6 cifar 主判读场命令执行（保留 run `cifar_a5v2_M2_feat_full/seed_42`，5 边界 checkpoint 全量提取；4 过渡合计 3938 batch、14992 行/末状态）。产物：`diagnostics_output/routeflip_cifar{.csv,_rows.csv,.summary.json}`。判读依据 = §30.4 判决树 + §30.7 审核冻结阶梯，无任何事后放宽。
+
+**读数一：F1 路由状态（5 状态全量，单槽垄断成立）**
+
+| state (ckpt) | keyH (bits) | 垄断份额 | 垄断槽 | key 池跨 client 一致 |
+|---|---|---|---|---|
+| 0 (task_00_end) | 0.0079 | 99.94% | slot 6 | 一致 |
+| 1 (task_01_end) | 0.0058 | 99.95% | slot 6 | 一致 |
+| 2 (task_02_end) | 0.0074 | 99.95% | slot 6 | 一致 |
+| 3 (task_03_end) | 0.0061 | 99.96% | slot 6 | 一致 |
+| 4 (task_04_end) | 0.0060 | 99.96% | slot 6 | 一致 |
+
+keyH 全状态 0.0058–0.0079 bits，与 §20 单槽垄断先验（≈0.004 bits）量级一致；垄断槽 slot 6 跨 5 状态恒定。4 过渡 batch flip rate 全 = 0.0（0/417、0/814、0/1158、0/1549；门 0.05），多数槽轮换事件 = 0。
+
+**读数二：2×2 因子分解（准确率计数池，恒等式精确成立）**
+
+| 过渡 | 天然臂 Acc t−1→t（探针口径，%） | drift | route | content | interaction |
+|---|---|---|---|---|---|
+| 0→1 | 96.15 → 96.63 | −0.481 | 0.000 | −0.481 | 0.000 |
+| 1→2 | 96.65 → 96.22 | +0.432 | 0.000 | +0.432 | 0.000 |
+| 2→3 | 95.12 → 92.47 | +2.646 | 0.000 | +2.646 | 0.000 |
+| 3→4 | 93.03 → 92.67 | +0.365 | 0.000 | +0.365 | 0.000 |
+| **均值** | — | **+0.74** | **0.00** | **+0.74** | **0.00** |
+
+零翻转下 route_pool≡0、content=drift、interaction≡0 是恒等式的退化分支（R_t ≡ R_{t−1} 逐 batch 成立 ⇒ 向量 Δr=0），非测量捷径；loss Shapley/特征幅值按预注册只定义在翻转行（臂 B/C 仅在翻转 batch 前向），零翻转 ⇒ 空集且结构上 φ_r≡0、φ_p=L_D−L_A 退化恒等成立。
+
+**门判定**：
+- **F0**：A2-R 先例维持（F1 显式判死门 + F3b ≥1pp 不放宽生效）。
+- **F1 DEAD**：flip rates [0,0,0,0] + 零轮换 + keyH≈垄断先验——"Route exists? → Route changes temporally?" 两步全死。
+- **F2 N/A**（无翻转对照列，池化 batch bootstrap 无 flip 臂）。
+- **F3a**：flip 臂 NaN；stable 侧逐行 CE 变化均值 [−0.018, +0.006, +0.083, +0.014] nats（2→3 过渡 CE 抬升最重，与 drift 同向）——仅佐证通道，无门作用。
+- **F3b FAIL**：route_pool 逐过渡全 0.0pp，均值 0.0pp vs 门 1.0pp。
+- **F4 N/A**：3938 batch 无一 flip，point-biserial 无定义——前兆问题随 F1 死而消失。
+- **F5 N/A**：oracle 人群 = 翻转行，pooled=0；Oracle-1 complementary=False、Oracle-2b 空曲线。
+- heads 跨状态哈希漂移事件 = 0（F3 同头前提成立）；key 池广播后跨 client 全一致（5/5 状态）。
+
+**审核锁死点闭合核验（§30.7 四项 + F5 净收益门，全部按预注册执行）**：
+1. **batch exposure 单位**：F1 按 batch flip rate（0/3938）；F2/F3a 的 paired batch bootstrap 因无对照臂自动 N/A——统计单位修订正确落实且无损判决。
+2. **组成敏感性 annex**：5 状态 × 75 个 (client, task) 组、circular shift 1..B−1 全部备选固定分区下多数槽改变 = **0**——"routes composition-insensitive；the batch majority is a stable population statistic on this run"（垄断使 batchwise 多数票退化为总体统计量，非 batch 伪象）。
+3. **标量归因**：准确率计数池主归因完整且 interaction ≡ 0.000；向量幅值未做任何百分比归因。
+4. **native gap 定位（F3b verdict 前置条件）**：75/75 键配 4 抽样——native diff max 0.84pp / mean 0.02pp；draw spread mean 1.06pp / max 3.06pp（native Dropout 抽样噪声主导，与 Track E 定性一致）；eval 抬升 mean +0.41pp；残差 73/75 严格落在 draw spread 内、其余 2 键超出量小于报告精度 0.01pp，**max_unexplained ≈ 0.0pp**（冒烟期 state0/client2/task0 的 0.45pp 疑点被 4 抽样的 spread 估计完全闭合）。结论："the gap is located, not a semantics divergence"——锁死点 4 解除，本 F3b verdict 作数。
+5. **F5 净收益门**：无翻转人群 ⇒ G_flip/G_net 均为空集，不适用；A2-R 旧死法（常开软混合 −1.9pp）无需引入。
+
+**判决（预注册冻结措辞，§30.4/30.7）**：
+
+> **HYPOTHESIS_REJECTED: the discrete temporal route-switching hypothesis is REJECTED**（flip rates [0,0,0,0]；零多数槽轮换；keyH per state [0.0079, 0.0058, 0.0074, 0.0061, 0.0060] bits）。这是**拒绝我们自身的机制假说，不是探针失败**。
+
+DTCPR **判死，不写训练臂**：fast/slow 双路由在部署路径上将恒一致、consensus gate 永不激活（结构 inert）。按最终裁定（2026-11-03），不再设计第三个结构候选。INR 复核按 §30.6 预注册豁免（判死不需双确认）。判级声明不变：单 run 单种子，产判据不产数字。
+
+**机制注记（content channel 读法，审核阶梯指定路径）**：
+- "Route fixed + features still drift" 实测成立：route 通道 0.00pp / 全部 batch 零变化，而漂移池 0.74pp **全部**由 contents 通道拥有（interaction ≡ 0）。
+- **最大单次漂移（2→3 过渡 +2.646pp，95.12→92.47）100% content-owned**——本 run 最重的一次遗忘事件与路由零相关。
+- 新机制叙事（**记录在案，不自动立项**，§30.4 冻结）：非仿射部署漂移由 **prompt 内容演化**主导，而非离散槽位切换——DHT 探针（§29）观察到的非仿射漂移由此获得更扎实的解释。
+- 方向指向（非承诺）：representation-side 干预若未来立项，目标应为 **prompt 值的时序内容稳定性**（EMA/正则/锚定一类），而非任何路由结构；路由侧结构创新在本 run 部署路径上结构性 inert。§31 训练臂预注册按 F5 未过**不触发**。
