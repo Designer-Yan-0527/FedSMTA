@@ -89,6 +89,10 @@ def parse_args():
                    help="ridge strength on the residual map dA; effective "
                         "lambda = lam * trace(Zn^T Zn)/d (scale-invariant)")
     p.add_argument("--seed_base", default=20261103, type=int)
+    p.add_argument("--rank", default=16, type=int,
+                   help="Probe-E low-rank / dynamic bridge rank")
+    p.add_argument("--dyn_epochs", default=200, type=int,
+                   help="full-batch Adam steps for the dynamic bridge")
     p.add_argument("--out_csv", required=True)
     p.add_argument("--feas_ratio_gate", default=0.8, type=float)
     p.add_argument("--gate_green", default=1.0, type=float)
@@ -132,6 +136,61 @@ def spectral_stats(A, z_new, z_old, ranks=(1, 4, 8, 16, 32, 64)):
     cum = {int(r): round(float(energy[:r].sum() / energy.sum()), 4)
            for r in ranks if r <= len(s)}
     return cum
+
+
+def fit_transport_lowrank(z_old, z_new, lam, rank):
+    """Rank-r truncation of the full affine solution (optimal Frobenius
+    approximation) -- Probe-E 'Low-rank Linear' arm."""
+    A, b = fit_transport(z_old, z_new, lam)
+    dA = A - np.eye(A.shape[0], dtype=np.float32)
+    u, s, vt = np.linalg.svd(dA, full_matrices=False)
+    r = min(rank, len(s))
+    A_lr = (np.eye(A.shape[0], dtype=np.float32)
+            + (u[:, :r] * s[:r]) @ vt[:r])
+    return A_lr, b
+
+
+def fit_transport_dynamic(z_old, z_new, lam, rank, seed, epochs=200,
+                          lr=1e-3):
+    """Probe-E 'Low-rank Dynamic' arm: B(z) = z + U (g(z) odot V^T z),
+    g(z) = sigmoid(M V^T z + a).  Sample-adaptive, NOT foldable into W1
+    (the DS-TBB candidate). Warm-started from the low-rank SVD of the
+    full affine solution (U0 V0^T = trunc(dA), M0=0, a0=0, b0 ridge);
+    full-batch Adam on the probing pairs; deterministic under seed.
+    Returns a numpy->numpy callable."""
+    A, b = fit_transport(z_old, z_new, lam)
+    dA = A - np.eye(A.shape[0], dtype=np.float32)
+    u, s, vt = np.linalg.svd(dA, full_matrices=False)
+    r = min(rank, len(s))
+    U0 = torch.tensor((u[:, :r] * s[:r]), dtype=torch.float32)
+    V0 = torch.tensor(vt[:r].T, dtype=torch.float32)
+    M0 = torch.zeros(r, r, dtype=torch.float32)
+    a0 = torch.zeros(r, dtype=torch.float32)
+    b0 = torch.tensor(b, dtype=torch.float32)
+    zn = torch.tensor(np.asarray(z_new, dtype=np.float32))
+    zo = torch.tensor(np.asarray(z_old, dtype=np.float32))
+    torch.manual_seed(seed)
+    params = [U0.requires_grad_(True), V0.requires_grad_(True),
+              M0.requires_grad_(True), a0.requires_grad_(True),
+              b0.requires_grad_(True)]
+    opt = torch.optim.Adam(params, lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad()
+        q = zn @ V0
+        g = torch.sigmoid(q @ M0.T + a0)
+        pred = zn + (g * q) @ U0.T + b0
+        loss = torch.nn.functional.mse_loss(pred, zo)
+        loss.backward()
+        opt.step()
+
+    @torch.no_grad()
+    def apply(z):
+        zt = torch.tensor(np.asarray(z, dtype=np.float32))
+        q = zt @ V0
+        g = torch.sigmoid(q @ M0.T + a0)
+        return (zt + (g * q) @ U0.T + b0).numpy()
+
+    return apply
 
 
 def compose(ts):
@@ -289,6 +348,17 @@ def main():
                 A_d, b_d = fit_transport(zj2[cur_r], zr[cur_r], args.lam)
                 acc_dir = _acc(head_predict(
                     H, apply_transport(z_te, A_d, b_d), allowed), y_te)
+                # Probe-E: low-rank linear + dynamic, same direct-fit
+                # distribution as acc_dir (task-r train rows, no old data)
+                A_lr, b_lr = fit_transport_lowrank(zj2[cur_r], zr[cur_r],
+                                                   args.lam, args.rank)
+                acc_lr = _acc(head_predict(
+                    H, apply_transport(z_te, A_lr, b_lr), allowed), y_te)
+                dyn = fit_transport_dynamic(
+                    zj2[cur_r], zr[cur_r], args.lam, args.rank,
+                    seed=stable_seed(args.seed_base, "dyn", cid, j, r),
+                    epochs=args.dyn_epochs)
+                acc_dyn = _acc(head_predict(H, dyn(z_te), allowed), y_te)
                 acc_refit = float("nan")
                 if not args.no_pool_ceiling:
                     H2 = fit_head(zr[trj], ref["labels"][trj], allowed,
@@ -305,9 +375,13 @@ def main():
                     "acc_stale": round(acc_stale, 2),
                     "acc_rec": round(acc_rec, 2),
                     "acc_dir": round(acc_dir, 2),
+                    "acc_lr": round(acc_lr, 2),
+                    "acc_dyn": round(acc_dyn, 2),
                     "acc_refit": round(acc_refit, 2),
                     "d_rec": round(acc_rec - acc_stale, 2),
                     "d_dir": round(acc_dir - acc_stale, 2),
+                    "d_lr": round(acc_lr - acc_stale, 2),
+                    "d_dyn": round(acc_dyn - acc_stale, 2),
                     "d_refit": round(acc_refit - acc_stale, 2),
                 })
 
@@ -325,6 +399,9 @@ def main():
 
     sig_rec = float(np.mean([r["d_rec"] for r in aging])) if aging else float("nan")
     sig_refit = float(np.mean([r["d_refit"] for r in aging])) if aging else float("nan")
+    sig_dir = float(np.mean([r["d_dir"] for r in aging])) if aging else float("nan")
+    sig_lr = float(np.mean([r["d_lr"] for r in aging])) if aging else float("nan")
+    sig_dyn = float(np.mean([r["d_dyn"] for r in aging])) if aging else float("nan")
     held = [f["resid_ratio_heldout"] for f in feas_rows
             if f["resid_ratio_heldout"] is not None]
     feas_med = float(np.median(held)) if held else float("nan")
@@ -360,6 +437,16 @@ def main():
                       "feasibility_pass": bool(feas_ok),
                       "signature_d_rec": round(sig_rec, 2),
                       "pool_ceiling_d_refit": round(sig_refit, 2),
+                      "probe_E": {"d_dir_full_affine": round(sig_dir, 2),
+                                  "d_lr_lowrank": round(sig_lr, 2),
+                                  "d_dyn_dynamic": round(sig_dyn, 2),
+                                  "rank": args.rank,
+                                  "note": "direct-fit ladder at final "
+                                          "boundary; dynamic > linear by "
+                                          "a clear margin motivates the "
+                                          "DS-TBB arm, dynamic ~ linear "
+                                          "kills it (capacity without "
+                                          "mechanism)"},
                       "transport_efficiency": (round(sig_rec / sig_refit, 3)
                                                if sig_refit else None),
                       "green_pp": args.gate_green, "red_pp": args.gate_red,
@@ -380,6 +467,10 @@ def main():
           f"{sig_refit:+.2f}pp -> {verdict}")
     print(f"[dht-probe] corr(gain, age) = {corr_age:.3f}; "
           f"corr(gain, drift) = {corr_drift:.3f}")
+    print(f"[dht-probe] Probe-E ladder (boundary {last}): "
+          f"full-affine {sig_dir:+.2f} / lowrank(r={args.rank}) "
+          f"{sig_lr:+.2f} / dynamic {sig_dyn:+.2f} / refit ceiling "
+          f"{sig_refit:+.2f}")
 
 
 if __name__ == "__main__":

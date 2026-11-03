@@ -1508,6 +1508,9 @@ python main.py datasets_delay --data_name ImageNet-R --data-path ./local_dataset
 | Probe-B 跨任务外推三臂 | B0 identity / B1 当前任务拟合（可部署，no-replay）/ B2 旧任务拟合（仅诊断 oracle）；旧任务 test 行特征恢复比 | B1≈B2 且 <1 = probing 分布成立；B2 有效 B1 无效 = probing 死；均无效 = 仿射死 |
 | Probe-C 头级因果老化 | `H_j^sync` = 出生边界 j 的 M2'' 同配方头（hidden 512 / standardize False / 稳定种子），之后不再见任务 j 数据；各后续边界 r 比较 stale / 递归迁移 / 直接迁移 / refit 上界四读数 | Δ(acc_rec−acc_stale) = DHT 净效应；Δ(acc_refit−acc_stale) = 池上界（F4 等价，仅诊断） |
 | Probe-D 递归 vs 直接 | 递归复合迁移 vs 单步直接拟合 | direct 好而 recursive 差 = 复合误差累积，非原理死 |
+| Probe-E 动态必要性阶梯 | 同一 direct-fit 分布下四级：Identity(stale) / Full Affine / Low-rank Linear(r=16 截断 SVD) / **Low-rank Dynamic**（`B(z)=z+U(g(z)⊙V^⊤z)`，`g=σ(MV^⊤z+a)`，SVD warm-start + 200 步全批 Adam，样本自适应、不可折叠进 W1 = DS-TBB 候选） | 见 29.2b 分支表 |
+
+**29.1b 低秩/动态谱增补**：Probe-A 同时输出拟合残差映射 ΔA 的奇异值累计能量曲线（r=1,4,8,16,32,64）——"广播位移低维性"与"动态桥必要性"共用同一条判死链，零额外拟合成本。
 
 **不变式**：探针只用 z_op 缓存特征（`ensure_features` 复用既有提取，行对齐 fail-closed）；不触碰训练代码；所有种子派生稳定可复现。transport 在特征空间评估（与第一层吸收数学等价，`W1'←W1·A` 等价于对输入做逆迁移）。
 
@@ -1522,6 +1525,17 @@ python main.py datasets_delay --data_name ImageNet-R --data-path ./local_dataset
 | 约束 | 当前任务头读数不受迁移影响（transport 只作用于历史头路径） |
 
 双门全过 → DHT 写训练臂（`M2'' + DHT` 单变量叠加，沿用 §23 范式：RNG 中立 / fail-closed / T0 回归）；门 1 过门 2 RED → 机制成立但池不够，按 F4 预案降级为约束手段不立项；门 1 不过 → 仿射死，当天关闭，不写臂。
+
+### 29.2b Probe-E 分支判读（预注册；DS-TBB 立项与否的唯一依据）
+
+| 数据形态 | 判决 |
+|---|---|
+| Low-rank ≈ Full Affine ≈ refit 上界 | 位移低维且仿射充分——**不需要动态结构**，DS-TBB 动机死（结构为加而加）；走 DHT/STBB 吸收式路线 |
+| Linear 有效，Dynamic 显著更优（Δ_dyn − Δ_lin ≥ +0.3pp）且两者均 < refit 上界 | 漂移含样本自适应分量——**DS-TBB 立项**（真 architecture 主张：动态桥 + 低维位移机制发现） |
+| Linear 弱，Dynamic 明显有效 | 漂移非全局仿射——动态结构反而是主机制，DS-TBB 立项且叙事升级 |
+| 两者都无效（≤ Identity） | temporal bridge 家族整体关闭（含一切显式/吸收/动态形态） |
+
+判级预声明：若走 DS-TBB 臂，§28 的"不作方法创新主张"在 §30 预注册中**明文升级**为 architecture-level 主张，升级依据 = Probe-B 外推 + Probe-E 阶梯 + 谱曲线三组证据；若 Probe-E 首行成立（线性充分），判级保持协议/机制级，不拔高。
 
 ### 29.3 命令（GPT 审核通过后执行；与 M2'' 训练无 GPU 抢占——特征提取为轻前向，建议错峰）
 
