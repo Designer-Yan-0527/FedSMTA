@@ -224,6 +224,28 @@ def load_boundary(run_dir, ckpt, feat_dir, data_path, device, mode, feat):
     return data, masks
 
 
+def canon(data, feat):
+    """Canonicalize a boundary cache by the join key (client, task,
+    split, sample_idx_relative). Boundary caches cover tasks 0..t ONLY
+    (rows are appended as tasks load), so the same logical sample lives
+    at different absolute positions in different states; after this
+    sort every (client, task, split) block is identical across all
+    states that contain it."""
+    order = np.lexsort((data["sample_idx_relative"], data["splits"],
+                        data["task_ids"], data["client_ids"]))
+    return {k: data[k][order] for k in
+            ("labels", "client_ids", "task_ids", "splits",
+             "sample_idx_relative", feat)}
+
+
+def _keyblock(s, j):
+    """Join-key fingerprint of task-j rows (client, split, rel_idx,
+    labels) -- must be identical across every state containing j."""
+    m = s["task_ids"] == j
+    return np.column_stack([s["client_ids"][m], s["splits"][m],
+                            s["sample_idx_relative"][m], s["labels"][m]])
+
+
 def main():
     args = parse_args()
     run_dir = Path(args.run_dir)
@@ -240,7 +262,8 @@ def main():
     ckpts = [ckpts[i] for i in order]
     bounds = [bounds[i] for i in order]
 
-    # load every deployment state once; fail closed on row misalignment
+    # load every deployment state once; canonicalize by join key; fail
+    # closed on any mismatch for tasks shared between two states
     states, masks = {}, None
     for t, ck in zip(bounds, ckpts):
         data, msk = load_boundary(run_dir, ck, feat_dir, args.data_path,
@@ -248,13 +271,29 @@ def main():
                                   args.feat)
         states[t] = data
         masks = msk
-    ref = states[bounds[0]]
-    for key in ("labels", "client_ids", "task_ids", "splits"):
-        for t in bounds[1:]:
-            if not np.array_equal(ref[key], states[t][key]):
-                raise RuntimeError(f"feature files are not row-aligned on "
-                                   f"{key} across checkpoints -- join key "
-                                   f"mismatch, do not trust this probe run")
+    S = {t: canon(states[t], args.feat) for t in bounds}
+    for j in bounds:
+        holders = [t for t in bounds if t >= j]
+        if len(holders) < 2:
+            continue
+        k0 = _keyblock(S[holders[0]], j)
+        for t in holders[1:]:
+            if not np.array_equal(k0, _keyblock(S[t], j)):
+                raise RuntimeError(
+                    f"task-{j} rows differ across checkpoints "
+                    f"({holders[0]} vs {t}) on the join key (client, "
+                    f"split, rel_idx, labels) -- do not trust this "
+                    f"probe run")
+
+    def M(t, c, task, split):
+        s = S[t]
+        return ((s["client_ids"] == c) & (s["task_ids"] == task)
+                & (s["splits"] == split))
+
+    def MLE(t, c, tmax, split):
+        s = S[t]
+        return ((s["client_ids"] == c) & (s["task_ids"] <= tmax)
+                & (s["splits"] == split))
 
     clients = sorted(masks)
     hp = dict(hidden=HIDDEN, epochs=EPOCHS, lr=LR, wd=WD, dropout=DROPOUT,
@@ -263,115 +302,115 @@ def main():
     feas_rows = []
 
     for cid in clients:
-        cids = ref["client_ids"]
-        tids = ref["task_ids"]
-        splits = ref["splits"]
-        tr = splits == 0
-        te = splits == 1
-        mine_tr = tr & (cids == cid)
-        mine_te = te & (cids == cid)
-
-        # ---- transports per adjacent pair (deployable B1 = current-task
-        # train rows; diagnostic B2 = old-task train rows) ----
+        # ---- transports per adjacent pair. Boundary caches cover tasks
+        # 0..t ONLY (Sec.29.1c): the strict no-replay probing rows
+        # (task-nxt samples seen by the state-t model) do NOT exist
+        # offline, so the arms are re-scoped to what both states share:
+        # B1' = fit on task-t train rows (the most recent current task
+        # -- deployable proxy), B2 = all tasks <= t (diagnostic oracle).
         trans_cur, trans_old = {}, {}
         for t, nxt in zip(bounds[:-1], bounds[1:]):
-            zo = states[t][args.feat]
-            zn = states[nxt][args.feat]
-            cur = mine_tr & (tids == nxt)          # probing: task being learned
-            if not cur.any():
-                raise RuntimeError(f"client {cid}: no train rows for task "
-                                   f"{nxt} -- wrong checkpoint ladder")
-            A1, b1 = fit_transport(zo[cur], zn[cur], args.lam)
+            zo, zn = S[t][args.feat], S[nxt][args.feat]
+            ct, cn = M(t, cid, t, 0), M(nxt, cid, t, 0)
+            if not ct.any():
+                raise RuntimeError(f"client {cid}: no task-{t} train rows "
+                                   f"at state {t} -- wrong checkpoint ladder")
+            A1, b1 = fit_transport(zo[ct], zn[cn], args.lam)
             trans_cur[(t, nxt)] = (A1, b1)
-            old = mine_tr & (tids <= t)            # diagnostic oracle fit
-            A2, b2 = fit_transport(zo[old], zn[old], args.lam)
+            ot, on = MLE(t, cid, t, 0), MLE(nxt, cid, t, 0)
+            A2, b2 = fit_transport(zo[ot], zn[on], args.lam)
             trans_old[(t, nxt)] = (A2, b2)
 
             # Probe-A: probing-distribution feasibility (held-out rows)
-            cur_te = mine_te & (tids == nxt)
-            r_tr = resid_ratio(zo[cur], zn[cur], A1, b1)
-            r_te = (resid_ratio(zo[cur_te], zn[cur_te], A1, b1)
-                    if cur_te.any() else float("nan"))
+            ctt, ctn = M(t, cid, t, 1), M(nxt, cid, t, 1)
+            r_tr = resid_ratio(zo[ct], zn[cn], A1, b1)
+            r_te = (resid_ratio(zo[ctt], zn[ctn], A1, b1)
+                    if ctt.any() else float("nan"))
             dA = float(np.linalg.norm(A1 - np.eye(A1.shape[0]), "fro"))
             feas_rows.append({
                 "client_id": cid, "pair": f"{t}->{nxt}",
-                "n_probe": int(cur.sum()),
+                "n_probe": int(ct.sum()),
                 "resid_ratio_train": round(r_tr, 4),
-                "resid_ratio_heldout": round(r_te, 4) if cur_te.any() else None,
+                "resid_ratio_heldout": round(r_te, 4) if ctt.any() else None,
                 "dA_fro": round(dA, 4),
                 "dA_spectrum_cum": spectral_stats(A1),
             })
 
             # Probe-B: old-task feature recovery, 3 arms (test rows)
             for j in [b for b in bounds if b <= t]:
-                oj = mine_te & (tids == j)
-                if not oj.any():
+                ojt, ojn = M(t, cid, j, 1), M(nxt, cid, j, 1)
+                if not ojt.any():
                     continue
-                r1 = resid_ratio(zo[oj], zn[oj], A1, b1)
-                r2 = resid_ratio(zo[oj], zn[oj], A2, b2)
+                r1 = resid_ratio(zo[ojt], zn[ojn], A1, b1)
+                r2 = resid_ratio(zo[ojt], zn[ojn], A2, b2)
                 rows.append({
                     "client_id": cid, "born_task": j, "boundary": nxt,
                     "kind": "feature_recovery",
                     "age": nxt - j,
                     "drift": round(float(np.mean(
-                        np.linalg.norm(zo[oj] - zn[oj], axis=1))), 4),
+                        np.linalg.norm(zo[ojt] - zn[ojn], axis=1))), 4),
                     "resid_B1_cur": round(r1, 4),
                     "resid_B2_old": round(r2, 4),
                 })
 
         # ---- Probe-C/D: causal head aging ----
         for j in [b for b in bounds if b < bounds[-1]]:
-            zj = states[j][args.feat]
-            trj = mine_tr & (tids == j)
+            trj = M(j, cid, j, 0)
             if not trj.any():
                 continue
             allowed = masks[cid][j]
-            H = fit_head(zj[trj], ref["labels"][trj], allowed,
+            H = fit_head(S[j][args.feat][trj], S[j]["labels"][trj],
+                         allowed,
                          seed=stable_seed(args.seed_base, "sync", cid, j),
                          standardize=False, **hp)
             for r in [b for b in bounds if b > j]:
-                zr = states[r][args.feat]
-                te_jr = mine_te & (tids == j)
-                z_te = zr[te_jr]
-                if len(z_te) == 0:
+                tej_r = M(r, cid, j, 1)
+                if not tej_r.any():
                     continue
-                y_te = ref["labels"][te_jr]
+                z_te = S[r][args.feat][tej_r]
+                y_te = S[r]["labels"][tej_r]
                 acc_stale = _acc(head_predict(H, z_te, allowed), y_te)
                 chain = [trans_cur[(t, t2)] for t, t2 in
                          zip(bounds[:-1], bounds[1:]) if j <= t < r]
                 A_rec, b_rec = compose(chain)
                 acc_rec = _acc(head_predict(
                     H, apply_transport(z_te, A_rec, b_rec), allowed), y_te)
-                # direct: fit on task-r train rows (still no old data)
-                zj2 = states[j][args.feat]
-                cur_r = mine_tr & (tids == r)
-                A_d, b_d = fit_transport(zj2[cur_r], zr[cur_r], args.lam)
+                # direct (composition oracle): the deployable probing
+                # rows (task-r under state j) do not exist in boundary
+                # caches, so direct fits on the rows both states share
+                # (task-j train) -- Sec.29.1c re-scope; Probe-E ladder
+                # uses the same shared-row fit distribution
+                dj, dr = M(j, cid, j, 0), M(r, cid, j, 0)
+                zj_d, zr_d = S[j][args.feat][dj], S[r][args.feat][dr]
+                A_d, b_d = fit_transport(zj_d, zr_d, args.lam)
                 acc_dir = _acc(head_predict(
                     H, apply_transport(z_te, A_d, b_d), allowed), y_te)
-                # Probe-E: low-rank linear + dynamic, same direct-fit
-                # distribution as acc_dir (task-r train rows, no old data)
-                A_lr, b_lr = fit_transport_lowrank(zj2[cur_r], zr[cur_r],
+                A_lr, b_lr = fit_transport_lowrank(zj_d, zr_d,
                                                    args.lam, args.rank)
                 acc_lr = _acc(head_predict(
                     H, apply_transport(z_te, A_lr, b_lr), allowed), y_te)
                 dyn = fit_transport_dynamic(
-                    zj2[cur_r], zr[cur_r], args.lam, args.rank,
+                    zj_d, zr_d, args.lam, args.rank,
                     seed=stable_seed(args.seed_base, "dyn", cid, j, r),
                     epochs=args.dyn_epochs)
                 acc_dyn = _acc(head_predict(H, dyn(z_te), allowed), y_te)
                 acc_refit = float("nan")
                 if not args.no_pool_ceiling:
-                    H2 = fit_head(zr[trj], ref["labels"][trj], allowed,
+                    trj_r = M(r, cid, j, 0)
+                    H2 = fit_head(S[r][args.feat][trj_r],
+                                  S[r]["labels"][trj_r], allowed,
                                   seed=stable_seed(args.seed_base, "refit",
                                                    cid, j, r),
                                   standardize=False, **hp)
                     acc_refit = _acc(head_predict(H2, z_te, allowed), y_te)
+                tej_j = M(j, cid, j, 1)
                 rows.append({
                     "client_id": cid, "born_task": j, "boundary": r,
                     "kind": "head_aging",
                     "age": r - j,
                     "drift": round(float(np.mean(
-                        np.linalg.norm(zr[te_jr] - zj2[te_jr], axis=1))), 4),
+                        np.linalg.norm(S[r][args.feat][tej_r]
+                                       - S[j][args.feat][tej_j], axis=1))), 4),
                     "acc_stale": round(acc_stale, 2),
                     "acc_rec": round(acc_rec, 2),
                     "acc_dir": round(acc_dir, 2),

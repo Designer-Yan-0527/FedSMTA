@@ -1512,6 +1512,14 @@ python main.py datasets_delay --data_name ImageNet-R --data-path ./local_dataset
 
 **29.1b 低秩/动态谱增补**：Probe-A 同时输出拟合残差映射 ΔA 的奇异值累计能量曲线（r=1,4,8,16,32,64）——"广播位移低维性"与"动态桥必要性"共用同一条判死链，零额外拟合成本。
 
+**29.1c 边界缓存布局与臂重映射（2026-11-03 实跑发现）**：边界 checkpoint 的特征缓存**只覆盖截至该边界已加载的任务**（task_00_end 仅 task 0 行，task_03_end 为 task 0–3 行）；行按 (client, task, split, rel_idx) 规范化对齐后跨状态可比。由此探针臂重映射：
+- **B1'**（原 B1）= 逐对在 **task-t train 行**上拟合（state t 的最近当前任务，两状态共有）——部署臂的可部署 proxy。**严格的 no-replay 当前任务 probing（task-nxt 样本过 state-t 模型）在离线缓存中不存在**，留待训练臂 Gate 阶段验证（轮开始前缓存，GPT §6 语义）；
+- **B2** = tasks ≤ t 全体 train 行拟合（诊断 oracle，不变）；
+- **Probe-C direct** = 在两状态共有的 task-j train 行上直接拟合（复合误差 oracle；角色与 recursive 互换参照：rec = 可部署 proxy 链、dir = oracle 上界）；
+- **Probe-E 阶梯** = 同共有行拟合分布下的四级对照（机制可分性判读不变，但"可部署分布下的动态必要性"降级为 proxy 口径，正式口径在训练臂 T0 Gate 补）。
+
+门数值（可行性 ≤0.8 / 签名 ≥+1.0pp / Δ_dyn−Δ_lin ≥+0.3pp）不变。
+
 **不变式**：探针只用 z_op 缓存特征（`ensure_features` 复用既有提取，行对齐 fail-closed）；不触碰训练代码；所有种子派生稳定可复现。transport 在特征空间评估（与第一层吸收数学等价，`W1'←W1·A` 等价于对输入做逆迁移）。
 
 ### 29.2 判读（预注册，先于数据）
