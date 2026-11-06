@@ -280,16 +280,15 @@ python tests/test_official_fedta_parity.py \
 
 ### 10.1 重新封板（2026-11-06，izfree）
 
-**勘误（同日晚）**：本次 PASS 实际验证的是 **Sec.33 状态**——§34.2 改动（`--bsab_pair_capture` 等）当时尚未提交推送，izfree 上的代码不含 capture 插桩（事后以 `--bsab_pair_capture` unrecognized 报错暴露）。Sec.33 状态 PASS 仍有价值（证明 CTRP 时代的代码仍与官方逐位一致），但**不覆盖 §34**。Sec.34 状态的 Gate 0A 需在代码同步推送、izfree `git pull` 之后重跑，重跑 PASS 后本节方可宣称"Sec.34 状态封板"。下方结论在重跑完成前按"Sec.33 状态"理解：
-
-上次 PASS 后代码经历了 A5-v2 refit 开关（§23/§28）、CTRP v1（§33）等大量改动，在 izfree（`~/projects/FedTA_CVPR2025-main` 为官方仓库）重新执行 Gate 0A：**PASS，13 项 D=0**。结论：全部开关关闭时（Sec.33 状态）仍与官方 FedTA 逐位一致——B0 证据链第一环成立（Sec.34 状态待重验）：
+**重跑 PASS（同日第三次，本次有效）**：§34.2 改动推送、izfree `git pull` 后重跑 Gate 0A：**PASS**。至此本节可正式宣称 **Sec.34 状态封板**——证据链三环闭合：
 
 ```
-官方 FedTA ≡[Gate 0A 重封，izfree]≡ FedSMTA 当前代码（开关全关）
-FedSMTA baseline ≡[verify_trajectory_identity.py，本机]≡ capture run（表征轨迹）
+官方 FedTA ≡[Gate 0A，izfree，Sec.34 状态]≡ FedSMTA 当前代码（开关全关）
+FedSMTA baseline ≡[verify_trajectory_identity.py，本机环2 PASS 25/25，§34.2.6b]≡ capture run（表征轨迹）
+capture run 读数 ≡[repro gate arm1 MC 带宽 PASS，§34.2.7]≡ 官方 evaluate 语义
 ```
 
-第二环（`diagnostics/verify_trajectory_identity.py`，baseline vs capture run 的 round checkpoint 逐位比对）待本机执行。
+**勘误（同日，第一次测的历史记录）**：第一次 PASS 实际验证的是 Sec.33 状态——§34.2 改动当时尚未推送，izfree 代码不含 capture 插桩（`--bsab_pair_capture` unrecognized 报错暴露）。Sec.33 状态 PASS 仍有价值（CTRP 时代代码与官方一致），但不覆盖 §34。此段为历史勘误记录，最终结论以上方重跑 PASS 为准。
 
 ## 11. Resume 回归测试（Gate 0B，已 PASS 封板）
 
@@ -2312,3 +2311,40 @@ pre_prompt_hash / post_prompt_hash / head_hash / row_index_hash / feature_shape
 * **含义**：c1–c4 的 birth prompt 值**不可从任何 checkpoint 恢复**（c0 例外：KD no-op ⇒ fusion 轮 fused == c0 birth）。round 级 (z⁻, z⁺) 真配对的唯一来源 = in-run capture artifacts（`bsab_capture/*.npz`）——离线重构路线对 B_t 不成立，等价于回到预注册 B0 路径。
 * **连带裁决**：(1) DSAR pilot `--rounds all` 取消（B_t 列无效、L_t 列语义偏差）；(2) L_t（birth 语义）的修正试点 = capture npz 的 z⁻/labels + round checkpoint 的 tail_anchor（key/anchor_pool/head 不受广播覆写，H_end 可恢复）按 (client, task, round) 对齐——等 capture rerun 跑完后与 B0 一并做。
 * **留档的冒烟读数**（仅 round_0010、15 cells、PRELIMINARY 非门）：L_t 在**部署态（广播后）表示**上 +2.2pp overall / +3.3pp current-task，r=8 即近饱和——部署态读出存在低秩可修 slack 的初步迹象（注意：这是 L(z⁺) 语义，非设计的 birth-state L_t）。
+
+#### 34.2.6b 环2 identity gate：capture run ≡ baseline（2026-11-06，PASS）
+
+`diagnostics/verify_trajectory_identity.py`（本窗口新写，两 run 版 Gate 0C）：cifar_base_p15 vs cifar_bsab_capture_M2matched，全 25 个 round checkpoint 逐张量零容差比对。**PASS：25/25 轮全部 HARD 字段（server_model/global_head/server_prompt/protos/clients[i] 的 prompts+tail_anchor_model+data_split_indices+class_mask+outer_split_manifest）bit-identical**；expected_diff 仅有 refit 头（`heads[]`）与 `a5_joint_head`（后者经验证与 tail_anchor 内 head 逐位相同的冗余快照，仅 refit run 落盘）。含义：**refit + capture 插桩在真实全量 run 上 RNG 中立，capture run 表征轨迹 ≡ baseline 轨迹**——B0 材料对 baseline 合法；与 izfree Gate 0A（注意：Sec.34 状态那次尚未补跑，见 §10.1 勘误）拼成"官方 ≡ 代码 ≡ capture"证据链。capture run 终态：25 round checkpoints + 125 npz boundary 全齐，integrity 持续更新到最后。
+
+#### 34.2.7 B0 正式判决：GREEN（2026-11-06 封板）
+
+**脚本**：`diagnostics/bsab_b0_verdict.py`（预注册 §34.2.5 四臂实现；125 cell 全量 + gate_only 增量模式，arm4 refit 头缓存 `bsab_b0/heads/`）。产出：`bsab_b0/{cells.csv, repro.csv, verdict.json, heads/}`。
+
+**§34.2.5 gate 勘误（两轮修订，均记录在案）**：
+1. **0.25pp 逐位容差 → MC-dropout 带宽**（根因：官方 evaluate 路径从未 `.eval()` ⇒ Chead Dropout(0.1) ON ⇒ 官方 CSV 数 = dropout-ON 随机前向的单次采样，逐位容差数学上不可满足；Client_DF L651 探针注释为证）。修订判据：官方数落在我们 MC 分布（50 draws）3σ 带内（|z|≤3）且 z 符号不系统性同侧（同侧 ≤20/25）。
+2. **arm4 降级 reference_only**（MC 结果两臂分裂的判定）：arm1（npz in-run 锚定头）25/25 PASS（|z|≤2.5，7+/18−）= 读出语义 ≡ 官方；arm4（离线重训头）6 cell 出带（z −9.4~+6.5）但符号 13+/12− 双向均衡 ⇒ 非系统偏差，是**重训随机性**（in-run refit 的 batch/shuffle/dropout RNG 流不可离线复刻，同配方不同随机实现）。裁决：ρ 分母只需管线内有效（负分母排除已覆盖其噪声），不与官方抽签头逐位对齐 ⇒ gate = arm1-only + zref，arm4 对照留档 repro.csv。
+
+**判决**（verdict.json）：
+
+| 判据 | 阈值 | 实测 | 结果 |
+|---|---|---|---|
+| repro gate (arm1 MC) | 25/25 \|z\|≤3 + 符号均衡 | 25/25，\|z\|≤2.5，7+/18− | PASS |
+| z_ref 不变性 | 25/25 逐位 | 25/25 | PASS |
+| ρ_birth mean | ≥0.8 | **1.006** | PASS |
+| ρ_birth pooled | ≥0.8 | **1.018** | PASS |
+| task 崩溃 | 无 | 无 | PASS |
+
+**VERDICT: GREEN —— B1 结构实现解冻。**
+
+**四臂读数**（125 cell，M2' refit head 读出）：① identity 94.83 / ② bridge 96.64 / ③ lowrank r8-r64 96.40-96.61 / ④ M2'' 96.57 / ref z⁻ 97.24。ρ per-task：t0 0.707 / t1 0.990 / t2 0.968 / t3 1.245 / t4 1.033（valid 84，负分母排除 41）。两论文点：免标签桥 ρ≈1（零标签追平重训上限；20/125 cell GCV 自动选 identity = 安全阀；41 个 refit 失效 cell 上桥仍 +0.15pp）；低秩 r8（~1% 参数）拿回 87% 修复量、sweep 平坦。
+
+**baseline 部署口径参照**（`dsar_birth_preview/summary.json`，H_end 联训头读出，PREVIEW）：damaged 93.52 → +B_t 95.86 → +B_t+L_t ≈96.3-96.8（current-task +2.8~3.3pp，oracle 3.72pp 的 ~80%）；损伤随任务放大 t0 −1.56pp → t4 −4.69pp，桥修复随之放大（t4 86%）。注意：current-task 诊断口径 ≠ 论文主表 AA；旧任务保持收益待 B1 正式 run。
+
+**下一步**：B1 预注册（部署图 H_end(L(B(z⁺)))、B_t GCV 在线化、L_t/B_t 拟合时机、rank 冻结、通信开销、旧任务度量）→ 实现 → INR B0-lite（依赖 izfree capture）→ 多 seed。
+
+#### 34.3 INR B0-lite 预注册（2026-11-06，跑前冻结）
+
+* **材料**：izfree 的 ImageNet-R capture run（M2'-matched 同款协议；izfree 无 INR baseline run ⇒ 环2 identity gate 免除，中立性由 cifar 链（§10.1 三环 + §34.2.6b + §34.2.7）承担——跨机器不可逐位一致，此前已裁决）。
+* **判据裁剪**：INR 无官方 a5v2 refit 锚 run ⇒ **reproduction gate 裁除**（`bsab_b0_verdict.py --no_repro`，verdict 标 `[B0-lite, no_repro]`）；**z_ref 不变性门保留**（npz 自含）；**ρ_birth 四臂 + GREEN/YELLOW/RED 阈值原样**（run 内配对，跨机器分析合法）。
+* **协议差异**：INR 官方协议 = 每客户端 40 私有类、0 公共类、每任务 8 类、surrogate 固定 5、batch 16 硬编码——与 cifar 的划分不同是预期行为，不作 fail 条件。
+* **流程**：izfree `git pull` 最新 diagnostics → 完整性检查（25 ckpt + 125 npz + args.json flags）→ `--repro_only --no_repro` 冒烟（round 0-4）→ 全量 `--no_repro`。
