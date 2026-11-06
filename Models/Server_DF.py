@@ -177,6 +177,33 @@ class Server_DF(object):
             self._ctrp_alpha = None
             self._ctrp_val_frac = None
 
+        # ------------------------------------------------------------------
+        # §34.2 0b：BSAB_PAIR_CAPTURE（user 2026-11-04 APPROVED FOR
+        # IMPLEMENTATION；instrumentation-only，BSAB 结构实现仍 FROZEN）。
+        # capture run = M2'-matched 冻结：--refit_timing post_broadcast 会让
+        # in-run head 变成 M2'' 状态、birth head 反而成为需要额外重构与解释
+        # 的中间状态 —— fail-closed 拒绝。诊断构建（run_manager=None）没有
+        # run 目录，同样 fail-closed。capture 输出目录 = <run_dir>/bsab_capture
+        # （经 args 传给 client，client 不自行推导路径）。
+        # ------------------------------------------------------------------
+        if bool(getattr(args, 'bsab_pair_capture', False)):
+            if str(getattr(args, 'refit_timing', 'local')) == 'post_broadcast':
+                raise SystemExit(
+                    "BSAB_CAPTURE_UNSUPPORTED_REFIT_TIMING: "
+                    "--bsab_pair_capture is only defined for the M2'-matched "
+                    "capture run (--refit_timing local; RUNCOMMANDS Sec.34.2). "
+                    "--refit_timing post_broadcast makes the in-run deployed "
+                    "head the post-broadcast M2'' state, so the frozen birth "
+                    "head would need offline reconstruction instead of direct "
+                    "pre-broadcast anchoring.")
+            if run_manager is None:
+                raise SystemExit(
+                    "BSAB_PAIR_CAPTURE requires the main-run RunManager "
+                    "(a diagnostic build without a run directory has nowhere "
+                    "to anchor the capture output; fail-closed)")
+            self.args.bsab_capture_dir = str(
+                self.run_manager.run_dir / "bsab_capture")
+
         # anchor 状态机（裁决 §D/§2）：state 0 不校准，
         # P_0_deploy = P_0_cand；t>=1 时 DeltaP 相对 deployed anchor。
         # _ctrp_prev_deployed = 上一 task 的 deployed prompt VALUES（完整
@@ -1150,20 +1177,41 @@ class Server_DF(object):
     # (RUNCOMMANDS Sec.33, pre-registered 2026-11-03, GPT-frozen verdict)
     # ------------------------------------------------------------------
 
-    # premise gate threshold (frozen Sec.7): actual nonslot batch fraction
-    # (forward-returned prompt_idx, NOT preference statistics) <= 1%
-    CTRP_MAX_NONSLOT_BATCH_FRAC = 0.01
+    # premise gate threshold (Gate Amendment, frozen 2026-11-04):
+    # sample-weighted deployed-route violation rate
+    #   M_s = sum_b n_b * 1[p_b = s],  p* = argmax_s M_s,
+    #   r = 1 - M_{p*} / sum_b n_b   (p_b = forward-returned deployed
+    #   prompt_idx, n_b = actual batch rows) <= 1%. Replaces the
+    # batch-count statistic (granularity mismatch: a 2-row partial batch
+    # weighed as much as a full 8-row batch); routing itself, the 1%
+    # tolerance and every other frozen ingredient are UNCHANGED.
+    CTRP_PREMISE_VIOLATION_RATE_MAX = 0.01
+
+    # Gate Amendment identifier (frozen 2026-11-04, user-approved): every
+    # CTRP record of the formal run carries the amendment identity so any
+    # CIFAR/INR result can be attributed to these frozen semantics
+    # (threshold=0.01, routing_unchanged, gate_unit=sample_mass).
+    CTRP_GATE_AMENDMENT = "CTRP_PREMISE_GATE_V2_SAMPLE_WEIGHTED"
+    CTRP_GATE_UNIT = "sample_mass"
 
     def _ctrp_persist_event(self, record):
         """Append a CTRP event record to the run dir (immediate flush:
         append_jsonl opens/writes/closes). run_manager=None (diagnostics
         / unit tests) -> print only, so the reason is never lost."""
+        record = dict(record)
+        record["gate_amendment"] = self.CTRP_GATE_AMENDMENT
+        record["gate_unit"] = self.CTRP_GATE_UNIT
+        record["routing_unchanged"] = True
         if self.run_manager is not None:
             self.run_manager.append_jsonl(
                 self.run_manager.metrics_dir / "ctrp_events.jsonl", record)
         print("[CTRP] " + json.dumps(record, default=str))
 
     def _ctrp_log_transition(self, record):
+        record = dict(record)
+        record["gate_amendment"] = self.CTRP_GATE_AMENDMENT
+        record["gate_unit"] = self.CTRP_GATE_UNIT
+        record["routing_unchanged"] = True
         if self.run_manager is not None:
             self.run_manager.append_jsonl(
                 self.run_manager.metrics_dir / "ctrp_transitions.jsonl",
@@ -1188,9 +1236,12 @@ class Server_DF(object):
                     record the discovered dominant slot s_0* and the
                     anchor = deepcopy of the candidate VALUES.
           t >= 1  : premise gate on the FORWARD-actual route (prompt_idx
-                    from Global_Prompt.forward, modal slot over the
-                    pooled current-task validation batches; nonslot batch
-                    fraction <= 1%; s_t* == s_{t-1}*). endpoint = matched
+                    from Global_Prompt.forward; Gate Amendment frozen
+                    2026-11-04: sample-weighted deployed-route violation
+                    rate r = 1 - M_p*/n_total <= 1%, with the dominant
+                    slot p* itself chosen by sample mass -- the
+                    batch-count statistic is kept only as a diagnostic;
+                    s_t* == s_{t-1}*). endpoint = matched
                     baseline, premise failures only logged; every other
                     matched arm fails closed. alpha from --ctrp_alpha
                     (fixed_alpha), pooled val/train CE argmin with the
@@ -1220,24 +1271,57 @@ class Server_DF(object):
         # pass 1: route discovery under the SERVER CANDIDATE prompt state
         # (frozen Sec.4: the sweep's baseline is the server candidate, not
         # the client's stale local prompt; clients load it and the loaded
-        # state hash is asserted against the server's)
-        batch_slots = []
+        # state hash is asserted against the server's). Gate Amendment
+        # (frozen 2026-11-04): each batch record carries its deployed slot
+        # AND its actual row count n_b; the premise statistic and the
+        # dominant-slot choice are both SAMPLE-WEIGHTED:
+        #   M_s = sum_b n_b 1[p_b = s];  p* = argmax_s M_s (ties -> the
+        #   SMALLER slot id, deterministic);  r = 1 - M_{p*} / sum_b n_b.
+        batch_records = []
         per_client_batches = {}
         for c in self.clients:
-            slots = c._ctrp_route_slots(self.prompt)
-            per_client_batches[c.id] = len(slots)
-            batch_slots.extend(slots)
-        if not batch_slots:
+            recs = c._ctrp_route_slots(self.prompt)
+            per_client_batches[c.id] = len(recs)
+            batch_records.extend(recs)
+        if not batch_records:
             self._ctrp_fail_premise({
                 "round": round_id, "task": t, "mode": self._ctrp_mode,
                 "reason": "zero current-task validation batches under the "
                           "server candidate state (CTRP_VAL_ROWS_EMPTY)",
             })
-        slots_arr = np.asarray(batch_slots, dtype=np.int64)
-        modal = int(np.bincount(slots_arr).argmax())
-        nonslot_frac = float(np.mean(slots_arr != modal))
-        n_nonslot = int(np.sum(slots_arr != modal))
-        n_batches = int(len(batch_slots))
+        n_total = int(sum(b["n_rows"] for b in batch_records))
+        n_batches = int(len(batch_records))
+        mass = {}
+        for b in batch_records:
+            mass[b["slot"]] = mass.get(b["slot"], 0) + int(b["n_rows"])
+        # p* by sample mass; an argmax tie resolves to the smaller slot id
+        modal = min(mass, key=lambda s: (-mass[s], s))
+        dominant_mass = int(mass[modal])
+        # INTEGER gate (frozen tau = 0.01): 100 * n_viol <= n_total is
+        # mathematically exact at the boundary (8/800 == 1% PASSES),
+        # with no dependence on float rounding; the violation rate below
+        # is display/diagnostic only
+        violation_rows = n_total - dominant_mass
+        premise_route_ok = violation_rows * 100 <= n_total
+        violation_rate = violation_rows / float(n_total)
+        n_nonslot = sum(1 for b in batch_records if b["slot"] != modal)
+        # legacy batch-count statistic + tie/partial audit: diagnostic_only,
+        # never enters PASS/FAIL (the INR forensic: 1/93 = 0.010753 as a
+        # batch fraction vs 2/731 = 0.002736 sample-weighted)
+        diagnostics = {
+            "nonslot_batch_frac": round(n_nonslot / float(n_batches), 6),
+            "nonslot_batches": f"{n_nonslot}/{n_batches}",
+            "partial_nonslot_batches": int(sum(
+                1 for b in batch_records
+                if b["slot"] != modal and b.get("partial"))),
+            "tie_batches": int(sum(
+                1 for b in batch_records if b.get("tie"))),
+            "tie_sample_mass": int(sum(
+                int(b["n_rows"]) for b in batch_records if b.get("tie"))),
+            "min_vote_margin": (min(
+                (int(b["vote_margin_rows"]) for b in batch_records))
+                if batch_records else None),
+        }
 
         # ---- state 0: no temporal calibration (frozen) ------------------
         if t == 0:
@@ -1251,9 +1335,12 @@ class Server_DF(object):
                 "round": round_id, "task": t, "mode": self._ctrp_mode,
                 "transition": "state0_init",
                 "dominant_slot": modal,
-                "nonslot_batch_frac": round(nonslot_frac, 6),
+                "dominant_sample_mass": f"{dominant_mass}/{n_total}",
+                "deployed_route_violation_rate": round(violation_rate, 6),
+                "premise_threshold": self.CTRP_PREMISE_VIOLATION_RATE_MAX,
+                "n_val_samples": n_total,
                 "n_val_batches": n_batches,
-                "n_nonslot_batches": n_nonslot,
+                "diagnostic_only": diagnostics,
                 "premise_status": "state0_no_calibration",
                 "selector": self._ctrp_mode,
                 "split_seed_schema": "a5_stable_seed(seed,client,task)",
@@ -1281,20 +1368,20 @@ class Server_DF(object):
         prev_slot = self._ctrp_prev_dominant_slot
         anchor_values = self._ctrp_prev_deployed.to(cand_values.device)
         anchor_hash = hash_tensor(anchor_values)
-        premise_pass = (nonslot_frac
-                       <= self.CTRP_MAX_NONSLOT_BATCH_FRAC
-                       and modal == prev_slot)
+        premise_pass = (premise_route_ok and modal == prev_slot)
 
         base_record = {
             "round": round_id, "task": t, "mode": self._ctrp_mode,
             "transition": f"{t - 1}->{t}",
             "dominant_slot": modal,
             "previous_dominant_slot": prev_slot,
-            "nonslot_batch_frac": round(nonslot_frac, 6),
+            "dominant_sample_mass": f"{dominant_mass}/{n_total}",
+            "deployed_route_violation_rate": round(violation_rate, 6),
+            "premise_threshold": self.CTRP_PREMISE_VIOLATION_RATE_MAX,
+            "n_val_samples": n_total,
             "n_val_batches": n_batches,
-            "n_nonslot_batches": n_nonslot,
-            "dominant_slot_share": round(float(np.mean(slots_arr == modal)),
-                                         6),
+            "dominant_slot_share": round(dominant_mass / float(n_total), 6),
+            "diagnostic_only": diagnostics,
             "per_client_val_batches": per_client_batches,
             "selector": self._ctrp_mode,
             "split_seed_schema": "a5_stable_seed(seed,client,task)",
@@ -1302,12 +1389,15 @@ class Server_DF(object):
             "prev_deployed_prompt_hash": anchor_hash,
         }
 
-        # ---- premise gate (frozen Sec.3 / Sec.7) ------------------------
+        # ---- premise gate (Gate Amendment frozen 2026-11-04;
+        # fail-closed Sec.3 / Sec.7 semantics unchanged) ----------------
         if not premise_pass:
             reason = (
-                f"nonslot batch fraction {nonslot_frac:.4f} > "
-                f"{self.CTRP_MAX_NONSLOT_BATCH_FRAC}"
-                if nonslot_frac > self.CTRP_MAX_NONSLOT_BATCH_FRAC
+                f"sample-weighted deployed-route violation rate "
+                f"{violation_rate:.6f} > "
+                f"{self.CTRP_PREMISE_VIOLATION_RATE_MAX} "
+                f"({violation_rows}/{n_total} rows off the dominant slot)"
+                if not premise_route_ok
                 else f"dominant slot changed across states "
                      f"({prev_slot} -> {modal})")
             record = dict(base_record)

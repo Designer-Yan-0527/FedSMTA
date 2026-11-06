@@ -60,6 +60,7 @@ python main.py datasets_delay \
 | `--skip_fed_avg_head` | off | **HS-N 修复开关**：跳过 fed_avg_head（论文无 head 聚合，该调用唯一活效应 = ×2^(N-1)/轮别名污染，详见 INR_PHASE1_HEAD_DIVERGENCE.md §4.5）。默认 off = 官方行为逐位一致；与 `--method` 正交，可叠加 fedta / fedta_a2 |
 | `--route_fix` | off | **A2-R 路由修复开关**（R1+R2，探针 `diagnostics/probe_route_fix.py` 判决 keyH 5/5 复活 +3~4 bits 且准确率守住）：R1 = prompt_key 正交球面初始化（独立 RNG 流，seed=`--seed`）+ R2 = 可导软路由 `w=softmax(sim/τ)` 全池加权（token 数 length×top_k 不变；训练/推理同款全软）。默认 off = 官方行为逐位一致；与 `--method`/`--a2_arm`/`--skip_fed_avg_head` 正交 |
 | `--route_tau` | 0.1 | R2 软路由温度 τ（仅 `--route_fix` 时生效；探针验证值 0.1） |
+| `--bsab_pair_capture` | off | **§34.2 0b pair capture 开关**（instrumentation-only）：每个 broadcast boundary 缓存 pre/post 广播配对特征行（当前任务全行 train+test、z_ref/z_op 双侧、pre/post prompt hash、锚定 birth head state+hash、row_index_hash），输出 `<run_dir>/bsab_capture/`。默认 off = 逐位一致。仅限 M2'-matched capture rerun（与 `--refit_timing post_broadcast` fail-closed 互斥：`BSAB_CAPTURE_UNSUPPORTED_REFIT_TIMING`）；不加 BSAB module、不改任何训练/广播行为，BSAB 结构实现仍 FROZEN |
 
 ## 5. 运行管理参数（Phase 0 工程，不影响算法）
 
@@ -276,6 +277,19 @@ python tests/test_official_fedta_parity.py \
 ```
 
 证明 `--method fedta --no_instrumentation ≡ 官方 FedTA`（13 项 D=0）。Gate 0A 强制 `global_epoch=5`（官方 SIKF 硬编码 `!= 4` 仅此时等价）；`--rounds` 必须等于 `task_num*global_epoch`；PASS 不容忍浮点误差；配置漂移 fail loudly。细节见脚本 docstring 与 git 历史。
+
+### 10.1 重新封板（2026-11-06，izfree）
+
+**勘误（同日晚）**：本次 PASS 实际验证的是 **Sec.33 状态**——§34.2 改动（`--bsab_pair_capture` 等）当时尚未提交推送，izfree 上的代码不含 capture 插桩（事后以 `--bsab_pair_capture` unrecognized 报错暴露）。Sec.33 状态 PASS 仍有价值（证明 CTRP 时代的代码仍与官方逐位一致），但**不覆盖 §34**。Sec.34 状态的 Gate 0A 需在代码同步推送、izfree `git pull` 之后重跑，重跑 PASS 后本节方可宣称"Sec.34 状态封板"。下方结论在重跑完成前按"Sec.33 状态"理解：
+
+上次 PASS 后代码经历了 A5-v2 refit 开关（§23/§28）、CTRP v1（§33）等大量改动，在 izfree（`~/projects/FedTA_CVPR2025-main` 为官方仓库）重新执行 Gate 0A：**PASS，13 项 D=0**。结论：全部开关关闭时（Sec.33 状态）仍与官方 FedTA 逐位一致——B0 证据链第一环成立（Sec.34 状态待重验）：
+
+```
+官方 FedTA ≡[Gate 0A 重封，izfree]≡ FedSMTA 当前代码（开关全关）
+FedSMTA baseline ≡[verify_trajectory_identity.py，本机]≡ capture run（表征轨迹）
+```
+
+第二环（`diagnostics/verify_trajectory_identity.py`，baseline vs capture run 的 round checkpoint 逐位比对）待本机执行。
 
 ## 11. Resume 回归测试（Gate 0B，已 PASS 封板）
 
@@ -2197,3 +2211,104 @@ auto 槽仅在 state 0 发现；后续状态 batch-majority 模式槽 ≠ 发现
 > **The effect is weaker but structurally identical to CIFAR-100: per-transition old gains are +0.35/+1.67/+0.25/+0.89pp with individual CIs crossing zero at t1/t3 (by pre-registration only the hierarchical aggregate CI decides, which is exactly why the no-cherry-picking all-transitions design was frozen), the optimal step is again state-adaptive (λ̂ = 0.80/0.65/0.90/0.80), and the auto-discovered monopoly slot is 53 (≠ CIFAR's slot 6) — the no-hardcoding protocol was not just prudent but necessary.**
 >
 > **The verdict is OVERSHOOT_EXPLOITABLE_CURRENT_ONLY (INR replication): the temporal prompt-update overshoot replicates cross-dataset as a deployment-repairable, current-task-signal-locatable step-calibration defect, CTRP's Sec.33 candidacy preconditions (INR mechanism replication) are now all satisfied pending final external review, and no training arm is pre-registered by this probe.**
+
+---
+
+## 34. BSAB：Broadcast-State Alignment Bridge（2026-11-04 立项裁决冻结；B_pre→B0→B1 执行树）
+
+**状态标记（user 裁决 2026-11-04）**：`B_pre: VALID + STRONG POSITIVE PRIOR` / `B0 birth test: NOT YET OBSERVED` / `BSAB architecture implementation: STILL FROZEN`。
+
+### 34.0 提案与执行树
+
+BSAB：冻结 head，在 evolving representation 与 head 之间学显式无标签低秩坐标 bridge `B(z)=z+ΔAz+b`，替代 M2'' post-broadcast refit（§28 判据臂）；birth 问题 = single-broadcast mismatch `z_t⁺ → z_t⁻`。
+
+冻结执行树（GPT 外审 2026-11-04）：
+
+* **B_pre（archived aging stress probe）**：跨任务端 accumulated transport，只作先验，**不判 birth 生死**（`aging RED ⇏ birth RED` 且 `aging GREEN ⇏ birth GREEN`：多步 transport 非单调，可部分抵消/复合变复杂）。
+* **B0（true birth-pair probe）**：pre/post-broadcast 配对缓存上的真 birth 检验，`ρ_birth ≥ 0.8` GREEN 门。
+* **B1（rank/structure selection）**：shared low-rank vs per-task low-rank vs full/high-rank。
+
+ρ_age 与 ρ_birth **不混名不混表**。ρ_age 分母 = birth-state reference gap（Acc(H_k(z_k))−Acc(H_k(z_j))，valid ⟺ ≥0.5pp，不叫 ceiling——bridge 可超过 birth-state accuracy）；ρ_birth 分母锚 M2''−M2'。负 gap（stale > birth-state ref）只记录不纳入。
+
+### 34.1 B_pre 存档记录（`diagnostics/probe_bsab_feasibility.py`，只读 M2' run artifacts）
+
+**RUN_01 = FIT_SANITY_FAIL / NOT_EVALUABLE / PRIMARY_SYMPTOM=A_MINUS_I_SPECTRUM≈NEGATIVE_IDENTITY**（`bsab_pre_report_run01_fitsanityfail.json`）。双重根因：
+① 参数化 bug：ridge 正则了 A 而非 ΔA=A−I，λ 大时 A→0（常数映射摧毁特征；σ(A−I) 平坦≈1、E_r=r/768、DoF 2–18 为谱指纹）；② 环境损坏：本机 numpy/scipy float64 BLAS/LAPACK 无效（`ENVIRONMENT_AUDIT.md §1`）——RUN_01 的 acc_full/rank_acc 数值作废。
+
+**RUN_02 = VALID**（`bsab_pre_report.json`，torch CPU 数值后端 + fit-sanity 6/6 PASS：`Y=X⇒A=I`、`λ→∞⇒B(z)=z`、`Acc_identity=Acc_stale` bitwise；z_ref 稳定门 PASS 0 violations；对官方 accuracy_matrix reproduction worst |Δ|=0.16pp；GCV 显式含 ΔA=0 候选，50/50 未选中）。
+
+**判读（PRELIMINARY / PRIOR-LEVEL ONLY，M2pb task4 完成前不出 FINAL）**：
+
+* `AGING TRANSPORTABILITY PRIOR = STRONGLY POSITIVE`：32/37 valid client-cells ρ_age≥0.5，多对 mean 0.8–1.2（可超 birth-state reference）。措辞冻结：*accumulated deployment-state drift appears substantially transportable by an unlabeled coordinate bridge*。禁止写 "BSAB can replace M2''"。
+* 2×2 象限：feat_good_head_good=6 / **feat_bad_head_good=26** / feat_bad_head_bad=5 / feat_good_head_bad=0——feature 级 R_feat 不是 BSAB 主目标，**not all feature drift is semantically relevant**；"feature MSE 一般 + head recovery 强" 在 birth-B0 应视为正结果。
+* **叙事修正（论文级）**：σ(ΔZ) E_64 仅 0.40–0.50——漂移能量**不低秩**；但 rank sweep 显示 r=8–32 即拿到大部分 head 恢复且与 full GCV 互有胜负。冻结表述：*the classifier-relevant component of broadcast-induced drift is concentrated in a low-dimensional corrective subspace*（D_head ⊊ D_energy, dim(D_head) ≪ dim(D_energy)），不写 "drift is low-rank"。
+* 负 reference gap 21/50 cells 只记录（aging 有时利于旧 head——真正变量是 state displacement relative to head-sensitive directions，非 task age）。
+
+### 34.2 0b：`BSAB_PAIR_CAPTURE` instrumentation-only hook spec（预注册；**hook + 单测已实现 2026-11-04**，见 34.2.6；授权范围独立于"只读 artifact"）
+
+**授权边界**：单独 instrumentation-only scope；不碰 CTRP/endpoint INR/当前 M2pb run；**正式 BSAB 结构实现仍冻结**，等 true B0。载体 = M2pb 完成后单独开 deterministic、matched 的 `BSAB_PAIR_CAPTURE` rerun（同配置同种子同划分；若未来本就需要同配置 rerun 可搭车，但必须先过 34.2.4 RNG-neutral regression）。
+
+**实现裁决（user，2026-11-04 第二轮）**：`BSAB_PAIR_CAPTURE: APPROVED FOR IMPLEMENTATION`；**capture run = M2'-timing 冻结**（不改为 matched to M2pb：M2' 给出最干净的 birth 基准 `z⁻→H_birth`，直接回答 "能否用 coordinate synchronization 替代 classifier retraining"；若 matched to M2pb 则 birth head 反而变成需额外解释的中间状态）；**M2'' = offline reconstructed positive-control arm**，subject to reproduction gate。排期：等 M2pb Task-4 FINAL 的同时**并行实现 hook + OFF/ON regression**；不启动正式 BSAB 结构实验。状态：`B_pre: VALID / STRONG POSITIVE PRIOR` / `B0: APPROVED FOR INSTRUMENTATION, NOT YET OBSERVED` / `BSAB architecture: FROZEN` / `M2'-matched capture: APPROVED` / `M2'' offline positive control: APPROVED, subject to reproduction gate`。
+
+**六条实现 hard gate（user 2026-11-04，逐条必须成立）**：
+
+1. **严格同一批 sample 配对**：z⁻ᵢ 与 z⁺ᵢ 同 sample、同顺序、同 preprocessing；直接保存 sample/index hash，不依赖 dataloader 顺序。
+2. **birth head 在 broadcast 前锚定**：`load_prompts` 前保存 H_birth + `head_hash`；所有 frozen-head arm 验证 hash 不变。
+3. **capture 不影响正式轨迹**：四流 RNG snapshot/restore 之外，OFF/ON regression 同时核对 prompt hash / head hash / optimizer-state 或关键 tensor hash / accuracy matrix / 后续 round candidate hash；目标是 **OFF/ON trajectory bitwise identical**，不止 accuracy 一致。
+4. **bridge fit 严格 label-free**：标签只进最终 accuracy evaluation 与 M2'' positive control，不进 bridge selection/fitting。
+5. **M2'' reproduction 先过关再算 ρ_birth**：离线 M2'' 与官方 M2pb matrix 超出预冻结容差 → ρ_birth 不报告（分母锚点不可靠）。
+6. **不许因 B_pre positive 提前调 B0**：strongly positive prior 不构成调 rank/λ/挑 task 的依据，B0 保持 confirmatory birth test。
+
+**34.2.1 配置与捕获点**（rerun matched to M2'：`--refit_timing local`，pre 状态即真实 M2' birth state）：
+
+* **pre（z⁻）**：client 完成本轮 local training 与每轮 M2' refit 后、`get_global_proto_and_head*` 装载 server fused prompt **之前**（`Client_DF.py` L924 `self.prompts = prompt` 之前，此时 `vit` 仍持本地训练后 prompts = L378 `deepcopy(get_prompts())` 状态）。
+* **post（z⁺）**：`vit.load_prompts(广播 prompt)`（L925）之后、`_a5_post_broadcast_interface` / 任何 post-broadcast refit / evaluate **之前**。与 §28 广播路径钩子同位。
+* **same rows**：两侧同一 sample index 集合；**缓存该 client 该任务全部可用 train/test rows**（head refit 输入为 feat，全行缓存 ⇒ M2'/M2'' 两 refit 臂与全部 bridge 臂可离线复现）。N_fit<2048/client 时用全部可用行并记 `LOW_POWER`；N_fit≲2d≈1536 为 full-affine 欠定线。eval 独立：完整 test split 或 ≥512 rows。
+* cadence：**每个 broadcast boundary（每轮）**捕获，25 boundaries（5 task × 5 round），带 round_id。
+
+**34.2.2 每行字段**：
+
+```text
+client_id / task_id / round_id / sample_index / split / label   # label 仅离线 accuracy
+z_ref_pre / z_op_pre / z_ref_post / z_op_post                    # float32
+# state anchors:
+pre_prompt_hash / post_prompt_hash / head_hash / row_index_hash / feature_shape
+```
+
+**bridge fit sees no labels**（z_ref 的 pre/post 双缓存用于在真 birth 场景重验 invariance）。
+
+**34.2.3 forward 卫生**：`model.eval()` + `torch.no_grad()` + 前后恢复 model mode；固定 index 的 deterministic diagnostic loader，**不复用正式训练 loader 的 shuffle/iterator 状态**。
+
+**34.2.4 RNG neutrality 硬 gate**：`RNG_before capture == RNG_after capture`，覆盖 Python / NumPy / Torch CPU / Torch CUDA 四流（复用 `_a5_rng_snapshot/_a5_rng_restore`，§23.1 单测先例）；再做 `capture OFF vs capture ON` 小规模 regression——后续 candidate/prompt hash/训练状态**逐位一致**才准上正式 rerun。通过后 capture 方为 instrumentation-neutral。
+
+**34.2.5 B0 对照臂与判据**（离线诊断，全部从缓存计算；官方 evaluate dropout-ON deviation 沿 §34 候选记录）：
+
+```text
+每个 broadcast boundary 上、同一 eval rows：
+  ① Acc_pre-head on z⁺（≡ identity bridge ≡ M2' deployed head 直接服役）
+  ② Acc_full-residual-bridge（GCV ridge，λ‖A−I‖²，含 ΔA=0 候选）
+  ③ Acc_low-rank-bridge（r sweep）
+  ④ Acc_M2''（离线按冻结配方在 z⁺ 上 refit；对官方 M2pb 复现校验）
+  （参考记录：Acc_M2' pre-head on z⁻ = birth-state reference，不作臂）
+```
+
+`ρ_birth = (Acc_bridge − Acc_identity) / (Acc_M2'' − Acc_identity)`（identity 臂 = M2' 实现的显式 control）。前置：离线 refit 臂对官方 M2'/M2pb accuracy matrix 的 reproduction check（超差 → PROTOCOL_MISMATCH，ρ 不出）。
+
+判据冻结：**GREEN** ⟺ mean ≥0.8 且 pooled ≥0.8 且 worst 无系统性崩溃（跨有效 transition）；**YELLOW** 0.5–0.8（只许研究 loss/rank，不进主方法）；**RED** <0.5（full residual affine 都 <0.5 才真 RED）。z_ref 不变性门沿 B_pre 语义：violation → `ZREF_INVARIANCE_VIOLATION` 暂停结构结论，查 extraction bug，**不自动 fallback 1536 维**。
+
+**stopping-time 纪律**：M2pb task4 完成前只出 PRELIMINARY（task0–3），FINAL B0 VERDICT 等全有效 transition 集。
+
+**34.2.6 实现记录（2026-11-04，instrumentation-only diff）**：
+
+* `--bsab_pair_capture`（`config/datasets_delay.py`，默认 OFF = 逐位 no-op；legacy args 无该字段亦安全）。`Server_DF.__init__` fail-closed：与 `--refit_timing post_broadcast` 互斥（`BSAB_CAPTURE_UNSUPPORTED_REFIT_TIMING`，capture run = M2'-matched 冻结）；诊断构建（run_manager=None）拒绝启动；capture 目录 = `<run_dir>/bsab_capture/`（经 `args.bsab_capture_dir` 接线，client 不自行推导路径）。
+* `Client_DF.py`：`_bsab_capture_pre/post` 挂入两个广播入口（pre 在 `self.prompts = prompt` 前 = birth state；post 在 `load_prompts` 后、`_a5_post_broadcast_interface`/evaluate 前）。gate-1：pre/post 两半独立重建 row manifest（当前任务全行 train[=refit cache 口径]+test，固定顺序），`row_index_hash` + labels/split/sample_index 逐位重验；gate-2：pre 半段锚定 birth head（`heads[task_id]` 完整 state + hash 随缓存落盘），post 半段重验 hash；gate-3：四流 RNG snapshot/restore + 全模块 mode 恢复 + 独立 deterministic loader（eval+no_grad、shuffle=False、num_workers=0、batch=16 与正式缓存口径一致）；同名文件已存在 = fail-closed 拒绝覆盖。每 boundary 产物：`bsab_c{client}_t{task}_r{round}_{entry}.npz`（client/task/round/sample_index/split/label、z_ref_pre/z_op_pre/z_ref_post/z_op_post float32、`head__*` birth head state）+ `.json`（pre/post prompt hash、head_hash、row_index_hash、n_train/n_test、LOW_POWER 标记、feature_shape、gates 校验位、label-free 契约 note）。entry ∈ {broadcast（active client）, broadcast_no_test（passive client）}。
+* 单测 `tests/test_bsab_pair_capture.py`（11/11 PASS，CPU）：OFF = 逐位 no-op（含 legacy args、无 birth state skip）；ON 缓存内容逐字段校验（z_ref pre/post 不变性、z_op 精确偏移 broadcast delta、row manifest/head state/hash 全等）；gate-1/gate-2/半段错配/覆盖保护/缺目录全 fail-closed；**instrumentation neutrality：OFF vs ON 广播边界后 model/vit/head 张量、全模块 mode、四流 RNG state 与 next-draw 逐位一致**（run 级 OFF/ON regression 仍为正式 rerun 前的独立硬门，34.2.4）。
+* 既有回归：`tests.test_a5v2_refit_switches` + `tests.test_ctrp` 合跑 81 tests，除 Test8 CUDA replay 2 例（GPU 与运行中 M2pb 竞争的间歇 OOM；单跑 PASS 复现不了）外全过。
+
+#### 34.2.6a 协议发现：checkpoint 的 `prompts` 字段语义 = post-broadcast（2026-11-05）
+
+* **发现载体**：DSAR 离线试点冒烟（`diagnostics/dsar_offline_pilot.py`，cifar_base_p15 round_0010，用户执行）。症状：displacement c0–c4 **全部恰为 0.0**、`bt_identity=1.0`——z⁺ 与 z⁻ 逐位相同，B_t 三臂退化。
+* **根因**：广播入口 `Client_DF.py` L1234/L1261 `self.prompts = prompt` 在轮末 checkpoint 保存**之前**覆写 client 的 birth prompts → 所有 round/task_end checkpoint 里 `clients[i]['prompts'] == server_prompt`（全部 5 个 client；baseline/M2'/M2pb 所有 run 同构）。恢复后两遍前向逐位一致，与症状完全自洽。
+* **含义**：c1–c4 的 birth prompt 值**不可从任何 checkpoint 恢复**（c0 例外：KD no-op ⇒ fusion 轮 fused == c0 birth）。round 级 (z⁻, z⁺) 真配对的唯一来源 = in-run capture artifacts（`bsab_capture/*.npz`）——离线重构路线对 B_t 不成立，等价于回到预注册 B0 路径。
+* **连带裁决**：(1) DSAR pilot `--rounds all` 取消（B_t 列无效、L_t 列语义偏差）；(2) L_t（birth 语义）的修正试点 = capture npz 的 z⁻/labels + round checkpoint 的 tail_anchor（key/anchor_pool/head 不受广播覆写，H_end 可恢复）按 (client, task, round) 对齐——等 capture rerun 跑完后与 B0 一并做。
+* **留档的冒烟读数**（仅 round_0010、15 cells、PRELIMINARY 非门）：L_t 在**部署态（广播后）表示**上 +2.2pp overall / +3.3pp current-task，r=8 即近饱和——部署态读出存在低秩可修 slack 的初步迹象（注意：这是 L(z⁺) 语义，非设计的 birth-state L_t）。

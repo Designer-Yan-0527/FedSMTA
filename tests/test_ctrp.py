@@ -121,7 +121,11 @@ class _FakePrompt(nn.Module):
 
 class _StubClient:
     """Stands in for Client_DF at the server hook: canned route slots and
-    sweep results."""
+    sweep results. slots entries are either an int (a FULL 8-row batch at
+    that deployed slot) or an (slot, n_rows) tuple (partial/short batch),
+    matching the Gate Amendment batch-record protocol."""
+
+    FULL_BATCH_ROWS = 8
 
     def __init__(self, cid, slots, sweep=None):
         self.id = cid
@@ -134,7 +138,20 @@ class _StubClient:
         self.vit = _FakePrompt()
 
     def _ctrp_route_slots(self, server_prompt_module, **kw):
-        return list(self.slots)
+        out = []
+        for s in self.slots:
+            if isinstance(s, (tuple, list)):
+                slot, n_rows = int(s[0]), int(s[1])
+            else:
+                slot, n_rows = int(s), self.FULL_BATCH_ROWS
+            out.append({
+                "slot": slot,
+                "n_rows": n_rows,
+                "vote_margin_rows": n_rows,
+                "tie": False,
+                "partial": n_rows < self.FULL_BATCH_ROWS,
+            })
+        return out
 
     def _ctrp_alpha_sweep(self, prompt, anchor, slot, grid, **kw):
         self.sweep_calls.append(slot)
@@ -523,7 +540,9 @@ class Test5PremiseGate(unittest.TestCase):
             outcome = ("raise", str(e))
         return h.server, rm, outcome
 
-    def test_nonslot_above_1pct_fails_closed_and_persists_first(self):
+    def test_violation_rate_above_1pct_fails_closed_and_persists_first(self):
+        # 7 full batches at slot 6 + 1 FULL 8-row nonslot batch:
+        # sample-weighted violation rate = 8/64 = 12.5% > 1% -> fail
         server, rm, outcome = self._run_transition_with_slots(
             'ctrp_val', slots_t1=(6, 6, 7, 6, 6, 6, 6, 6))
         self.assertEqual(outcome[0], "raise")
@@ -533,7 +552,11 @@ class Test5PremiseGate(unittest.TestCase):
                   if name == "ctrp_events.jsonl"]
         self.assertTrue(events)
         self.assertEqual(events[-1]["event"], "CTRP_PREMISE_FAIL")
-        self.assertIn("nonslot batch fraction", events[-1]["reason"])
+        self.assertIn("deployed-route violation rate",
+                      events[-1]["reason"])
+        self.assertEqual(events[-1]["deployed_route_violation_rate"],
+                         0.125)
+        self.assertEqual(events[-1]["dominant_sample_mass"], "56/64")
         # premise fail = the candidate was NOT deployed/modified
         self.assertIsNone(server._ctrp_selected_alpha)
 
@@ -559,14 +582,63 @@ class Test5PremiseGate(unittest.TestCase):
             self.assertIn("CTRP_PREMISE_FAIL", outcome[1])
             self.assertIn("dominant slot changed", outcome[1])
 
-    def test_one_percent_nonslot_passes(self):
-        # 99 batches at the dominant slot + 1 non-dominant = exactly 1%
+    def test_one_percent_violation_rate_passes(self):
+        # 99 full batches at the dominant slot + 1 full nonslot batch:
+        # 8/800 = exactly the frozen 1% tolerance -> PASS (r <= tau)
         slots = (6,) * 99 + (7,)
         server, rm, outcome = self._run_transition_with_slots(
             'ctrp_val', slots_t1=slots)
         self.assertEqual(outcome[0], "ok")
         self.assertEqual(server._ctrp_history[-1]["premise_status"],
                          "pass")
+
+    # -- Gate Amendment (frozen 2026-11-04): sample-weighted statistic ----
+
+    def test_two_row_partial_nonslot_batch_passes_inr_forensic_case(self):
+        # the archived INR forensic: 92 full batches at slot 6 plus ONE
+        # 2-row partial batch routed to 7. Batch-count gate: 1/93 =
+        # 0.010753 > 0.01 FAIL; sample-weighted gate: 2/738 = 0.002710
+        # <= 0.01 PASS -- the amendment removes the granularity mismatch
+        # WITHOUT touching routing or the tolerance.
+        slots = ((6, 8),) * 92 + ((7, 2),)
+        server, rm, outcome = self._run_transition_with_slots(
+            'ctrp_val', slots_t1=slots)
+        self.assertEqual(outcome[0], "ok")
+        rec = server._ctrp_history[-1]
+        self.assertEqual(rec["premise_status"], "pass")
+        self.assertEqual(rec["dominant_sample_mass"], "736/738")
+        self.assertAlmostEqual(rec["deployed_route_violation_rate"],
+                               2 / 738, places=6)
+        # the legacy batch-count metric survives as diagnostic_only and
+        # shows exactly why the old gate would have failed
+        diag = rec["diagnostic_only"]
+        self.assertEqual(diag["nonslot_batches"], "1/93")
+        self.assertEqual(diag["nonslot_batch_frac"], 0.010753)
+        self.assertEqual(diag["partial_nonslot_batches"], 1)
+
+    def test_dominant_slot_selection_is_sample_weighted(self):
+        # dominant slot p* is the one carrying the most SAMPLES, not the
+        # most batches: 5 full batches (40 rows) at slot 7 vs 6 two-row
+        # batches (12 rows) at slot 6 -> p* = 7 (batch-count argmax
+        # would have picked 6)
+        h = _HookHarness(mode='ctrp_val', ge=2,
+                         slots=((7, 8),) * 5 + ((6, 2),) * 6,
+                         sweep=_sweep_res([2.0] * 21, n_rows=10))
+        h.run(1)      # state 0 records s_0*
+        s = h.server
+        self.assertEqual(s._ctrp_prev_dominant_slot, 7)
+        rec = s._ctrp_history[-1]
+        self.assertEqual(rec["dominant_sample_mass"], "40/52")
+        self.assertAlmostEqual(rec["deployed_route_violation_rate"],
+                               12 / 52, places=6)
+
+    def test_sample_weighted_violation_above_1pct_fails(self):
+        # 33 full batches at slot 6 + 1 full nonslot batch: 8/272 =
+        # 0.0294 > 0.01 -> still fail-closed under the amended gate
+        server, rm, outcome = self._run_transition_with_slots(
+            'ctrp_val', slots_t1=(6,) * 33 + (7,))
+        self.assertEqual(outcome[0], "raise")
+        self.assertIn("CTRP_PREMISE_FAIL", outcome[1])
 
     def test_premise_fail_reason_lands_in_run_dir(self):
         rm = _StubRunManager()

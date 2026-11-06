@@ -207,6 +207,37 @@ def get_args_parser(subparsers):
                                  '(deterministic class-stratified, seed '
                                  'a5_stable_seed(seed, client, task); must '
                                  'lie strictly within (0, 1))')
+    # §34.2 0b -- BSAB_PAIR_CAPTURE (pre-registered RUNCOMMANDS Sec.34.2;
+    # user APPROVED FOR IMPLEMENTATION 2026-11-04, instrumentation-only):
+    # pre/post-broadcast feature-pair cache for the B0 birth test.
+    # Default OFF = completely bit-identical no-op. The capture run is
+    # FROZEN as M2'-matched (--refit_timing local; fail-closed otherwise):
+    # the in-run deployed head IS the M2' birth head, so B0 cleanly asks
+    # whether a coordinate bridge can substitute for the M2'' post-
+    # broadcast refit. Scope: capture ONLY (per-row z_ref/z_op pre+post,
+    # prompt/head/row-index hashes, full-row train+test cache, RNG-neutral
+    # diagnostic forward, independent bsab_capture/ output dir). No BSAB
+    # module, no head/loss/prompt/optimizer/broadcast changes -- BSAB
+    # architecture implementation stays FROZEN until the true birth-pair
+    # B0 verdict. Labels are cached for offline accuracy evaluation only
+    # and never enter bridge fitting. See RUNCOMMANDS.md Sec.34.2.
+    subparsers.add_argument('--bsab_pair_capture', action='store_true',
+                            help='Sec.34.2 0b instrumentation-only pre/post-'
+                                 'broadcast pair capture (default OFF = '
+                                 'bit-identical). Per broadcast boundary, '
+                                 'caches the current task FULL train+test '
+                                 'rows with z_ref/z_op on both sides of '
+                                 'load_prompts, plus pre/post prompt '
+                                 'hashes, the anchored birth head (state '
+                                 '+ hash) and the row_index_hash (same '
+                                 'sample-index sequence for both halves). '
+                                 'Four-stream RNG snapshot/restore + mode '
+                                 'restore: capture OFF vs ON trajectories '
+                                 'must be bitwise identical. Fail-closed '
+                                 'with --refit_timing post_broadcast '
+                                 '(capture run = M2\'-matched, '
+                                 'BSAB_CAPTURE_UNSUPPORTED_REFIT_TIMING). '
+                                 'Outputs to <run_dir>/bsab_capture/.')
     subparsers.add_argument('--client_num', default=5, type=int,
                             help='the num of client')
     subparsers.add_argument('--task_num', default=5, type=int,

@@ -1,5 +1,7 @@
+import json
 import time
 from copy import deepcopy
+from pathlib import Path
 import random
 
 import numpy as np
@@ -47,6 +49,13 @@ A5_REFIT_EPOCHS = 100
 A5_REFIT_LR = 1e-3
 A5_REFIT_WD = 1e-4
 A5_REFIT_BATCH = 64
+
+# §34.2 0b BSAB_PAIR_CAPTURE：全行缓存的最低 power 参考线（train rows 少于
+# 此值时用全部可用行并记 LOW_POWER；N_fit≳2d≈1536 为 full-affine 欠定线）
+# 与固定 diagnostic loader batch（B=16 = 正式 refit cache / feature
+# extraction 口径；z_op 依赖 batch 组成，pre/post 必须同 batch 切分）
+BSAB_CAPTURE_MIN_FIT = 2048
+BSAB_CAPTURE_BATCH = 16
 
 
 def a5_stable_seed(*parts):
@@ -140,6 +149,15 @@ class Client_DF(object):
         self._ctrp_on = (
             str(getattr(args, 'ctrp_mode', 'off') or 'off') != 'off')
         self._ctrp_val_frac = float(getattr(args, 'ctrp_val_frac', 0.20))
+
+        # §34.2 0b：BSAB_PAIR_CAPTURE instrumentation（默认 OFF = 完全
+        # no-op，逐位一致）。授权边界 instrumentation-only：不做任何 BSAB
+        # 结构实现，不改 head/loss/prompt/optimizer/训练顺序/广播行为。
+        # 输出目录由 Server_DF 从 RunManager 接线（args.bsab_capture_dir），
+        # client 不自行推导路径（诊断构建 fail-closed，见 Server_DF）。
+        self._bsab_capture_on = bool(
+            getattr(args, 'bsab_pair_capture', False))
+        self._bsab_pending = None
 
 
     def init_local_model(self,model_name,args=None):
@@ -470,7 +488,18 @@ class Client_DF(object):
         statistics). Asserts the route is constant within each batch
         (batchwise top-1 routing, top_k=1). Never hardcoded to a dataset
         slot. Deterministic: fixed row order, shuffle=False, no_grad,
-        full state save/restore + RNG guard."""
+        full state save/restore + RNG guard.
+
+        Gate Amendment (frozen 2026-11-04): returns one record per
+        batch -- {slot, n_rows, vote_margin_rows, tie, partial} --
+        where slot is the DEPLOYED route (unchanged) and n_rows feeds
+        the sample-weighted premise statistic
+            M_s = sum_b n_b * 1[p_b = s],  p* = argmax_s M_s,
+            r = 1 - M_{p*} / sum_b n_b,      PASS iff r <= 0.01.
+        vote_margin_rows / tie / partial are AUDIT-ONLY diagnostics
+        (per-row top-1 preference vote margin, recomputed with the
+        Global_Prompt routing math; they never enter PASS/FAIL and
+        never alter the deployed route)."""
         if rows is None:
             split = self.data_split_indices.get(self.task_id, {})
             if rows_key not in split or not split[rows_key]:
@@ -490,7 +519,7 @@ class Client_DF(object):
             self.vit.eval()
             self.model.eval()
             self._ctrp_with_candidate(server_prompt_module)
-            slots = []
+            batches = []
             loader = DataLoader(Subset(self.train_data[t], list(rows)),
                                batch_size=batch_size, shuffle=False,
                                num_workers=getattr(self.args,
@@ -514,8 +543,34 @@ class Client_DF(object):
                         "CTRP: prompt_idx is not constant within a batch "
                         f"on client {self.id} (batchwise top-1 top_k=1 "
                         "premise violated; fail-closed)")
-                slots.append(int(idx[0, 0].item()))
-            return slots
+                slot = int(idx[0, 0].item())
+                n_rows = int(idx.shape[0])
+                # audit-only per-row preference votes (Global_Prompt
+                # routing math, embedding_key='cls' via cls_features;
+                # same l2_normalize + matmul as the deployed forward)
+                pm = self.vit.prompt
+                with torch.no_grad():
+                    key = pm.prompt_key
+                    prompt_norm = pm.l2_normalize(key, dim=1)
+                    x_norm = pm.l2_normalize(q, dim=1)
+                    sim = torch.matmul(x_norm, prompt_norm.t())
+                    _, row_pref = torch.topk(sim, k=1, dim=1)
+                    votes = torch.bincount(
+                        row_pref.reshape(-1).to(torch.int64),
+                        minlength=int(key.shape[0]))
+                    if votes.numel() >= 2:
+                        top2 = torch.topk(votes, k=2).values
+                        margin = int(top2[0] - top2[1])
+                    else:
+                        margin = n_rows
+                batches.append({
+                    "slot": slot,
+                    "n_rows": n_rows,
+                    "vote_margin_rows": margin,
+                    "tie": bool(margin == 0),
+                    "partial": bool(n_rows < batch_size),
+                })
+            return batches
         finally:
             self.vit.prompt = orig_prompt
             if flags[0] is not None:
@@ -875,17 +930,313 @@ class Client_DF(object):
             self.vit.train(vit_was_training)
             self._a5_rng_restore(rng)
 
+    # ------------------------------------------------------------------
+    # §34.2 0b: BSAB_PAIR_CAPTURE -- instrumentation-only pre/post-
+    # broadcast pair cache（user 2026-11-04 APPROVED FOR IMPLEMENTATION；
+    # capture run = M2'-matched，见 Server_DF fail-closed 与 RUNCOMMANDS
+    # §34.2）。授权范围 = capture ONLY：不加 BSAB module、不改 head/loss/
+    # prompt/optimizer/训练顺序/dataloader split/广播行为，不接入任何
+    # CTRP/endpoint 正式臂。六条 hard gate 落点：
+    #   (1) 严格同一批 sample 配对：pre/post 两半各自独立重建同一 row
+    #       manifest，row_index_hash 不一致即 fail-closed（不依赖
+    #       dataloader 顺序，直接保存 sample_index）；
+    #   (2) birth head 在 load_prompts 前锚定（heads[task_id] = local
+    #       timing 下的 M2' refit birth head）：保存完整 state + head_hash，
+    #       post 半段重验 hash 不变；
+    #   (3) capture 不影响正式轨迹：四流 RNG snapshot/restore + 全模块
+    #       mode 恢复 + 独立 deterministic loader，OFF/ON 逐位一致由
+    #       tests/test_bsab_pair_capture.py + 正式 rerun 前的 OFF/ON
+    #       regression 双层把关；
+    #   (4) bridge fit 严格 label-free：label 字段只供离线 accuracy
+    #       evaluation / M2'' positive control（离线探针侧契约）；
+    #   (5)(6) 为离线 B0 侧纪律（reproduction gate / confirmatory），
+    #       不在本 hook 内实现。
+    # ------------------------------------------------------------------
+
+    def _bsab_capture_dir(self):
+        """capture 输出目录（Server_DF 从 RunManager 接线；缺失即
+        fail-closed，绝不静默改写别处）。"""
+        path = str(getattr(self.args, 'bsab_capture_dir', '') or '')
+        if not path:
+            raise RuntimeError(
+                "client %d: --bsab_pair_capture is ON but no capture "
+                "directory was wired (Server_DF sets args.bsab_capture_dir "
+                "from the run's RunManager; diagnostic builds are "
+                "fail-closed)" % self.id)
+        return Path(path)
+
+    def _bsab_capture_rows(self):
+        """gate-1 row manifest：当前任务的全部 train rows（refit cache 同
+        口径 = _ctrp_train_indices；capture run 为 CTRP-off 的 M2'-matched
+        rerun，即完整 inner-train）+ 全部 test rows，记录顺序固定为
+        train-block 在前、test-block 在后。两半独立重建并以
+        row_index_hash 相互校验。"""
+        split = self.data_split_indices.get(self.task_id, {})
+        train_idx = list(self._ctrp_train_indices(self.task_id))
+        test_idx = list(split.get("test", []))
+        rows = ([("train", i) for i in train_idx]
+                + [("test", i) for i in test_idx])
+        if not rows:
+            raise RuntimeError(
+                "client %d task %d: BSAB capture found no train/test rows "
+                "(fail-closed)" % (self.id, self.task_id))
+        h = _a5_hashlib.sha256()
+        h.update("|".join("%s:%d" % r for r in rows).encode())
+        return rows, h.hexdigest()[:16]
+
+    def _bsab_forward_rows(self, rows):
+        """§34.2.3 deterministic diagnostic forward：eval + no_grad、固定
+        行序、shuffle=False、num_workers=0 的独立顺序 loader（绝不复用
+        正式训练 loader 的 shuffle/iterator 状态）；调用方包四流 RNG
+        snapshot/restore。特征流语义 = refit cache / extract_features：
+        z_ref = frozen original model 的 feat；z_op = 当前任务 prompt 增强
+        的 pre-anchor feat（task_id=self.task_id，train=True flag 在
+        eval+no_grad 下与正式缓存采集一致），batch=BSAB_CAPTURE_BATCH。
+        返回 (z_ref, z_op, labels, split_codes, sample_idx)，float32。"""
+        if self.original_model is None:
+            raise RuntimeError(
+                "client %d: BSAB capture requires the frozen original "
+                "model (z_ref stream; fail-closed)" % self.id)
+        by_split = {"train": [], "test": []}
+        for name, idx in rows:
+            by_split[name].append(idx)
+        dataset = self.train_data[self.task_id]
+        z_refs, z_ops, labels, split_codes, sample_idx = [], [], [], [], []
+        for split_name, code in (("train", 0), ("test", 1)):
+            if not by_split[split_name]:
+                continue
+            loader = DataLoader(
+                Subset(dataset, list(by_split[split_name])),
+                batch_size=BSAB_CAPTURE_BATCH, shuffle=False, num_workers=0)
+            for input, target in loader:
+                input = input.to(self.device, non_blocking=True)
+                with torch.no_grad():
+                    out_ref = self.original_model(input)
+                    out_op = self.vit(input, task_id=self.task_id,
+                                      cls_features=out_ref["pre_logits"],
+                                      train=True)
+                z_refs.append(out_ref["feat"].float().cpu().numpy())
+                z_ops.append(out_op["feat"].float().cpu().numpy())
+                labels.append(np.asarray(target, dtype=np.int64))
+                split_codes.append(np.full(len(target), code, np.int64))
+            sample_idx.extend(by_split[split_name])
+        z_ref = np.concatenate(z_refs).astype(np.float32)
+        z_op = np.concatenate(z_ops).astype(np.float32)
+        return (z_ref, z_op, np.concatenate(labels),
+                np.concatenate(split_codes),
+                np.asarray(sample_idx, dtype=np.int64))
+
+    def _bsab_capture_pre(self, round_id, entry):
+        """pre（z⁻）半段：get_global_proto_and_head* 入口处、
+        `self.prompts = prompt` / load_prompts 之前调用。z⁻ 必须在
+        client 自己的本地训练后 prompt 状态下前向 —— 该 birth state
+        在 train() 末尾保存进 self.prompts；而共享 vit 此刻持的是
+        别的 client 的残留状态（服务器先全体训练、再依次广播），
+        直接用 vit 现状会把 c1..c4 的 z⁻ 采成已广播态（两臂 regression
+        的 z_op_static=8/10 即此泄漏，bugfix 2026-11-04）。因此本函数
+        临时装载 self.prompts → z⁻ 前向 → 恢复 vit 原状（观察者中立：
+        装载/恢复均为 deepcopy，不消耗 RNG；且紧随其后的
+        load_prompts(广播 prompt) 无论如何都会覆盖）。
+        gate-2：此时锚定 birth head（heads[task_id] 的完整 state +
+        head_hash）。全程四流 RNG snapshot/restore + 模块 mode 恢复。"""
+        if not self._bsab_capture_on:
+            return
+        self._bsab_pending = None
+        if (self.task_id < 0
+                or self.task_id not in self.data_split_indices):
+            return  # 该 client 尚无任何 birth state（从未见过任务数据）
+        if self.original_model is None:
+            raise RuntimeError(
+                "client %d: BSAB capture requires the frozen original "
+                "model (z_ref stream; fail-closed)" % self.id)
+        rng = self._a5_rng_snapshot()
+        flags = (self.vit.training, self.model.training,
+                 self.original_model.training)
+        birth_prompts = self.prompts
+        if birth_prompts is None:
+            raise RuntimeError(
+                "client %d: BSAB capture found no local birth prompt "
+                "state in self.prompts at the broadcast boundary "
+                "(fail-closed)" % self.id)
+        vit_prompt_snapshot = deepcopy(self.vit.get_prompts())
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            self.model.eval()
+            rows, row_index_hash = self._bsab_capture_rows()
+            head = self.heads[self.task_id]
+            if head is None:
+                raise RuntimeError(
+                    "client %d task %d: no birth head in heads[task] at "
+                    "the broadcast boundary (fail-closed)"
+                    % (self.id, self.task_id))
+            head_state = {k: v.detach().cpu().contiguous().clone()
+                          for k, v in head.state_dict().items()}
+            # z⁻ 在 client 自己的 birth prompt 状态下前向（见 docstring：
+            # 共享 vit 持的是其他 client 的残留态/上一轮广播态）
+            self.vit.load_prompts(deepcopy(birth_prompts))
+            z_ref, z_op, labels, split_codes, sample_idx = \
+                self._bsab_forward_rows(rows)
+            self._bsab_pending = {
+                "round_id": int(round_id), "entry": entry,
+                "row_index_hash": row_index_hash,
+                "head_hash": hash_prompt_module(head),
+                "head_state": head_state,
+                "pre_prompt_hash": hash_prompt_module(birth_prompts),
+                "z_ref_pre": z_ref, "z_op_pre": z_op,
+                "labels": labels, "split_codes": split_codes,
+                "sample_idx": sample_idx,
+                "n_train": sum(1 for r in rows if r[0] == "train"),
+                "n_test": sum(1 for r in rows if r[0] == "test"),
+                "feature_shape": list(z_op.shape[1:]),
+            }
+        finally:
+            self.vit.load_prompts(vit_prompt_snapshot)
+            self.original_model.train(flags[2])
+            self.model.train(flags[1])
+            self.vit.train(flags[0])
+            self._a5_rng_restore(rng)
+
+    def _bsab_capture_post(self, round_id, entry):
+        """post（z⁺）半段：vit.load_prompts(广播 prompt) 之后、
+        _a5_post_broadcast_interface / 任何 evaluate 之前调用。两半配对
+        校验（gate-1 row manifest + gate-2 birth head hash 均重验）后原子
+        写出 npz + json 到独立 capture 目录。已存在同名文件 = fail-closed
+        （绝不静默覆盖旧 capture）。"""
+        if not self._bsab_capture_on:
+            return
+        pend = self._bsab_pending
+        self._bsab_pending = None
+        if pend is None:
+            return
+        if int(round_id) != pend["round_id"] or entry != pend["entry"]:
+            raise RuntimeError(
+                "client %d: BSAB capture halves mismatched (pre r%d %s vs "
+                "post r%d %s; fail-closed)"
+                % (self.id, pend["round_id"], pend["entry"],
+                   int(round_id), entry))
+        rng = self._a5_rng_snapshot()
+        flags = (self.vit.training, self.model.training,
+                 self.original_model.training)
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            self.model.eval()
+            rows, row_index_hash = self._bsab_capture_rows()
+            if row_index_hash != pend["row_index_hash"]:
+                raise RuntimeError(
+                    "client %d round %d: GATE-1 VIOLATION: the row "
+                    "manifest changed between the pre and post capture "
+                    "halves (%s != %s; strict same-sample pairing is "
+                    "broken; fail-closed)"
+                    % (self.id, round_id, pend["row_index_hash"],
+                       row_index_hash))
+            head = self.heads[self.task_id]
+            head_hash = (hash_prompt_module(head)
+                         if head is not None else None)
+            if head_hash != pend["head_hash"]:
+                raise RuntimeError(
+                    "client %d round %d: GATE-2 VIOLATION: the birth head "
+                    "changed between the pre and post capture halves "
+                    "(%s != %s; fail-closed)"
+                    % (self.id, round_id, pend["head_hash"], head_hash))
+            post_prompt_hash = hash_prompt_module(self.vit.prompt)
+            z_ref_post, z_op_post, labels, split_codes, sample_idx = \
+                self._bsab_forward_rows(rows)
+            if (not np.array_equal(labels, pend["labels"])
+                    or not np.array_equal(split_codes,
+                                          pend["split_codes"])
+                    or not np.array_equal(sample_idx,
+                                          pend["sample_idx"])):
+                raise RuntimeError(
+                    "client %d round %d: GATE-1 VIOLATION: paired row "
+                    "metadata diverged between capture halves "
+                    "(fail-closed)" % (self.id, round_id))
+            out_dir = self._bsab_capture_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stem = "bsab_c%d_t%d_r%04d_%s" % (self.id, self.task_id,
+                                              int(round_id), entry)
+            npz_path = out_dir / (stem + ".npz")
+            json_path = out_dir / (stem + ".json")
+            if npz_path.exists() or json_path.exists():
+                raise RuntimeError(
+                    "client %d round %d: BSAB capture output already "
+                    "exists (%s); refusing to overwrite an earlier "
+                    "capture (fail-closed)"
+                    % (self.id, round_id, npz_path))
+            n = len(pend["labels"])
+            arrays = dict(
+                client_ids=np.full(n, self.id, dtype=np.int64),
+                task_ids=np.full(n, self.task_id, dtype=np.int64),
+                round_ids=np.full(n, int(round_id), dtype=np.int64),
+                sample_index=pend["sample_idx"],
+                split=pend["split_codes"],
+                label=pend["labels"],
+                z_ref_pre=pend["z_ref_pre"],
+                z_op_pre=pend["z_op_pre"],
+                z_ref_post=z_ref_post,
+                z_op_post=z_op_post,
+            )
+            for k, v in pend["head_state"].items():
+                arrays["head__" + k] = v.numpy()
+            np.savez(npz_path, **arrays)
+            meta = {
+                "client_id": self.id,
+                "task_id": self.task_id,
+                "round_id": int(round_id),
+                "entry": entry,
+                "pre_prompt_hash": pend["pre_prompt_hash"],
+                "post_prompt_hash": post_prompt_hash,
+                "head_hash": pend["head_hash"],
+                "row_index_hash": row_index_hash,
+                "n_rows": int(n),
+                "n_train": int(pend["n_train"]),
+                "n_test": int(pend["n_test"]),
+                "n_fit": int(pend["n_train"]),
+                "low_power": bool(pend["n_train"] < BSAB_CAPTURE_MIN_FIT),
+                "feature_shape": pend["feature_shape"],
+                "seed": int(getattr(self.args, "seed", -1)),
+                "head_refit": bool(getattr(self.args, "head_refit",
+                                           False)),
+                "refit_input": str(getattr(self.args, "refit_input",
+                                           "x1")),
+                "refit_timing": str(getattr(self.args, "refit_timing",
+                                            "local")),
+                "gates": {"row_pairing_verified": True,
+                          "birth_head_hash_verified": True},
+                "note": ("instrumentation-only BSAB_PAIR_CAPTURE "
+                         "(RUNCOMMANDS Sec.34.2); M2'-matched; BSAB "
+                         "architecture implementation FROZEN; label is "
+                         "cached for offline accuracy evaluation only "
+                         "and must NEVER enter bridge fitting/selection"),
+            }
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, sort_keys=True)
+        finally:
+            self.original_model.train(flags[2])
+            self.model.train(flags[1])
+            self.vit.train(flags[0])
+            self._a5_rng_restore(rng)
+
     def load_global_weights(self,weights):
         self.model.load_state_dict(weights)
         self.evaluate(self.task_id,self.nb_classes)
 
     def get_global_proto_and_head(self,proto,head,prompt,round):
+        # §34.2 0b pre（z⁻）捕获：load_prompts 之前 = 本地训练后 birth
+        # state；默认（capture OFF）= 完全 no-op
+        self._bsab_capture_pre(round, entry='broadcast')
+
         self.global_protos = deepcopy(proto)
 
         self.global_head = head
 
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
+
+        # §34.2 0b post（z⁺）捕获：广播 prompt 已装载、任何 post-broadcast
+        # refit / evaluate 之前；默认（capture OFF）= 完全 no-op
+        self._bsab_capture_post(round, entry='broadcast')
 
         # A5-v2 §28 判据臂（--refit_timing post_broadcast）：广播后接口
         # 状态（融合 prompt 已装载）上的 refit，特征流与随后的 evaluate
@@ -899,12 +1250,19 @@ class Client_DF(object):
         return {0: acc_task0, self.task_id: acc_current}
 
     def get_global_proto_and_head_no_test(self, proto, head, prompt, round):
+        # §34.2 0b pre（z⁻）捕获（passive-client 广播路径；默认 OFF =
+        # 完全 no-op）
+        self._bsab_capture_pre(round, entry='broadcast_no_test')
+
         self.global_protos = deepcopy(proto)
 
         self.global_head = head
 
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
+
+        # §34.2 0b post（z⁺）捕获（默认 OFF = 完全 no-op）
+        self._bsab_capture_post(round, entry='broadcast_no_test')
 
 
     def get_head(self,head):
