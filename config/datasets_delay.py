@@ -238,6 +238,35 @@ def get_args_parser(subparsers):
                                  '(capture run = M2\'-matched, '
                                  'BSAB_CAPTURE_UNSUPPORTED_REFIT_TIMING). '
                                  'Outputs to <run_dir>/bsab_capture/.')
+    # §34.4/§34.4a B1 DSAR sidecar (frozen 2026-11-06, SHARED_PATH_
+    # CONFIRMED): client-local per-broadcast r8 readout adapters.
+    # Deployment: current task z+ -> B -> L -> Tail_Anchor_t; historical
+    # task z+ -> B -> Tail_Anchor_k (B-only). B = label-free fixed-
+    # lambda ridge bridge (lambda = N*s*gamma_star, gamma_star =
+    # 0.390324) with an unlabeled 80/20 paired-MSE identity guard; L =
+    # rank-8 residual adapter trained by masked CE through the frozen
+    # H_end (100ep / bs64 / Adam / lr1e-3 / wd1e-4). Default OFF =
+    # completely bit-identical no-op (official path untouched). Zero
+    # added FL payload: sidecar state never enters fed_avg / server
+    # state transfer; checkpoints gain a dsar_sidecar key on ON runs
+    # only. Fail-closed with --head_refit / --ctrp_mode != off.
+    subparsers.add_argument('--dsar', action='store_true',
+                            help='Sec.34.4/34.4a B1 DSAR readout sidecar '
+                                 '(default OFF = bit-identical). Per prompt '
+                                 'broadcast, each client locally fits '
+                                 'B (label-free ridge bridge z+ -> z-, '
+                                 'fixed lambda, identity-guarded) and L '
+                                 '(rank-8 residual CE adapter on the '
+                                 'current task); evaluate applies the '
+                                 'frozen dispatch (current: B->L, '
+                                 'historical: B-only) before Tail_Anchor. '
+                                 'RNG/mode-neutral fits; zero FL payload.')
+    subparsers.add_argument('--dsar_identity', action='store_true',
+                            help='G1 verification mode (requires --dsar): '
+                                 'skip all fits, commit exact-identity '
+                                 'sidecars every broadcast. OFF vs '
+                                 'ON(identity) must be bit-identical '
+                                 '(logits/checkpoints); NOT a method arm.')
     subparsers.add_argument('--client_num', default=5, type=int,
                             help='the num of client')
     subparsers.add_argument('--task_num', default=5, type=int,

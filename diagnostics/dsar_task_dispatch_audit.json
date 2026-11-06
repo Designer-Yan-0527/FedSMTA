@@ -1,0 +1,61 @@
+{
+  "audit": "DSAR B1 historical task dispatch audit (read-only, code evidence)",
+  "date": "2026-11-06",
+  "verdict": "SHARED_PATH_CONFIRMED",
+  "scope": "Models/Client_DF.py, Models/Server_DF.py, Models/Tail_Anchor.py",
+  "questions": {
+    "1_current_task_readout": {
+      "chain": [
+        "Client_DF.evaluate() L1344-1348: original_model(input)['pre_logits'] -> vit(input, task_id=self.task_id, cls_features, train=True)['feat'] == z_op (768d)",
+        "Client_DF L1348: z_op -> self.model(z_op, target) == Tail_Anchor.forward",
+        "Tail_Anchor.forward L35-66: l2n(z_op) @ key_norm.t() -> top-1 index -> anchor_pool[index]",
+        "head input = [z_op (768) || anchor (768)] -> Chead(1536->512->nb_classes) -> pre logits",
+        "Client_DF.evaluate L1354-1357: class_mask[task] index_fill -inf -> argmax"
+      ],
+      "note": "z_ref is NOT in the deployed readout: it is the frozen-original-model feature stream used only as capture reference (Client_DF L992: 'z_ref = frozen original model 的 feat; z_op = 当前任务 prompt 增强'). Chead 1536 = z_op half || anchor half (refit feat arm L805-808: head(x1)=z_op head, x1[:, :768] 即 z_op)."
+    },
+    "2_historical_task_readout": {
+      "finding": "HISTORICAL TASKS DO GO THROUGH THE CURRENT POST-BROADCAST PROMPT STATE.",
+      "evidence": [
+        "Client_DF.evaluate() L1347: vit forward uses task_id=self.task_id (the client's CURRENT task), NOT the evaluated task argument",
+        "Client_DF.get_global_proto_and_head() L1235: self.vit.load_prompts(self.prompts) loads the broadcast prompt BEFORE evaluate calls (L1246-1247)",
+        "Therefore a task-k test sample (k<t) is embedded with the current task's post-broadcast prompt state: its z_op carries the same broadcast displacement that B_{c,r} corrects"
+      ],
+      "per_round_eval": "L1246-1247: broadcast immediately evaluates evaluate(0) and evaluate(self.task_id) — task0 is evaluated EVERY round post-broadcast; full matrix at task end via run_full_evaluation"
+    },
+    "3_head_selection": {
+      "rule": [
+        "Client_DF.evaluate() L1334: self.model.load_head(self.heads[task]) — the EVALUATED task's head (historical heads[k] preserved locally)",
+        "L1354: class_mask[task] for masking",
+        "Tail_Anchor key/anchor_pool are client-local parameters; NOT in fed_avg payload (Server_DF aggregation = prompts L1128 fed_avg_prompt, vit.head L1153 fed_avg_head, protos BGPS, SIKF kd_fusion_prompt L314) — anchor routing semantics remain baseline"
+      ]
+    },
+    "4_task_dispatch_source": {
+      "finding": "Dispatch is protocol-driven, never label-driven.",
+      "evidence": [
+        "Server_DF L335-345: broadcast loop calls get_global_proto_and_head which evaluates {0, task_id} (Client_DF L1246-1250)",
+        "evaluate_all_seen_tasks L1440: ascending task order at task end",
+        "No path selects head/route from test labels; task_id for vit forward is always self.task_id"
+      ]
+    },
+    "5_adapter_insertion_point": {
+      "finding": "Insert B->L on the 768d feat tensor BEFORE it enters self.model(); anchor routing then sees the corrected feature, matching the exact semantics validated in B0 preview (ta_logits uses corrected z_adj for BOTH routing and readout).",
+      "evidence": [
+        "Client_DF.evaluate() L1348: single tensor handoff z_op -> self.model(z_op, target)",
+        "B0 preview fit_lt/ta_logits: z_adj = zm + (zm@V)@U.t() + b participates in key matching AND head readout — identical to inserting at L1348",
+        "Capture pre/post hooks (L1228/L1239) bracket vit.load_prompts — the post hook position (L1239) is the exact B fit slot; L 拟合 slot = before L1228 (pre-broadcast, z^- era)"
+      ],
+      "z_ref_correction": "PREREG ERRATUM NEEDED: §34.4 deployment graph 'H_end(z_ref ⊕ L(B(z_op)))' is wrong — z_ref does not enter the head. True graph: H_k([L(B(z_op)) ⊕ anchor(L(B(z_op)))]) — anchor half from unchanged key-anchor routing on the corrected feature."
+    },
+    "6_cross_task_transferability": {
+      "code_fact": "Code CAN apply B to historical readout: historical z_op is produced by the same post-broadcast current-task vit state that B corrects (Q2 evidence). The broadcast displacement is a property of the round's prompt aggregation, not of task membership.",
+      "static_audit_limit": "Static audit proves applicability only. Whether a B fitted on current-task train rows generalizes to old-task z_op distributions is OUT-of-distribution risk and MUST be settled by the B1 experiment (G_old gate), not by this audit.",
+      "dist_ckpt": "kd_fusion_prompt (SIKF) runs on non-task-end rounds (Server_DF L312-314), so broadcast composition varies within a task — B is fitted per-round on the same round it is applied, so this is consistent"
+    }
+  },
+  "implementation_risks_found": [
+    "evaluate() uses vit forward with train=True and DataLoader(batch_size=8, shuffle=True) (L1330, L1347): deployed z_op is a stochastic forward artifact. B0 preview already validated B on npz rows (bs16 diagnostic loader, also train=True), so the mechanism tolerates this; B1 G4 must record feature-extraction parity (fit rows bs16 vs eval stream bs8) and use RNG-snapshot paired evaluation for Base-vs-DSAR shadow comparison",
+    "per-round evaluate in broadcast (L1246-1247) evaluates task0 + current — historical readout coverage per round is task0; the remaining old tasks are covered at task end (run_full_evaluation) — G_old must be computed from the official task-end matrix (a_{t,k}), matching §34.4"
+  ],
+  "decision_for_user": "SHARED_PATH_CONFIRMED: historical B-only branch (B -> H_k, no L for k<t) is architecturally legal with unchanged head selection / anchor routing / task mask. Requesting approval to freeze it as the B1 historical dispatch."
+}

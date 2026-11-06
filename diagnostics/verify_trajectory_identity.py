@@ -36,6 +36,10 @@ import argparse
 import sys
 from pathlib import Path
 
+# 允许从 repo 根目录直接运行：python diagnostics/verify_trajectory_identity.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import numpy as np
 import torch
 
 from runtime_utils import load_checkpoint_file
@@ -84,11 +88,14 @@ def walk(a, b, path, diffs):
         return
     if isinstance(a, dict) and isinstance(b, dict):
         for k in sorted(set(a) | set(b), key=str):
+            # 注意：缺失字段的分类必须按子路径算（父路径的 kind 会把
+            # a5_joint_head 这类插桩专属字段误判为 hard）
+            ckind = classify(path + (str(k),))
             if k not in a:
-                diffs.append((kind, path + (str(k),), "only-in-treatment",
+                diffs.append((ckind, path + (str(k),), "only-in-treatment",
                              None, None))
             elif k not in b:
-                diffs.append((kind, path + (str(k),), "only-in-baseline",
+                diffs.append((ckind, path + (str(k),), "only-in-baseline",
                              None, None))
             else:
                 walk(a[k], b[k], path + (str(k),), diffs)
@@ -100,7 +107,16 @@ def walk(a, b, path, diffs):
         for i, (x, y) in enumerate(zip(a, b)):
             walk(x, y, path + (str(i),), diffs)
         return
-    if type(a) is not type(b) or a != b:
+    if type(a) is not type(b):
+        diffs.append((kind, path, "value mismatch",
+                      repr(a)[:50], repr(b)[:50]))
+        return
+    try:
+        unequal = bool(a != b)
+    except (ValueError, TypeError):
+        # numpy 数组等容器：!= 返回数组，改用逐位比较
+        unequal = not np.array_equal(a, b)
+    if unequal:
         diffs.append((kind, path, "value mismatch",
                       repr(a)[:50], repr(b)[:50]))
 

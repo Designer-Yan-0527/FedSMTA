@@ -153,7 +153,7 @@ def fit_bridge(zp_train, zm_train):
     scale = float(torch.diagonal(XtX).mean())
     # hat 矩阵迹的 GCV 快速近似：ridge hat trace = Σ d_i/(d_i+λ)（eigh 一次）
     evals = torch.linalg.eigvalsh(XtX)
-    best = None                            # (gcv, lam, delta)
+    best = None                            # (gcv, lam, delta, expo)
     for expo in torch.linspace(-4, 4, 33):
         lam = float(10 ** expo) * scale
         delta = torch.linalg.solve(XtX + torch.eye(d).double() * lam, XtD)
@@ -162,17 +162,20 @@ def fit_bridge(zp_train, zm_train):
         tr = float((evals / (evals + lam)).sum()) / n
         gcv = mse / max(1e-12, (1.0 - tr) ** 2)
         if best is None or gcv < best[0]:
-            best = (gcv, lam, delta)
-    _, lam, delta = best
+            best = (gcv, lam, delta, float(expo))
+    _, lam, delta, lam_expo = best
     # identity 候选（ΔA=0）：与 best-ridge 按 training MSE 比较（label-free）
     mse_id = float((D * D).sum() / (n * d))
     mse_ridge = float(((X @ delta - D) ** 2).sum() / (n * d))
     if mse_id <= mse_ridge:
-        return torch.eye(FEAT_DIM), torch.zeros(FEAT_DIM), True, 0.0
+        # identity 胜出：网格指数无意义，记 nan（GCV 边界统计只对
+        # nonidentity cell 有意义；gamma 导出脚本同样跳过 identity cell）
+        return (torch.eye(FEAT_DIM), torch.zeros(FEAT_DIM), True, 0.0,
+                float("nan"))
     A = (torch.eye(d) + delta).float()
     # 截距（无正则，闭式）
     b = (Y.mean(dim=0) - X.mean(dim=0) @ A.double()).float()
-    return A, b, False, lam
+    return A, b, False, lam, lam_expo
 
 
 # --------------------------------------------- ④ 冻结配方离线 M2''
@@ -420,7 +423,8 @@ def main():
 
             if not args.gate_only:
                 # ---- ② label-free GCV 残差桥（λ‖ΔA‖² 预注册参数化）----
-                A, b_off, identity_won, lam = fit_bridge(zp_fit, zm_fit)
+                A, b_off, identity_won, lam, lam_expo = fit_bridge(
+                    zp_fit, zm_fit)
                 delta = A - torch.eye(FEAT_DIM)
                 U_, S_, Vt_ = torch.linalg.svd(delta, full_matrices=False)
                 lowrank = {}
@@ -455,7 +459,11 @@ def main():
                            low_power=int(n_train < LOW_POWER_MIN_FIT),
                            acc_identity=acc_id, acc_bridge=acc_bridge,
                            acc_m2pp=acc_m2pp, acc_birth_ref=acc_ref,
-                           bridge_identity=int(identity_won), bridge_lam=lam)
+                           bridge_identity=int(identity_won), bridge_lam=lam,
+                           # §34.6 条件 B：GCV 网格指数（10^expo 相对
+                           # scale；identity cell 记 nan）——供 γ*_INR 导出
+                           # 统计网格边界命中（GCV_GRID_BOUNDARY_WARNING）
+                           bridge_lam_expo=lam_expo)
                 for rk in LT_RANKS_SWEEP:
                     row[f"acc_lowrank_r{rk}"] = acc_lr[rk]
                 rows.append(row)

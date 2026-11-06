@@ -32,10 +32,24 @@ head 键集异常 -> 报错退出。c0 零漂移对照（KD no-op）：仅报告
 用法（repo 根目录，CPU）：
   python diagnostics/dsar_birth_preview.py
   python diagnostics/dsar_birth_preview.py --rounds 0,5,7
+
+§34.6 Stage 0 扩展（2026-11-06，INR_B0_EXPLORATORY，只读诊断；
+GPT 技术审查批准项）：
+  * BT_RANKS 扩至 (8,16,32,64,128,256)；
+  * 每 cell 在 80/20 hash 切分（与在线 dsar_split_fit_cal 同纪律）上
+    报告 per-rank cal-MSE、identity-guard active 率与无标签恢复比
+    R_r = (MSE_I−MSE_r)/(MSE_I−MSE_full)（仅当 MSE_full 优于 MSE_I
+    才有定义，否则 nan）；per-rank bias 用截断后重算口径（b₈ 裁决）；
+  * 位移矩阵 ΔA 谱统计（累计能量、eff_rank_90）；
+  * B→L 链组合臂 acc_chain_lt{L}_bt{B}（B0 配方：L 训练于 z⁻ 全
+    train、B 用全拟合 intercept c —— 探索性，非部署配方）；
+  * lt_r8_vs_ceiling_share 聚合修复为 nanmean（原 np.mean 对含 nan
+    cell 产出 nan 的已知聚合 bug，一行修复随本扩展一并落地）。
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import time
@@ -47,7 +61,14 @@ import torch.nn.functional as F
 
 FEAT_DIM = 768
 LT_RANKS = (8, 16, 32)
-BT_RANKS = (8, 16, 32)
+BT_RANKS = (8, 16, 32, 64, 128, 256)
+# §34.6 Stage 0 条件 A：R_r 有效分母容差。分母 (MSE_I - MSE_full) 必须
+# > RR_DEN_TOL·MSE_I 才算有效 cell；无效 cell 的 R_r 记 nan（从宏平均
+# 与 knee 判定中排除），rr_valid=0，summary 报告有效/排除 cell 数。
+RR_DEN_TOL = 1e-6
+# §34.6 Stage 0 条件 A：knee 判定阈值（冻结）。宏平均 R_r ≥ 0.9 的最小
+# rank 为合格 knee；无 rank 达标 → NO_KNEE_FOUND（禁止临时降阈值）。
+KNEE_RR_THRESHOLD = 0.9
 LT_EPOCHS = 200
 LT_LR = 1e-3
 LT_WD = 1e-4
@@ -123,8 +144,10 @@ def fit_lt(zm_train, y_train, key, anchor_pool, hsd_cur, r, seed):
 
 def fit_bt(zp_train, zm_train, seed):
     """B_t: label-free ridge z+ -> z-（仿射，含 intercept）。
-    GCV 选 λ（相对尺度网格），并与 identity（ΔB=0）按 train MSE 比较。
-    返回 (Wz, c) 及 identity 是否胜出；低秩变体由调用方做 SVD 截断。"""
+    GCV 选 λ（相对尺度网格 10^[-3,4]），并与 identity（ΔB=0）按
+    train MSE 比较。返回 (Wz, c, identity_won, lam, mse, gcv_expo)；
+    gcv_expo = 最优 λ 的相对尺度指数（identity 胜出时为 nan，网格
+    端点命中由调用方按 [-3, 4] 端值判定）；低秩变体由调用方做 SVD 截断。"""
     torch.manual_seed(seed)
     X64 = torch.cat([zp_train.double(),
                      torch.ones(zp_train.shape[0], 1, dtype=torch.float64)],
@@ -134,7 +157,7 @@ def fit_bt(zp_train, zm_train, seed):
     XtX = X64.t() @ X64
     XtY = X64.t() @ Y64
     scale = float(torch.diagonal(XtX).mean())
-    best = None  # (gcv, lam, mse, W)
+    best = None  # (gcv, lam, mse, W, expo)
     for expo in torch.linspace(-3, 4, 29):
         lam = float(10 ** expo) * scale
         reg = torch.eye(dx, dtype=torch.float64) * lam
@@ -147,16 +170,32 @@ def fit_bt(zp_train, zm_train, seed):
         tr = float(torch.einsum("ij,ji->", X64, P)) / n
         gcv = mse / max(1e-12, (1.0 - tr) ** 2)
         if best is None or gcv < best[0]:
-            best = (gcv, lam, mse, W)
-    _, lam, mse, W = best
+            best = (gcv, lam, mse, W, float(expo))
+    _, lam, mse, W, expo_best = best
     # identity 候选（label-free 选择）
     mse_id = float(((zp_train.double() - zm_train.double()) ** 2).sum()
                    / (n * zm_train.shape[1]))
     if mse_id <= mse:
-        return torch.eye(FEAT_DIM), torch.zeros(FEAT_DIM), True, lam, mse_id
+        return (torch.eye(FEAT_DIM), torch.zeros(FEAT_DIM), True, lam,
+                mse_id, float("nan"))
     Wz = W[:FEAT_DIM].float()
     c = W[FEAT_DIM].float()
-    return Wz, c, False, lam, mse
+    return Wz, c, False, lam, mse, expo_best
+
+
+def cal_split_mask(n):
+    """§34.6 Stage 0 只读复刻在线 80/20 行切分纪律（Models/DSAR.py
+    dsar_split_fit_cal）：sha256("dsar_split:{idx}") 前 4 字节 LE
+    % 5 == 0 -> cal。退化（空侧）fail-closed。"""
+    flags = []
+    for i in range(n):
+        h = hashlib.sha256(f"dsar_split:{i}".encode()).digest()
+        flags.append(int.from_bytes(h[:4], "little") % 5 == 0)
+    m = torch.tensor(flags, dtype=torch.bool)
+    if not bool(m.any()) or bool(m.all()):
+        raise SystemExit(f"HASH_SPLIT_DEGENERATE: n={n} "
+                         f"n_cal={int(m.sum())}")
+    return m
 
 
 # ----------------------------------------------------------------- 主流程
@@ -306,7 +345,7 @@ def run_preview(args_cli):
                     seed=1000 + 97 * r + 31 * ci + r_rank)
 
             # ---- B_t：label-free ridge + identity 候选 ----
-            Wz, c, identity_won, lam, _ = fit_bt(
+            Wz, c, identity_won, lam, _, _expo_bt = fit_bt(
                 zp_fit, zm_fit, seed=2000 + 97 * r + 31 * ci)
             dW = Wz - torch.eye(FEAT_DIM)
             U_, S_, Vt_ = torch.linalg.svd(dW, full_matrices=False)
@@ -314,6 +353,64 @@ def run_preview(args_cli):
             for r_rank in BT_RANKS:
                 dW_r = (U_[:, :r_rank] * S_[:r_rank]) @ Vt_[:r_rank]
                 bt_rank[r_rank] = torch.eye(FEAT_DIM) + dW_r
+
+            # ---- §34.6 Stage 0：谱统计 + 80/20 cal 上的 per-rank
+            # 无标签恢复比 R_r 与 identity-guard active 率（INR_B0_
+            # EXPLORATORY；全部只读诊断，不进任何在线路径）----
+            e2 = (S_.double() ** 2)
+            cum_e = torch.cumsum(e2, dim=0) / float(e2.sum())
+            eff90 = int((cum_e < 0.90).sum().item()) + 1
+            mcal = cal_split_mask(n_train)
+            zp_fh, zm_fh = zp_fit[~mcal], zm_fit[~mcal]
+            zp_cal, zm_cal = zp_fit[mcal], zm_fit[mcal]
+            Wg, cg, _, lam_g, _, expo_g = fit_bt(
+                zp_fh, zm_fh, seed=3000 + 97 * r + 31 * ci)
+            xbar = zp_fh.double().mean(dim=0)
+            ybar = zm_fh.double().mean(dim=0)
+            xcf = zp_fh.double() - xbar
+            s_fit = float((xcf * xcf).sum()
+                          / (xcf.shape[0] * FEAT_DIM))
+            xc = zp_cal.double()
+            yc = zm_cal.double()
+            mse_id_cal = float(((xc - yc) ** 2).mean())
+            mse_full_cal = float(
+                ((xc @ Wg.double() + cg.double() - yc) ** 2).mean())
+            dAg = (Wg - torch.eye(FEAT_DIM)).double()
+            Ug, Sg, Vtg = torch.linalg.svd(dAg)
+            rr_fields = dict(
+                n_fit=int((~mcal).sum()), n_cal=int(mcal.sum()),
+                spec_eff_rank_90=eff90,
+                rr_gcv_lam=lam_g, rr_gcv_expo=(float(expo_g)
+                                                if expo_g == expo_g
+                                                else float("nan")),
+                rr_gcv_boundary=int(
+                    expo_g == expo_g
+                    and (expo_g <= -3.0 + 1e-9 or expo_g >= 4.0 - 1e-9)),
+                rr_s_fit=s_fit,
+                mse_id_cal=mse_id_cal, mse_full_cal=mse_full_cal,
+                guard_active_full=int(mse_full_cal < mse_id_cal))
+            for r_rank in BT_RANKS:
+                rr_fields[f"spec_cum_r{r_rank}"] = float(cum_e[r_rank - 1])
+            for r_rank in BT_RANKS:
+                dA_r = (Ug[:, :r_rank] * Sg[:r_rank]) @ Vtg[:r_rank]
+                # 截断后重算 bias（b₈ 裁决口径，2026-11-06）
+                b_r = ybar - xbar - xbar @ dA_r
+                mse_r = float(((xc @ (dA_r + torch.eye(FEAT_DIM,
+                                                       dtype=torch.float64))
+                                + b_r - yc) ** 2).mean())
+                rr_fields[f"mse_r{r_rank}_cal"] = mse_r
+                # 有效分母容差（GPT §34.6 Stage 0 条件 A）：分母
+                # (MSE_I - MSE_full) <= 1e-6·MSE_I 视为无效（full-ridge 在
+                # cal 上无正恢复空间），该 cell 的 R_r 记 nan 并从宏平均
+                # 与 knee 判定中排除；排除数在 summary.rr_n_valid 报告。
+                den = mse_id_cal - mse_full_cal
+                rr_fields[f"rr_r{r_rank}"] = (
+                    (mse_id_cal - mse_r) / den
+                    if den > RR_DEN_TOL * mse_id_cal else float("nan"))
+                rr_fields[f"guard_active_r{r_rank}"] = int(
+                    mse_r < mse_id_cal)
+            rr_fields["rr_valid"] = int(
+                mse_id_cal - mse_full_cal > RR_DEN_TOL * mse_id_cal)
 
             # ---- 测试行四臂评估 ----
             zm_ev, zp_ev, y_ev = zm[m_te], zp[m_te], y[m_te]
@@ -344,6 +441,20 @@ def run_preview(args_cli):
                     ta_logits(zp_ev @ bt_rank[r_rank] + c,
                               key, anchor_pool, hsd_end),
                     y_ev, allowed)
+            # ---- §34.6 Stage 0：B→L 链组合臂（B0 配方，探索性）：
+            # acc_chain_lt{L}_bt{B} = Acc[H_end(L(B_r(z⁺)))] ----
+            for r_l in LT_RANKS:
+                apply_l, _ = lt[r_l]
+                row[f"acc_chain_lt{r_l}_btfull"] = masked_acc(
+                    ta_logits(apply_l(zp_ev @ Wz + c),
+                              key, anchor_pool, hsd_end),
+                    y_ev, allowed)
+                for r_b in BT_RANKS:
+                    row[f"acc_chain_lt{r_l}_bt{r_b}"] = masked_acc(
+                        ta_logits(apply_l(zp_ev @ bt_rank[r_b] + c),
+                                  key, anchor_pool, hsd_end),
+                        y_ev, allowed)
+            row.update(rr_fields)
             rows.append(row)
         print(f"round {r:4d}: {len(by_client)} clients done "
               f"({time.time()-t0:.0f}s)", flush=True)
@@ -366,10 +477,33 @@ def run_preview(args_cli):
     def _mean(vals):
         return float(np.mean(vals)) if vals else float("nan")
 
+    def _nanmean(vals):
+        vals = [v for v in vals if v == v]  # nan 剔除（无恢复空间的 cell）
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def _nanmedian(vals):
+        vals = [v for v in vals if v == v]
+        return float(np.median(vals)) if vals else float("nan")
+
+    def _nanp10(vals):
+        vals = [v for v in vals if v == v]
+        return float(np.percentile(vals, 10)) if vals else float("nan")
+
+    def _knee_rank(rows_):
+        """条件 A 冻结规则：宏平均 R_r 首次 ≥ 阈值的最小 rank；
+        无 rank 达标 → NO_KNEE_FOUND。"""
+        for rk in BT_RANKS:
+            m = _nanmean([rw[f"rr_r{rk}"] for rw in rows_])
+            if m == m and m >= KNEE_RR_THRESHOLD:
+                return rk
+        return "NO_KNEE_FOUND"
+
     arm_cols = (["acc_raw", "acc_ceiling", "acc_damaged", "acc_bt_full",
                  "bt_identity"] +
                 [f"acc_lt_r{r_}" for r_ in LT_RANKS] +
-                [f"acc_bt_r{r_}" for r_ in BT_RANKS])
+                [f"acc_bt_r{r_}" for r_ in BT_RANKS] +
+                [f"acc_chain_lt{r_}_bt{b_}" for r_ in LT_RANKS
+                 for b_ in list(BT_RANKS) + ["full"]])
     tasks = sorted({r_["task"] for r_ in rows})
     summary = {
         "n_cells": len(rows),
@@ -386,15 +520,55 @@ def run_preview(args_cli):
             "lt_r8_minus_raw":
                 _mean([r_["acc_lt_r8"] - r_["acc_raw"] for r_ in rows]),
             "lt_r8_vs_ceiling_share":
-                _mean([(r_["acc_lt_r8"] - r_["acc_raw"]) /
-                       max(1e-9, r_["acc_ceiling"] - r_["acc_raw"])
-                       if r_["acc_ceiling"] > r_["acc_raw"] else float("nan")
-                       for r_ in rows]),
+                _nanmean([(r_["acc_lt_r8"] - r_["acc_raw"]) /
+                          max(1e-9, r_["acc_ceiling"] - r_["acc_raw"])
+                          if r_["acc_ceiling"] > r_["acc_raw"]
+                          else float("nan")
+                          for r_ in rows]),
             "broadcast_damage_raw_minus_damaged":
                 _mean([r_["acc_raw"] - r_["acc_damaged"] for r_ in rows]),
             "bt_full_minus_damaged":
                 _mean([r_["acc_bt_full"] - r_["acc_damaged"] for r_ in rows]),
         },
+        # ---- §34.6 Stage 0 汇总（INR_B0_EXPLORATORY）----
+        "guard_active_rate": {
+            **{f"r{rk}": _mean([rw[f"guard_active_r{rk}"] for rw in rows])
+               for rk in BT_RANKS},
+            "full": _mean([rw["guard_active_full"] for rw in rows])},
+        "recovery_ratio_R_r": {
+            f"r{rk}": _nanmean([rw[f"rr_r{rk}"] for rw in rows])
+            for rk in BT_RANKS},
+        # 条件 A：有效 cell 计数 + R_r median/低分位（仅有效分母 cell）
+        "rr_n_valid": int(sum(rw.get("rr_valid", 0) for rw in rows)),
+        "rr_n_invalid": int(len(rows)
+                            - sum(rw.get("rr_valid", 0) for rw in rows)),
+        "recovery_ratio_R_r_median": {
+            f"r{rk}": _nanmedian([rw[f"rr_r{rk}"] for rw in rows])
+            for rk in BT_RANKS},
+        "recovery_ratio_R_r_p10": {
+            f"r{rk}": _nanp10([rw[f"rr_r{rk}"] for rw in rows])
+            for rk in BT_RANKS},
+        # 条件 A：knee 判定（冻结规则）——有效分母 cell 的宏平均 R_r 首次
+        # ≥ 0.9 的最小 rank；无 rank 达标 → NO_KNEE_FOUND（禁止临时降
+        # 阈值/事后挑 rank）。test accuracy 只作机制解释，不参与本判定。
+        "knee": {
+            "threshold": KNEE_RR_THRESHOLD,
+            "denominator_tolerance": RR_DEN_TOL,
+            "aggregation": ("macro-mean R_r over valid-denominator "
+                            "cells (denominator > tol*MSE_I)"),
+            "min_rank_meeting_threshold": _knee_rank(rows),
+        },
+        "spectrum": {
+            # identity 胜出 cell 的 ΔA=0 -> 谱无定义（nan 剔除，见 docstring）
+            "cum_energy": {f"r{rk}": _nanmean([rw[f"spec_cum_r{rk}"]
+                                              for rw in rows])
+                           for rk in BT_RANKS},
+            "effective_rank_90": _nanmean([rw["spec_eff_rank_90"]
+                                           for rw in rows])},
+        "rr_n_fit": _mean([rw["n_fit"] for rw in rows]),
+        "rr_n_cal": _mean([rw["n_cal"] for rw in rows]),
+        "rr_gcv_boundary_hits": int(sum(rw["rr_gcv_boundary"]
+                                        for rw in rows)),
         "displacement": {f"c{ci}": _mean([r_["disp_mean"] for r_ in rows
                                          if r_["client"] == ci])
                          for ci in sorted({r_["client"] for r_ in rows})},
@@ -404,7 +578,23 @@ def run_preview(args_cli):
                   "per A5 RNG-neutrality); current-task rows only; "
                   "LOW_POWER (n_train<2048) on all cells; partial rounds "
                   "(capture run in progress); CPU torch per "
-                  "ENVIRONMENT_AUDIT float64 BLAS breakage."),
+                  "ENVIRONMENT_AUDIT float64 BLAS breakage. "
+                  "STAGE0 (§34.6, INR_B0_EXPLORATORY, 2026-11-06): "
+                  "BT_RANKS extended to 256; per-rank cal-MSE guard active "
+                  "rate on 80/20 hash split (online dsar_split discipline); "
+                  "unlabeled recovery ratio R_r=(MSE_I-MSE_r)/"
+                  "(MSE_I-MSE_full) (nan when full does not beat identity; "
+                  "per-rank bias = truncated-recompute b8 ruling); "
+                  "displacement spectrum cumulative energy + eff_rank_90; "
+                  "B->L chain arms use the B0 recipe (L trained on full "
+                  "train z-, full-fit intercept c) -- exploratory, not the "
+                  "deployment recipe; lt_r8_vs_ceiling_share aggregation "
+                  "fixed to nanmean (was a known np.mean-over-nan bug). "
+                  "KNEE_RULE_FROZEN (GPT 2026-11-06 cond A): min rank with "
+                  "macro-mean R_r >= 0.9 over valid-denominator cells "
+                  "(denominator > 1e-6*MSE_I); no rank meets it -> "
+                  "NO_KNEE_FOUND; test accuracy explanatory only, never a "
+                  "rank-selection input."),
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -423,6 +613,31 @@ def run_preview(args_cli):
     print("\n[gaps]")
     for k, v in summary["gaps"].items():
         print(f"  {k:34s} {v:7.2f}")
+    print("\n[guard_active_rate] (per-rank cal-MSE identity guard, "
+          "80/20 hash split)")
+    for k, v in summary["guard_active_rate"].items():
+        print(f"  {k:8s} {v:7.2f}")
+    print("\n[recovery_ratio R_r] (unlabeled cal-MSE vs full-ridge; "
+          "nan-cells excluded)")
+    for k, v in summary["recovery_ratio_R_r"].items():
+        print(f"  {k:8s} {v:7.2f}")
+    print("  [median / p10 over valid cells]")
+    for k in summary["recovery_ratio_R_r"]:
+        print(f"  {k:8s} med={summary['recovery_ratio_R_r_median'][k]:7.2f} "
+              f"p10={summary['recovery_ratio_R_r_p10'][k]:7.2f}")
+    print(f"\n[rr_valid] n_valid={summary['rr_n_valid']} "
+          f"n_invalid(denominator <= {RR_DEN_TOL}*MSE_I)="
+          f"{summary['rr_n_invalid']}")
+    print(f"[knee] frozen rule: macro-mean R_r >= {KNEE_RR_THRESHOLD} "
+          f"(valid cells only) -> min rank = "
+          f"{summary['knee']['min_rank_meeting_threshold']}")
+    print(f"\n[spectrum] eff_rank_90 mean = "
+          f"{summary['spectrum']['effective_rank_90']:.1f}")
+    for k, v in summary["spectrum"]["cum_energy"].items():
+        print(f"  cum_energy {k:6s} {v:7.2f}")
+    print(f"\n[rr] n_fit mean={summary['rr_n_fit']:.0f} "
+          f"n_cal mean={summary['rr_n_cal']:.0f} "
+          f"gcv boundary hits={summary['rr_gcv_boundary_hits']}")
     print("\n[displacement mean per client] (c0 = KD no-op zero-drift)")
     for k, v in summary["displacement"].items():
         print(f"  {k}: {v:.4f}")

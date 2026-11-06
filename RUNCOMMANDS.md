@@ -2344,7 +2344,135 @@ pre_prompt_hash / post_prompt_hash / head_hash / row_index_hash / feature_shape
 
 #### 34.3 INR B0-lite 预注册（2026-11-06，跑前冻结）
 
-* **材料**：izfree 的 ImageNet-R capture run（M2'-matched 同款协议；izfree 无 INR baseline run ⇒ 环2 identity gate 免除，中立性由 cifar 链（§10.1 三环 + §34.2.6b + §34.2.7）承担——跨机器不可逐位一致，此前已裁决）。
+* **材料**：izfree 的 ImageNet-R capture run（M2'-matched 同款协议；izfree 无 INR baseline run ⇒ 环2 identity gate 免除，中立性由 cifar 链（§10.1 三环 + §34.2.6b + §34.2.7）承担——跨机器不可逐位一致，此前已裁决）。**〔勘误 2026-11-06 晚〕**"INR 无官方 a5v2 锚 run"前提**错误**：autodl 本机存在 `inr_a5v2_M2_feat_p40` / `inr_a5v2_M2pb_p40`（官方 M2'/M2'' 完整 run，含 client CSV 与 checkpoint）——当时只确认了 izfree 侧未查本机。判决不追溯翻案（按落盘预注册执行），repro gate 改为 **post-hoc robustness 补跑**（见 §34.5 补跑条目）；baseline 对照锚 = `inr_base_p40` 官方对角线 82.87/77.56/78.62/79.05/78.76（mean 79.37，server 聚合口径）。
 * **判据裁剪**：INR 无官方 a5v2 refit 锚 run ⇒ **reproduction gate 裁除**（`bsab_b0_verdict.py --no_repro`，verdict 标 `[B0-lite, no_repro]`）；**z_ref 不变性门保留**（npz 自含）；**ρ_birth 四臂 + GREEN/YELLOW/RED 阈值原样**（run 内配对，跨机器分析合法）。
 * **协议差异**：INR 官方协议 = 每客户端 40 私有类、0 公共类、每任务 8 类、surrogate 固定 5、batch 16 硬编码——与 cifar 的划分不同是预期行为，不作 fail 条件。
 * **流程**：izfree `git pull` 最新 diagnostics → 完整性检查（25 ckpt + 125 npz + args.json flags）→ `--repro_only --no_repro` 冒烟（round 0-4）→ 全量 `--no_repro`。
+
+#### 34.4 B1 preregistration v1（2026-11-06 冻结，外部审查版采纳；跑前冻结，方可动训练代码）
+
+**一句话冻结**：per-broadcast client-local r8 DSAR sidecar；fixed normalized ridge + unlabeled identity guard；zero added FL payload；training trajectory unchanged.
+
+**B0 遗留口径修正（随封板生效）**：① ρ>1 论文措辞不写"超过重训上限"，写"达到/饱和 M2'' reference 的恢复量"（M2'' 自带重训随机性）；② 今后始终同时报 raw accuracy 与 valid-denominator ρ（41/125 负分母限制 ρ 的全 cell 解释力，但不推翻 bridge 的 all-cell raw 增益）；③ 500/1000 次 MC 为论文 robustness 附加项，非解锁条件；④ 20/125 identity no-op（transport 不需要时自动退化）与 41 refit-negative（有监督 reference 自身不稳定）不冲突，各归各叙事。
+
+**六项冻结**：
+
+1. **部署图 = 纯 readout sidecar**。`ŷ = H_end(z_ref ⊕ L(B(z⁺_op)))`：B/L 只碰 768-D operational branch，**z_ref 全程 bypass**；broadcast hook 只负责拟合/更新 sidecar 状态，不改 forward、不进 `load_prompts`、不 monkey-patch feature tensor。正式部署唯一入口 = 统一 `DSAR readout` helper（被 evaluate/predict 调用）。**local-training forward 不经过 B/L**——prompt/backbone/head 训练轨迹与 FedTA baseline 相同。结构不变量（硬门材料）：DSAR_ON vs OFF 的 base prompt/head/checkpoint tensors **逐轮逐位一致**，差异只允许存在于 sidecar 参数与读出结果。
+2. **B_t 在线 λ 冻结**（不跑 GCV、无在线 sweep）：`λ_{c,r} = N_{c,r}·s_{c,r}·γ*`，s = tr(XᵀX)/(N·d)（X = 当前 cell z⁺ train 行中心化）。**γ* = 0.396419**（`diagnostics/bsab_gamma_star.py` 从封板 B0 artifact 导出：105 nonidentity cell 的 λ_GCV/(N·s) 中位数，IQR 0.374–0.652，落盘 `bsab_b0/gamma_star_corrected.json`。**ERRATUM-gamma-split §34.4c**：superseded γ\*=0.390324 的 s 误建于 test 行，2026-11-06 修订为 train 行口径，详见 §34.4c）。**无标签 identity guard**：train rows 按 sample-index hash 固定切 80% fit / 20% calibration（不消费 RNG）；固定 λ 在 80% 拟合，20% 上比较 `MSE(B(z⁺),z⁻) < MSE(z⁺,z⁻)` 才启用，否则严格 B=I；启用后用全部 train rows 重拟合一次。**test/val 不参与 λ、identity、rank 任何决策。**
+3. **拟合时机 = per-broadcast、per-client**（与 B0 证据单元 125 cell 同构，不改为 task boundary）。每轮时序冻结：local training 正常结束 → H_end → 冻结 backbone/prompt/head → identity 初始化拟合 L_{c,r} → 固定 index loader 取 z⁻_op（current-task train split 全行）→ load server broadcast → 同一 index manifest 取 z⁺_op → 拟合 B_{c,r} → evaluate 走 B→L→H。B 全程无标签；L 可用 current-task train labels（冻结-head CE，预注册职责）。**每轮 fresh-fit from identity：不 warm-start、不跨轮 compose**（B_r∘B_{r-1} 累积动力学未经 B0 验证，禁止）。
+4. **rank 冻结 r=8**（B 与 L 统一）：B = residual ridge ΔA + 确定性 SVD 截断 r8 部署为低秩 factors；L = rank-8 residual 参数化直接训练。r16/32/64 只作**主 run 完成后的结构消融**，禁止看 B1 结果后改主方法 rank。依据：B0 r8=96.40 vs full 96.64（87% 修复量）、r64=96.61（+0.03pp）。
+5. **adapter FL 通信 = 0**。B_{c,r} 是 client-local broadcast compensation（目标 z⁻ 是该 client 的本地坐标，跨 client 聚合 A 无 B0 证据且会平均坏 local coordinate target）——server 只传原 FedTA payload，client 收到后本地拟合 B。本地只存 r8 factors（U,V ∈ R^{768×8}, b ∈ R^768，13,056 floats ≈ 51 KiB/module，B+L ≈ 102 KiB/client）；full 768² 矩阵仅限求解期内存，**禁止进 uplink/downlink**；若模拟器由 server 代存 client-local state，只存/回传 r8 factors 并在论文通信核算中标明 simulator state-management。
+6. **判据 = 结构硬门 + 效果联合 GREEN 门**（官方 FedTA 聚合口径不变；a_{t,k} = 完成 task t 后对 task k 的 accuracy）。指标：AA_T = mean_k a_{T,k}；F = mean_{k<T}(max_{s≥k} a_{s,k} − a_{T,k})；**G_old = mean_{t>k}(a^{DSAR}_{t,k} − a^{Base}_{t,k})**；Δ_k = a^{DSAR}_{T,k} − a^{Base}_{T,k}。
+
+**GREEN 联合规则**（跑前冻结，不许跑完挑指标）：
+
+```
+Structural hard gate: PASS        # 任一失败 → 直接 RED，不看 accuracy
+  - DSAR_OFF ≡ matched baseline（逐位复现）
+  - DSAR_ON 时 base prompt/head/checkpoint 逐轮 hash ≡ OFF
+  - 无 test leakage；B/L fit failure → fail-safe 回 identity
+  - 无 NaN/Inf；正式 evaluate 命中 B→L→H，training forward 不命中
+ΔAA_T ≥ +0.50 pp
+G_old  ≥ +0.25 pp                  # 防止只把 current task 做漂亮
+ΔF     ≤ +0.25 pp                  # Forgetting 允许小波动、不许明显恶化
+min_k Δ_k ≥ −1.00 pp               # 单任务不许崩超 1pp
+```
+
+ΔAA_T>0 但联合门未全过 → **YELLOW**（保留结构，不宣称端到端成功）；ΔAA_T≤0 且 G_old<0 超出噪声，或任何硬门失败 → **RED**。**B1 single-seed GREEN 仅 = 结构进入正式复现阶段的门**；论文统计显著性由多 seed 决定，不提前包装。
+
+**Shadow comparison 细则**：Base-vs-DSAR 在同一 checkpoint 上做 paired evaluation——评 raw readout 前 snapshot RNG、评 DSAR 前恢复同一 RNG，两臂看到相同 dropout masks（B0 暴露的官方 dropout-ON 语义不复辟为 .eval()，但把比较噪声压到最低）。官方语义矩阵照原样保存，paired matrix 作为 B1 gate 的因果读数。
+
+#### 34.4a B1 Dispatch Audit Addendum — APPROVED（2026-11-06 冻结；历史 B-only 分支 + 部署图勘误）
+
+**Audit verdict**: `SHARED_PATH_CONFIRMED`。Evidence: `diagnostics/dsar_task_dispatch_audit.json`（Client_DF / Server_DF / Tail_Anchor 六项静态调用图证据，文件:行号齐全）。关键链：`vit(input, task_id=self.task_id, train=True)` → z_op → `self.model(z_op, target)` → key-anchor routing → Chead（Client_DF.evaluate L1344-1357）；历史任务评估 vit 前向恒用**当前任务 id**（L1347）且广播 prompt 已先装载（L1235）——历史 z_op 与本轮 B 所修共享**同一次 broadcast 参数状态变换**（注意：不等于所有样本位移向量相同，F⁺(x)−F⁻(x) 非 constant；历史有效性仍由 G_old 实验检验，静态审计仅证明架构合法性）。key/anchor_pool 为 client 本地参数、不进任何 fed_avg payload——B 插入不改变路由算法/head 选择/class mask（anchor index 允许随修正特征自然变化，即 B0 preview 已验证的部署语义，不得人为固定 baseline anchor index）。
+
+**Deployment erratum**: §34.4 原部署图 `H_end(z_ref ⊕ L(B(z_op)))` 不符合真实 Tail_Anchor 前向——**z_ref 是 frozen original-model 参照流，不参与正式 head 输入**（Client_DF L992）。实际 Chead 输入 1536 = `[corrected z_op ‖ routed anchor(corrected z_op)]`。正确部署算子（TA_k(z) = Mask_k(Chead_k([z‖a(z)]))，a(z) 为原 key-anchor routing）：
+
+- **当前任务 k=t**：`ŷ_t = TA_t(L_{c,r}(B_{c,r}(z_op⁺)))`
+- **历史任务 k<t**：`ŷ_k = TA_k(B_{c,r}(z_op⁺))`（**B-only，禁用 L**）
+
+**四项不可变语义**：① B 插在 `self.model()` 入口之前，修正特征同时参与 key routing 与 Chead feature half；② k<t 只 B→Tail_Anchor；③ head 选择恒 `self.heads[k]` + 原 anchor pool/key routing/class mask；④ B 的 active/identity 仅由当前任务 train split 无标签 calibration 决定，**禁止以历史 task accuracy 或测试标签决定**。**B identity ≠ DSAR identity**：guard 选 B=I 时当前任务的 L 照常生效，不得短路成 `return original_readout(z)`。
+
+**Engineering constants（批准冻结；γ\* 经 §34.4c 勘误修订）**：γ\*=0.396419（ERRATUM-gamma-split，见 §34.4c；superseded 0.390324）；rank_B=rank_L=8；LOW_POWER_IDENTITY：fit rows<32 或 calibration rows<8 → exact identity（含 bias 全清零；hash mismatch/NaN/solver 错误等完整性异常**不得**用此理由降级）；L 配方：100 epochs、bs=64、`torch.optim.Adam`（不得换 AdamW）、lr=1e-3、weight_decay=1e-4、λ_L=0，U 非零/V 零/bias 零初始化，无 early stopping、不以 val/test 选参。
+
+**Evaluation integrity**：官方 evaluate 的 `train=True`、bs=8、shuffle 语义不被 DSAR 修改；所有额外拟合/诊断维护 RNG/mode/主训练状态中立性；**task-end 全任务评估必须读取与该时刻 broadcast 状态匹配的最新已提交 sidecar**（不得仅凭 broadcast 内两次 evaluate 验证历史部署）；B/L 的 ON 结果按实际 bs8+train=True 官方口径统计，不以 bs16 离线缓存替代。**G4 必须验证**：OFF 的正式 evaluate() 完全未改；OFF/ON(identity) 同 RNG 同 batch manifest 下 logits 逐位一致；额外 fit/capture 不改变后续官方训练或评估 RNG 状态。
+
+**Implementation authorization**: `Models/DSAR.py` Shell + `Client_DF.py` 受控接线 + `verify_dsar_invariance.py` 即刻开工；G1 未 GREEN 前不启动正式 B1 训练。第一阶段交付 = 真实 diff + OFF/ON(identity) 逐位中立性结果 + 当前/历史任务 readout 接线测试（非 accuracy）。
+
+#### 34.4b B1 数值口径修正 + G2 断言冻结 — APPROVED（2026-11-06 方案级 PASS；断言先行冻结，待 G2 执行时验收）
+
+**两项数学修正闭环（复审裁决：不再重开设计）**：
+
+1. **截断后 bias 重算**：B1 唯一有效实现是 r8 截断后重算
+   `b₈ = μ_y − μ_x − μ_x@ΔA₈`（等价 `μ_y − μ_x(I+ΔA₈)`；部署 refit 步用全部 train rows 的均值）。B0 `bt_rank` 保留全拟合截距的做法自此降级为**历史实验事实**，不再作为 B1 实现依据（不登记勘误——B1 从未以旧口径跑过正式臂）。实现：`Models/DSAR.py` `_bias8()` + 部署步（全行 refit → `_trunc8` → `_bias8`）。
+2. **identity guard 裁决对象 = 实际部署的 r8 候选**：五步流程 `80% ridge → r8 truncation → b₈ → 20% calibration paired-MSE（identity 赢平局）→ 胜出才全行 refit 再截断`。guard 不得比较未截断 full-ridge（对抗反例实证 `mse_full=0.0205 < mse_id=0.0208 < mse_r8`：旧 guard 会部署一个部署后更差的 bridge，INR preview task0 −0.19pp 即该漏洞的真实数据投影；新 guard 正确返回 IDENTITY_GUARD）。实现：`Models/DSAR.py` guard 块（`_trunc8` + `_bias8` + `_mse_r8`）；aux 键 `mse_bridge_r8_cal` / `mse_identity_cal` / `lam_fit` / `lam_refit` 专供 G2 断言。
+
+**G2 断言表（冻结，G2 执行时逐项验收）**：
+
+| 断言 | 要求 |
+|---|---|
+| `G2_RANK8_GUARD` | guard 比较实际 r8 部署候选：外部独立代码路径复刻冻结配方（fit-half solve → SVD r8 → b₈ → cal MSE），与 aux `mse_bridge_r8_cal` 数值一致（相对容差 1e-9） |
+| `G2_BIAS8` | 部署 bias 与独立公式 b₈（全行均值 + 截断算子）一致（float32 往返容差 ≤1e-5）；全秩截距 c_full 不得被部署（rank>8 位移场景 c_full≠b₈ 必须成立，防口径回退） |
+| `G2_IDENTITY_TIE` | `status==IDENTITY_GUARD ⟺ mse_identity_cal ≤ mse_bridge_r8_cal`（identity 赢平局）；每个拟合 cell 断言决策/公式等价 |
+| `G2_REFIT` | FITTED ⇒ 全部 train rows + 同一 γ\*=0.396419（§34.4c 修订值）重拟合（aux `lam_refit` 与外部重算 λ=N·s·γ\* 一致），并再次截断 r8 + 重算 b₈ |
+| `G2_LOW_POWER` | fit rows<32 或 cal rows<8 ⇒ LOW_POWER_IDENTITY（含 bias 全清零）；hash mismatch / NaN / Inf / solver 错误等完整性异常必须 raise，**不得**经此条款降级 |
+
+CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse_r8=0.1004968726 两侧相同；b₈ 公式 vs 部署 bias 最大差 3.7e-9；c_full 与 b₈ 差 2.1e-2，证明口径切换实质性）；对抗扫描命中 2 个 full-wins/r8-loses 配置，均被新 guard 正确拒绝；重放逐位确定性、LOW_POWER、L 拟合、sidecar dispatch 全绿。
+
+**G1 写盘纪律（工程条款，冻结）**：G1 工具写入既有 baseline run 目录时**只允许新增明确命名的诊断产物**（默认 `<run_dir>/dsar_g1_invariance.json`），不得覆盖/修改原始 checkpoint、args.json、accuracy matrix 或任何 B0 封板文件。当前实现审计：`verify_dsar_invariance.py` 唯一写盘点 = 输出 JSON（`open(out_json, "w")`）；checkpoint 经 `load_checkpoint` 只读装载；`diag_utils` 对 run_dir 仅读 `args.json`；`build_server(run_manager=None)` 不触碰 accuracy records；每客户端测试结束后内存旗标恢复 OFF 默认。
+
+#### 34.4c CIFAR B1 Gamma Normalization Erratum — APPROVED（2026-11-06 预注册勘误，pre-formal-run correction）
+
+**Decision: APPROVED — PRE-FORMAL-RUN CORRECTION**。§34.6 Stage 0 复审发现：原冻结 γ\*=0.390324 的导出脚本（`bsab_gamma_star.py` 旧版）以 `split == 1` 取行计算归一化尺度 s，而 capture writer 编码为 **0=train, 1=test**（`Client_DF._bsab_forward_rows`；artifact 级证据 = capture manifest JSON 的 n_train/n_test/n_rows 声明 + 105/105 cell `count(split==0)==n_train` 对账），即 s 误建立在 **test rows** 上，违反 train-only calibration 纪律。修复 split 编码后，使用 train rows（`split==0`）重新导出。
+
+**勘误登记表**：
+
+| 字段 | 值 |
+|---|---|
+| `gamma_star_old` | 0.390324 |
+| `gamma_star_corrected` | **0.396419**（导出全精度 0.396419312045252） |
+| `reason` | normalization s computed on test rather than train rows（split 编码误读） |
+| `effective_from` | CIFAR B1 formal run 前（B1 尚未开跑，`prior_formal_runs_affected = None`） |
+| `prior_formal_runs_affected` | None |
+| `b0_verdict_changed` | **False**（错误仅存在于 B1 常数冻结的 γ 导出环节，B0 四臂判决不重开） |
+
+**Effective rule**：CIFAR B1 正式实现唯一使用 corrected γ\*=0.396419（`Models/DSAR.py::GAMMA_STAR`，DSAR_VERSION bump `dsar-b1-shell-v2-gamma-erratum`），在线 λ 公式 `λ=N·s·γ*` 不变。修订原因仅为数据行集勘误，**不依据任何正式 B1 ON/OFF accuracy 选择**。B0 GREEN、B1 r8、identity guard、部署图（§34.4a）、L 优化配方和四项联合 GREEN 门均不改变。差异约 +1.56%，但 identity guard 是离散选择边界（`MSE_{r8} < MSE_I`），个别 cell 可能在 `FITTED` 与 `IDENTITY_GUARD` 间切换，故 G1 及受影响 G2 数值断言必须重跑并记录前后 `FITTED`/`IDENTITY_GUARD` 数量变化（不要求新旧判决逐位一致）。
+
+**Artifact 处理**：旧版 `bsab_b0/gamma_star.json` 原文与哈希保留（superseded 历史证据），修正版单独落盘 `bsab_b0/gamma_star_corrected.json`：
+
+- superseded `gamma_star.json` SHA-256: `25ea22fb8ea6f8b4245e6ebbb403c41e5633805d8b832e3890af9ece71da52ba`（γ_median=0.3903236188504265, n=105）
+- corrected `gamma_star_corrected.json` SHA-256: `f3174a508922de548e51368b4a3672f580272681c485670d6e2d1beefeafa0b4`（γ_median=0.396419312045252, n_nonidentity=105, p25=0.3735, p75=0.6546, min=0.2105, max=2.2244；含 gcv_grid_boundary_warning 字段，2026-11-06 条件 B 扩展后脚本导出）
+
+**Required validation（四项一致性检查，通过前 B1 formal run 继续 LOCKED）**：
+
+1. **Cell 集合对账**：更正前后相同的 105 个 nonidentity cell（20 identity skip 不变）；导出脚本内建 PAIRING_GATE（`count(split==0)==n_train`）105/105 通过。✅ 2026-11-06
+2. **GCV 来源对账**：λ_GCV、候选网格（10^expo×scale, expo∈[−4,4] 33 点）、拟合行集均直接读自封板 `bsab_b0/cells.csv` 与 capture npz，未因修复改变（split 行集选择除外——即勘误本体）。✅
+3. **Split 编码 artifact 证据**：`0=train / 1=test` 由 capture manifest JSON（n_train/n_test/n_rows）+ 105/105 行数对账确认，不依赖代码注释。✅
+4. **新值独立复现**：修正脚本重复导出两次 SHA-256 逐位一致（`f3174a50…`，条件 B 扩展后脚本版本）；此前 inline 独立计算与脚本导出同值 0.396419。✅
+
+**连带同步（已完成）**：`Models/DSAR.py`（常数+注释+版本）、RUNCOMMANDS §34.4 冻结项 2 / §34.4a Engineering constants / §34.4b G2_REFIT 断言三处同步为 0.396419，避免文档与代码保留两个不同正式 γ\*。
+
+#### 34.5 INR B0-lite 判决：RED，裁剪 INR 臂（2026-11-06 封板）
+
+**执行**：izfree `--no_repro` 全量 125 cell（repro gate 按 §34.3 裁除；zref PASS 25/25）。**VERDICT: RED**：ρ mean=0.315 / pooled=0.418，t1=−0.109、t4=−0.226，worst 全部集中 c4（ρ −6.0~−1.8）。
+
+**归因（分解诊断后确认，A+C 混合；B 排除）**：
+
+| task | 损伤 | bridge 修复 | m2pp 修复 | 桥修复率 |
+|---|---|---|---|---|
+| 0 | 0.68 | +0.50 | +0.64 | 78% |
+| 1 | 1.23 | **−0.15** | +0.42 | 塌 |
+| 2 | 2.28 | +0.81 | +1.48 | 36% |
+| 3 | 0.76 | +0.66 | +0.66 | 87% |
+| 4 | 1.82 | **+0.09** | +0.82 | 5% |
+| pooled | ~1.35 | +0.38 | +0.80 | **~28%（cifar 82%）** |
+
+- **A（ρ 噪声主导）**：INR 损伤本小（0.68–2.28pp vs cifar 2.85/4.69pp），分母普遍 <1pp ⇒ 64/125 负分母、ρ 爆炸值（−6.0）为噪声；ρ 指标在 INR 多数 cell 不适用。
+- **C（实质弱点，raw 增益口径确认）**：损伤大的 task（t1/t4）桥反而修不动（负/近零）——与 cifar"损伤越大修复率越高"相反。修复率 28% vs 82% 是结构信号非噪声。
+- **损伤小的机制归因（位移对照，同口径 125 cell npz）**：INR 位移 mean 0.010 vs cifar 0.0148（小 32%）+ 头敏感度 ~135 vs ~193 pp/unit（钝 30%）⇒ 位移小一半贡献 + 头钝感一半贡献。协议根源：INR 40 全私有类/每任务 8 类/类空间压力小（cifar 75 类区段+公共类冲突大）。
+- **修复率低的候选机制**（未定论，事后可查）：~650 行/cell 拟合 768 维仿射欠定更严重；损伤方向或大部分不在仿射桥可达跨度（B_pre RUN_01 镜像）。
+
+**处置（预注册 RED 条款执行）**：
+1. **INR 臂裁剪**：DSAR 不做 INR 端到端部署（收益上限 <0.8pp 撑不起结构成本）；论文 scope 声明"部署于损伤显著的数据集"，INR 作 limitation/边界案例诚实报告（损伤小 + 仿射不可达）。
+2. **cifar B1 照常推进**（§34.4 不受影响）。
+3. INR capture/诊断材料保留（cells.csv + verdict.json + 位移统计），供论文 limitation 段与审稿答复。

@@ -41,6 +41,11 @@ from Models.classification_head import StandardizedChead as _A5StandardizedChead
 from Models.ctrp import (forward_with_prompt, row_ce, hash_prompt_module,
                         hash_tensor, alpha_blend, stratified_split)
 
+# §34.4/§34.4a B1 DSAR sidecar（冻结部署：当前任务 z⁺→B→L→TA_t、
+# 历史任务 z⁺→B→TA_k；插入点 = evaluate 的 self.model() 之前）
+from Models.DSAR import (DSARSidecar, DSAR_VERSION, dsar_identity_sidecar,
+                         dsar_fit_bridge, dsar_fit_l, dsar_stable_seed)
+
 # refit 固定配方（预注册；探针 probe_oracle_headroom.py 的训练日程，
 # 仅 hidden 取 512 以保持 heads 存储 = Chead schema，见 §23.6-2）
 A5_REFIT_HIDDEN = 512
@@ -158,6 +163,31 @@ class Client_DF(object):
         self._bsab_capture_on = bool(
             getattr(args, 'bsab_pair_capture', False))
         self._bsab_pending = None
+
+        # §34.4/§34.4a B1 DSAR sidecar：client-local per-broadcast r8
+        # readout adapters（默认 OFF = 完全 no-op，逐位一致）。ON 时
+        # evaluate/evaluate_with_margin 在 self.model() 之前按冻结
+        # dispatch 应用（历史任务 B-only；B identity ≠ DSAR identity，
+        # 两个 adapter 各自独立短路）。--dsar_identity = G1 逐位中立性
+        # 测试模式（跳过全部拟合，仅提交 exact-identity sidecar）。
+        self._dsar_on = bool(getattr(args, 'dsar', False))
+        self._dsar_identity = bool(getattr(args, 'dsar_identity', False))
+        if self._dsar_identity and not self._dsar_on:
+            raise RuntimeError(
+                "DSAR: --dsar_identity requires --dsar (fail-closed)")
+        if self._dsar_on and bool(getattr(args, 'head_refit', False)):
+            raise RuntimeError(
+                "DSAR_ON_HEAD_REFIT_UNSUPPORTED: B1 evidence is defined on "
+                "the plain fedta baseline; refit-arm readout semantics are "
+                "not part of the frozen DSAR deployment (fail-closed)")
+        if self._dsar_on and str(
+                getattr(args, 'ctrp_mode', 'off') or 'off') != 'off':
+            raise RuntimeError(
+                "DSAR_ON_CTRP_UNSUPPORTED: CTRP matched split changes the "
+                "train-row manifest; B1 is pre-registered on the plain "
+                "fedta baseline (fail-closed)")
+        self._dsar_sidecar = None
+        self._dsar_pending = None
 
 
     def init_local_model(self,model_name,args=None):
@@ -1218,6 +1248,230 @@ class Client_DF(object):
             self.vit.train(flags[0])
             self._a5_rng_restore(rng)
 
+    # ------------------------------------------------------------------
+    # §34.4/§34.4a B1 DSAR：per-broadcast client-local readout sidecar
+    # 拟合与提交。默认 OFF = 完全 no-op（不进本节任何分支）。
+    # --dsar_identity 测试模式跳过全部拟合、仅提交 exact-identity
+    # sidecar（G1 OFF/ON(identity) 逐位中立性验证用，非方法臂）。
+    # 拟合时序（§34.4 item 3 冻结）：broadcast 入口（pre 半段，z⁻ 时代）
+    # 拟合 L -> load_prompts(广播) -> post 半段采 z⁺ 拟合 B -> 提交
+    # sidecar -> evaluate 读 B/L。每轮 fresh-fit from identity，不
+    # warm-start、不跨轮 compose。全程四流 RNG snapshot/restore + 模块
+    # mode/head/prompt 状态恢复；拟合数值走 Models/DSAR.py 独立
+    # Generator 流。
+    # ------------------------------------------------------------------
+
+    def _dsar_train_rows(self):
+        """B1 fit row manifest：当前任务 train split 全行（=
+        _ctrp_train_indices，与 BSAB capture / refit cache 同口径），
+        固定行序。pre/post 两个半段各自重建并以 hash 互验。"""
+        train_idx = list(self._ctrp_train_indices(self.task_id))
+        if not train_idx:
+            raise RuntimeError(
+                "client %d task %d: DSAR fit found no train rows "
+                "(fail-closed)" % (self.id, self.task_id))
+        h = _a5_hashlib.sha256()
+        h.update("|".join(str(int(i)) for i in train_idx).encode())
+        return train_idx, h.hexdigest()[:16]
+
+    def _dsar_forward_train_rows(self, train_idx):
+        """确定性诊断前向（_bsab_forward_rows 同纪律：eval + no_grad、
+        固定行序、shuffle=False、num_workers=0、bs=BSAB_CAPTURE_BATCH
+        ——z_op 依赖 batch 组成，pre/post 两半必须同 batch 切分）。
+        返回 (z_op, y)，torch 张量留在 self.device 供 L 拟合直接使用。"""
+        if self.original_model is None:
+            raise RuntimeError(
+                "client %d: DSAR requires the frozen original model "
+                "(fail-closed)" % self.id)
+        loader = DataLoader(Subset(self.train_data[self.task_id],
+                                   list(train_idx)),
+                            batch_size=BSAB_CAPTURE_BATCH, shuffle=False,
+                            num_workers=0)
+        z_ops, ys = [], []
+        for input, target in loader:
+            input = input.to(self.device, non_blocking=True)
+            with torch.no_grad():
+                out_ref = self.original_model(input)
+                out_op = self.vit(input, task_id=self.task_id,
+                                  cls_features=out_ref["pre_logits"],
+                                  train=True)
+            z_ops.append(out_op["feat"].float())
+            ys.append(target.long().to(self.device))
+        return torch.cat(z_ops, dim=0), torch.cat(ys, dim=0)
+
+    def _dsar_fit_pre(self, round_id, entry):
+        """pre 半段（get_global_proto_and_head* 入口、load_prompts 之前）：
+        z⁻ 采集（client 自己的 birth prompt 状态，与 _bsab_capture_pre
+        同一防残留态泄漏纪律）+ L_{c,r} 拟合（冻结 H_end = heads[task]，
+        eval 语义 + 官方 masked-CE 口径）。
+        identity 测试模式 / 无 birth state：仅提交 exact-identity
+        sidecar（保证"最新已提交 sidecar 匹配当前广播状态"的 G4
+        不变量），不拟合。"""
+        if not self._dsar_on:
+            return
+        self._dsar_pending = None
+        if self._dsar_identity:
+            self._dsar_sidecar = dsar_identity_sidecar(
+                round_id, entry, self.task_id, status="IDENTITY_TEST")
+            return
+        if (self.task_id < 0
+                or self.task_id not in self.data_split_indices):
+            self._dsar_sidecar = dsar_identity_sidecar(
+                round_id, entry, self.task_id, status="NO_BIRTH_STATE")
+            return
+        rng = self._a5_rng_snapshot()
+        flags = (self.vit.training, self.model.training,
+                 self.original_model.training)
+        head_snapshot = deepcopy(self.model.get_head())
+        vit_prompt_snapshot = deepcopy(self.vit.get_prompts())
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            self.model.eval()
+            birth_prompts = self.prompts
+            if birth_prompts is None:
+                raise RuntimeError(
+                    "client %d: DSAR found no local birth prompt state at "
+                    "the broadcast boundary (fail-closed)" % self.id)
+            birth_hash = hash_prompt_module(birth_prompts)
+            # z⁻ 在 client 自己的 birth prompt 状态下前向（共享 vit 此刻
+            # 持别的 client 残留态；_bsab_capture_pre 同一 bugfix 纪律）
+            self.vit.load_prompts(deepcopy(birth_prompts))
+            train_idx, row_hash = self._dsar_train_rows()
+            z_minus, y = self._dsar_forward_train_rows(train_idx)
+            # L 拟合：冻结 H_end 读出（heads[task]，load_head 内部
+            # deepcopy）+ 官方 class-mask CE（phase-2 同口径）
+            if self.heads[self.task_id] is None:
+                raise RuntimeError(
+                    "client %d task %d: no H_end head at the broadcast "
+                    "boundary (fail-closed)" % (self.id, self.task_id))
+            self.model.load_head(self.heads[self.task_id])
+            not_mask = np.setdiff1d(np.arange(self.nb_classes),
+                                    self.class_mask[self.task_id])
+            not_mask = torch.tensor(not_mask,
+                                    dtype=torch.int64).to(self.device)
+
+            def readout_logits(zb, yb):
+                pre, _, _ = self.model(zb, yb)
+                return pre.index_fill(dim=1, index=not_mask,
+                                      value=float('-inf'))
+
+            seed_l = dsar_stable_seed(getattr(self.args, 'seed', 0),
+                                      'dsarL', self.id, self.task_id,
+                                      int(round_id))
+            l_factors, l_status, l_ce = dsar_fit_l(
+                z_minus, y, readout_logits, seed_l)
+            # L 拟合的 backward 会在冻结 Tail_Anchor 参数上留下 grad
+            # 缓冲；清掉（训练流 optimizer 每轮新建，不受影响）
+            self.model.zero_grad(set_to_none=True)
+            self._dsar_pending = {
+                "round_id": int(round_id), "entry": str(entry),
+                "row_hash": row_hash, "train_idx": train_idx,
+                "birth_prompt_hash": birth_hash,
+                "z_minus": z_minus, "y": y,
+                "l_factors": l_factors, "l_status": l_status,
+                "l_final_ce": l_ce, "seed_l": seed_l,
+            }
+            print('[DSAR] client %d task %d round %d: L %s (n=%d%s)'
+                  % (self.id, self.task_id, int(round_id), l_status,
+                     int(z_minus.shape[0]),
+                     '' if l_ce is None else ', final_ce=%.4f' % l_ce))
+        finally:
+            self.model.load_head(head_snapshot)
+            self.vit.load_prompts(vit_prompt_snapshot)
+            self.original_model.train(flags[2])
+            self.model.train(flags[1])
+            self.vit.train(flags[0])
+            self._a5_rng_restore(rng)
+
+    def _dsar_fit_post(self, round_id, entry):
+        """post 半段（load_prompts(广播) 之后、任何 evaluate 之前）：
+        同 manifest 采 z⁺ -> 无标签 B_{c,r} 拟合（固定 λ=N·s·γ* +
+        80/20 sample-index-hash split + paired-MSE identity guard +
+        全行重拟合 + SVD r8 截断；B 不接触任何 label）-> 与 pending 的
+        L 组装 sidecar 一次提交（fresh-fit from identity，每轮覆盖）。"""
+        if not self._dsar_on:
+            return
+        if self._dsar_sidecar is not None and (
+                self._dsar_identity or self._dsar_pending is None):
+            # identity 测试模式 / 无 birth state：pre 已提交 identity，
+            # 这里只补记当前广播 prompt hash（G4 状态匹配标记）
+            self._dsar_sidecar.meta["prompt_hash"] = \
+                hash_prompt_module(self.vit.prompt)
+            self._dsar_pending = None
+            return
+        pend = self._dsar_pending
+        self._dsar_pending = None
+        if pend is None:
+            return
+        rng = self._a5_rng_snapshot()
+        flags = (self.vit.training, self.model.training,
+                 self.original_model.training)
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            self.model.eval()
+            if (int(round_id) != pend["round_id"]
+                    or str(entry) != pend["entry"]):
+                raise RuntimeError(
+                    "client %d: DSAR halves mismatched (pre r%d %s vs "
+                    "post r%d %s; fail-closed)"
+                    % (self.id, pend["round_id"], pend["entry"],
+                       int(round_id), entry))
+            train_idx, row_hash = self._dsar_train_rows()
+            if row_hash != pend["row_hash"]:
+                raise RuntimeError(
+                    "client %d round %d: DSAR GATE VIOLATION: the row "
+                    "manifest changed between the capture halves "
+                    "(fail-closed)" % (self.id, round_id))
+            z_plus, y2 = self._dsar_forward_train_rows(train_idx)
+            if not torch.equal(y2, pend["y"]):
+                raise RuntimeError(
+                    "client %d round %d: DSAR GATE VIOLATION: paired row "
+                    "labels diverged between capture halves (fail-closed)"
+                    % (self.id, round_id))
+            seed_b = dsar_stable_seed(getattr(self.args, 'seed', 0),
+                                      'dsarB', self.id, self.task_id,
+                                      int(round_id))
+            b_factors, b_status, b_aux = dsar_fit_bridge(
+                z_plus, pend["z_minus"], train_idx, seed_b)
+            meta = {
+                "version": DSAR_VERSION,
+                "round_id": int(round_id), "entry": str(entry),
+                "task_id": int(self.task_id),
+                "b_status": b_status, "l_status": pend["l_status"],
+                "l_final_ce": pend["l_final_ce"],
+                "birth_prompt_hash": pend["birth_prompt_hash"],
+                "prompt_hash": hash_prompt_module(self.vit.prompt),
+                "n_train": int(len(train_idx)),
+                "b_aux": b_aux,
+            }
+            sidecar = DSARSidecar(
+                b_factors is not None,
+                (b_factors or {}).get("M1"),
+                (b_factors or {}).get("M2"),
+                (b_factors or {}).get("bias"),
+                pend["l_factors"] is not None,
+                (pend["l_factors"] or {}).get("M1"),
+                (pend["l_factors"] or {}).get("M2"),
+                (pend["l_factors"] or {}).get("bias"),
+                meta)
+            if not sidecar.rank_shapes_ok() or not sidecar.factors_finite():
+                raise RuntimeError(
+                    "client %d round %d: DSAR committed malformed r8 "
+                    "factors (fail-closed)" % (self.id, round_id))
+            self._dsar_sidecar = sidecar
+            print('[DSAR] client %d task %d round %d: B %s (n_fit=%d '
+                  'n_cal=%d) + L %s -> sidecar committed'
+                  % (self.id, self.task_id, int(round_id), b_status,
+                     int(b_aux.get("n_fit", -1)),
+                     int(b_aux.get("n_cal", -1)), pend["l_status"]))
+        finally:
+            self.original_model.train(flags[2])
+            self.model.train(flags[1])
+            self.vit.train(flags[0])
+            self._a5_rng_restore(rng)
+
     def load_global_weights(self,weights):
         self.model.load_state_dict(weights)
         self.evaluate(self.task_id,self.nb_classes)
@@ -1226,6 +1480,10 @@ class Client_DF(object):
         # §34.2 0b pre（z⁻）捕获：load_prompts 之前 = 本地训练后 birth
         # state；默认（capture OFF）= 完全 no-op
         self._bsab_capture_pre(round, entry='broadcast')
+
+        # §34.4/§34.4a B1 DSAR pre 半段（z⁻ 采集 + L 拟合；
+        # 默认 OFF = 完全 no-op）
+        self._dsar_fit_pre(round, entry='broadcast')
 
         self.global_protos = deepcopy(proto)
 
@@ -1237,6 +1495,11 @@ class Client_DF(object):
         # §34.2 0b post（z⁺）捕获：广播 prompt 已装载、任何 post-broadcast
         # refit / evaluate 之前；默认（capture OFF）= 完全 no-op
         self._bsab_capture_post(round, entry='broadcast')
+
+        # §34.4/§34.4a B1 DSAR post 半段（z⁺ 采集 + B 拟合 + sidecar
+        # 提交；随后的 evaluate 读到最新已提交 sidecar；默认 OFF =
+        # 完全 no-op）
+        self._dsar_fit_post(round, entry='broadcast')
 
         # A5-v2 §28 判据臂（--refit_timing post_broadcast）：广播后接口
         # 状态（融合 prompt 已装载）上的 refit，特征流与随后的 evaluate
@@ -1254,6 +1517,11 @@ class Client_DF(object):
         # 完全 no-op）
         self._bsab_capture_pre(round, entry='broadcast_no_test')
 
+        # §34.4/§34.4a B1 DSAR pre 半段（passive client 同样每轮拟合/
+        # 提交 sidecar——task-end 全任务评估走所有客户端的已提交
+        # sidecar；默认 OFF = 完全 no-op）
+        self._dsar_fit_pre(round, entry='broadcast_no_test')
+
         self.global_protos = deepcopy(proto)
 
         self.global_head = head
@@ -1263,6 +1531,9 @@ class Client_DF(object):
 
         # §34.2 0b post（z⁺）捕获（默认 OFF = 完全 no-op）
         self._bsab_capture_post(round, entry='broadcast_no_test')
+
+        # §34.4/§34.4a B1 DSAR post 半段（默认 OFF = 完全 no-op）
+        self._dsar_fit_post(round, entry='broadcast_no_test')
 
 
     def get_head(self,head):
@@ -1345,7 +1616,16 @@ class Client_DF(object):
                     output = self.original_model(input)
                     output = output['pre_logits'].requires_grad_(False)
                     output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    pre, output_mixed, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+                    z_feat = output['feat'].to(self.device)
+                    if self._dsar_sidecar is not None:
+                        # §34.4a frozen dispatch: historical task = B-only,
+                        # current task = B -> L. Exact identity adapters
+                        # short-circuit independently (B identity != DSAR
+                        # identity); with both inactive the SAME tensor
+                        # object is returned (bitwise-neutral).
+                        z_feat = self._dsar_sidecar.apply(
+                            z_feat, task == self.task_id)
+                    pre, output_mixed, _ = self.model(z_feat, target.to(self.device))
             logits = pre
 
             # logits = output['logits']
@@ -1398,7 +1678,15 @@ class Client_DF(object):
                     output = self.original_model(input)
                     output = output['pre_logits'].requires_grad_(False)
                     output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    pre, output_mixed, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+                    z_feat = output['feat'].to(self.device)
+                    if self._dsar_sidecar is not None:
+                        # §34.4a frozen dispatch (same insertion as
+                        # evaluate(): task-end run_full_evaluation reads
+                        # through this path and MUST see the latest
+                        # committed sidecar)
+                        z_feat = self._dsar_sidecar.apply(
+                            z_feat, task == self.task_id)
+                    pre, output_mixed, _ = self.model(z_feat, target.to(self.device))
             logits = pre
 
             # logits = output['logits']
@@ -1505,6 +1793,14 @@ class Client_DF(object):
         if self._a5_refit_on:
             state["a5_joint_head"] = module_state_or_none(self._a5_joint_head)
 
+        # §34.4/§34.4a B1 DSAR：最新已提交 sidecar（task-end 全任务评估
+        # / resume 都必须读到与该时刻 broadcast 状态匹配的 sidecar）。
+        # schema 仅 ON 臂新增 key（OFF 基线 checkpoint 逐位不变）。
+        if self._dsar_on:
+            state["dsar_sidecar"] = (
+                self._dsar_sidecar.state_dict()
+                if self._dsar_sidecar is not None else None)
+
         return state
 
     def load_checkpoint_state(self, state):
@@ -1572,6 +1868,27 @@ class Client_DF(object):
                     "re-run from scratch)" % self.id)
             self._a5_joint_head = rebuild_client_head(
                 jh, deepcopy(self.model.get_head())).to(self.device)
+
+        # §34.4/§34.4a B1 DSAR：sidecar 恢复，fail-closed（ON 臂 resume
+        # 从缺 key 的 checkpoint 继续 = 评估读出的 adapter 状态静默漂移，
+        # 拒绝；结构与 r8 factor 形状再验）
+        if self._dsar_on:
+            if "dsar_sidecar" not in state:
+                raise RuntimeError(
+                    "client %d: DSAR resume requires dsar_sidecar in the "
+                    "checkpoint -- refusing to silently continue with a "
+                    "drifted adapter state (fail-closed; re-run from "
+                    "scratch)" % self.id)
+            sc_state = state["dsar_sidecar"]
+            self._dsar_sidecar = (
+                DSARSidecar.from_state(sc_state, self.device)
+                if sc_state is not None else None)
+            if (self._dsar_sidecar is not None
+                    and not (self._dsar_sidecar.rank_shapes_ok()
+                             and self._dsar_sidecar.factors_finite())):
+                raise RuntimeError(
+                    "client %d: DSAR resume found malformed r8 factors in "
+                    "the checkpoint (fail-closed)" % self.id)
 
         self.global_protos = state.get("global_protos")
         self.local_protos = state.get("local_protos")
