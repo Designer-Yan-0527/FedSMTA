@@ -119,13 +119,18 @@ def parse_args():
                    help="keep small: this only tests DSAR neutrality")
     p.add_argument("--seed", default=42, type=int)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--private_class_num", default=0, type=int,
+                   help="0 = dataset protocol default (cifar100: 15, "
+                        "ImageNet-R: 40 -- official §5.1, mandatory)")
     p.add_argument("--work_dir", default="output/regression", type=Path)
     p.add_argument("--method", default="fedta")
     p.add_argument("--skip_real", action="store_true",
                    help="run only the G4-A identity arms (verdict scope "
                         "G4_IDENTITY, not sufficient for B1 unlock)")
     p.add_argument("--out_json", default=None,
-                   help="default: <work_dir>/metrics/dsar_g4_regression.json")
+                   help="default: "
+                        "<work_dir>/metrics/dsar_g4_regression_"
+                        "<data_name>.json")
     return p.parse_args()
 
 
@@ -458,8 +463,11 @@ def main():
             f"--rounds {rounds} exceeds task_num*global_epoch "
             f"({args.task_num * args.global_epoch})")
 
+    private_class_num = (args.private_class_num if args.private_class_num > 0
+                         else (40 if args.data_name == "ImageNet-R" else 15))
     common = ["--data_name", args.data_name, "--data-path", args.data_path,
               "--seed", str(args.seed), "--device", args.device,
+              "--private_class_num", str(private_class_num),
               "--global_epoch", str(args.global_epoch),
               "--task_num", str(args.task_num),
               "--local_epoch", str(args.local_epoch),
@@ -583,7 +591,8 @@ def main():
     identity_ok = all(ok for _, ok, _ in report)
 
     out_json = (Path(args.out_json) if args.out_json else
-                Path(args.work_dir) / "metrics" / "dsar_g4_regression.json")
+                Path(args.work_dir) / "metrics" /
+                f"dsar_g4_regression_{args.data_name}.json")
     out_json.parent.mkdir(parents=True, exist_ok=True)
 
     def write_verdict(scope, identity_ok_, full_ok):
