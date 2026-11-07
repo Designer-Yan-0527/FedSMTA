@@ -2461,6 +2461,7 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 **最短解锁路径（不重做大规模研究）**：
 
 1. **G2 签核**：以既有 CPU 冒烟证据为基础，对真实 capture 数据跑 §34.4b 五断言（G2_RANK8_GUARD / G2_BIAS8 / G2_IDENTITY_TIE / G2_REFIT / G2_LOW_POWER）的独立复刻签核，产出持久 verdict JSON。
+   **✅ 已完成（2026-11-07）**：`diagnostics/dsar_g2_signoff.py`（生产侧 `Models/DSAR.py::dsar_fit_bridge` aux vs 本地独立复刻，不 import DSAR 实现函数；γ*=0.396419/rank 8/32/8 阈值/80/20 hash split 全部本地重写；附 manifest pairing gate）。**VERDICT: PASS（125/125 cell）**：五断言全绿；FITTED 105 / IDENTITY_GUARD 20 / LOW_POWER 0（与 §34.4c 验证闭环计数一致，零翻转）；独立复刻与生产 aux **逐位一致**（max bias diff = 0，max lam_refit rel err = 0，容差 1e-9/1e-5 均远未触界）；20 个 IDENTITY_GUARD cell 与 B0 identity 集合逐 cell 吻合（全 c0、rounds 5t+0..3，§34.6 Q4 结构性必然的又一次独立复现）；`max|c_full−b8| = 1.97e-1 > 1e-5` 证明口径切换实质性（冒烟证据 2.1e-2 的全量放大），且全部可分辨 cell 上部署 bias ≠ c_full（无口径回退）。证据：`output/cifar100/fedta/cifar_bsab_capture_M2matched/seed_42/bsab_b0/dsar_g2_signoff.json`（G1 写盘纪律：唯一新增写盘点 = 该 JSON）。
 2. **G3 签核**：G1 T3 配对 hook 证据 + `dsar_task_dispatch_audit.json` 真实 broadcast 调用点审计合并签核。
 3. **G4 签核**：最短 deterministic matched OFF/ON(identity) 训练回归——逐轮比较主模型 state、optimizer、scheduler、RNG 状态与 checkpoint/resume 对应性；ON(identity) 全程逐位等于 OFF。
 
