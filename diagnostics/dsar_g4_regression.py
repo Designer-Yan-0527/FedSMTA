@@ -46,9 +46,10 @@ G4-B 断言（real-fit 路径，2026-11-08 审核补齐项）：
                   发生。
   G4B_SEAL        args 记录 dsar=True / dsar_identity=False；每 client
                   sidecar 版本封章 / r8 因子形状与有限性 / active 旗标
-                  一致性；sidecar 提交时点正确（meta.round_id ==
-                  completed_round - 1，即轮末广播提交）；全程至少一个
-                  FITTED 在线状态（B=FITTED 或 L=FITTED；审核要求）。
+                  一致性；sidecar 提交时点正确（checkpoint 在轮末广播
+                  之后保存，故 meta.round_id == completed_round）；全程
+                  至少一个 FITTED 在线状态（B=FITTED 或 L=FITTED；审核
+                  要求）。
 
 裁决分级（§34.4d 执行审核）：
   G4_IDENTITY_PASS = A/B/C 三臂全绿（不得扩展解释为 FULL）
@@ -127,6 +128,12 @@ def parse_args():
     p.add_argument("--skip_real", action="store_true",
                    help="run only the G4-A identity arms (verdict scope "
                         "G4_IDENTITY, not sufficient for B1 unlock)")
+    p.add_argument("--reuse_runs", action="store_true",
+                   help="do NOT (re)run any training: reuse the existing "
+                        "run dirs as-is and recompute every assertion + "
+                        "verdict from the on-disk checkpoints/matrices "
+                        "(e.g. to regenerate the verdict JSON after an "
+                        "assertion-side fix)")
     p.add_argument("--out_json", default=None,
                    help="default: "
                         "<work_dir>/metrics/dsar_g4_regression_"
@@ -392,8 +399,11 @@ def check_seal_real(ckpts):
 
     Verified per checkpoint: args record dsar=True / dsar_identity=False;
     every client carries a structurally valid sidecar; the commit timing
-    is right (sidecar is committed at the round-end broadcast, so
-    meta.round_id == completed_round - 1); entry is a broadcast path."""
+    is right (checkpoints are saved AFTER the round-end broadcast -- see
+    §34.2.6a, birth prompts are already overwritten at save time -- so the
+    sidecar in a completed_round=r checkpoint is the one just committed at
+    broadcast r: meta.round_id == completed_round); entry is a broadcast
+    path."""
     issues, status_counts, n_fitted = [], {}, 0
     for name, ck in sorted(ckpts.items()):
         args = ck.get("args", {})
@@ -411,10 +421,10 @@ def check_seal_real(ckpts):
             issues += [f"{name}:c{c['id']}: {i}"
                        for i in sidecar_factor_issues(sc)]
             meta = sc.get("meta", {})
-            if int(meta.get("round_id", -1)) != cr - 1:
+            if int(meta.get("round_id", -2)) != cr:
                 issues.append(f"{name}: client {c['id']} sidecar "
                               f"round_id={meta.get('round_id')} != "
-                              f"completed_round-1 ({cr - 1})")
+                              f"completed_round ({cr})")
             if meta.get("entry") not in ("broadcast", "broadcast_no_test"):
                 issues.append(f"{name}: client {c['id']} entry="
                               f"{meta.get('entry')}")
@@ -480,26 +490,35 @@ def main():
         run_dir = (args.work_dir / args.data_name / args.method / arm
                    / f"seed_{args.seed}")
         runs[arm] = run_dir
-        if run_dir.exists():
+        if run_dir.exists() and not args.reuse_runs:
             print(f"[cleanup] removing previous test run dir {run_dir}")
             shutil.rmtree(run_dir)
 
     dsar_identity_on = ["--dsar", "--dsar_identity"]
     dsar_real_on = ["--dsar"]
 
+    if args.reuse_runs:
+        missing = [arm for arm in arms if not runs[arm].exists()]
+        if missing:
+            raise SystemExit(
+                f"--reuse_runs: run dir(s) missing: {missing}")
+        print(f"[reuse] recomputing assertions from existing runs "
+              f"(no training): {[str(runs[a]) for a in arms]}")
+
     # ================= G4-A: identity arms =================
-    # A: OFF continuous (official path baseline)
-    run_main(common + ["--run_name", "g4_off_full",
-                       "--max_rounds", str(rounds)])
-    # B: ON(identity) continuous
-    run_main(common + ["--run_name", "g4_on_full",
-                       "--max_rounds", str(rounds)] + dsar_identity_on)
-    # C: ON(identity) split + resume (resume across the task boundary)
-    run_main(common + ["--run_name", "g4_on_split",
-                       "--max_rounds", str(split_at)] + dsar_identity_on)
-    run_main(common + ["--run_name", "g4_on_split",
-                       "--max_rounds", str(rounds),
-                       "--resume", "auto"] + dsar_identity_on)
+    if not args.reuse_runs:
+        # A: OFF continuous (official path baseline)
+        run_main(common + ["--run_name", "g4_off_full",
+                           "--max_rounds", str(rounds)])
+        # B: ON(identity) continuous
+        run_main(common + ["--run_name", "g4_on_full",
+                           "--max_rounds", str(rounds)] + dsar_identity_on)
+        # C: ON(identity) split + resume (resume across the task boundary)
+        run_main(common + ["--run_name", "g4_on_split",
+                           "--max_rounds", str(split_at)] + dsar_identity_on)
+        run_main(common + ["--run_name", "g4_on_split",
+                           "--max_rounds", str(rounds),
+                           "--resume", "auto"] + dsar_identity_on)
 
     ckpts = {arm: load_all_ckpts(runs[arm]) for arm in IDENTITY_ARMS}
 
@@ -655,14 +674,15 @@ def main():
         sys.exit(0 if identity_ok else 1)
 
     # D: ON(real-fit) continuous
-    run_main(common + ["--run_name", "g4_on_real_full",
-                       "--max_rounds", str(rounds)] + dsar_real_on)
     # E: ON(real-fit) split + resume (non-identity sidecar resume check)
-    run_main(common + ["--run_name", "g4_on_real_split",
-                       "--max_rounds", str(split_at)] + dsar_real_on)
-    run_main(common + ["--run_name", "g4_on_real_split",
-                       "--max_rounds", str(rounds),
-                       "--resume", "auto"] + dsar_real_on)
+    if not args.reuse_runs:
+        run_main(common + ["--run_name", "g4_on_real_full",
+                           "--max_rounds", str(rounds)] + dsar_real_on)
+        run_main(common + ["--run_name", "g4_on_real_split",
+                           "--max_rounds", str(split_at)] + dsar_real_on)
+        run_main(common + ["--run_name", "g4_on_real_split",
+                           "--max_rounds", str(rounds),
+                           "--resume", "auto"] + dsar_real_on)
 
     ckpts_real = {arm: load_all_ckpts(runs[arm]) for arm in REAL_ARMS}
     real_status_counts = {}
