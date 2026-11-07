@@ -105,7 +105,8 @@ def parse_args():
     p = argparse.ArgumentParser("G4 DSAR training-level regression")
     p.add_argument("--data_name", default="cifar100",
                    choices=["cifar100", "ImageNet-R"])
-    p.add_argument("--data_path", default="./local_datasets")
+    p.add_argument("--data-path", "--data_path", dest="data_path",
+                   default="./local_datasets")
     p.add_argument("--rounds", default=0, type=int,
                    help="total rounds N (0 = global_epoch + 1: crosses the "
                         "task-0 end boundary into task 1)")
