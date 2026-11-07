@@ -2555,6 +2555,8 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 
 **Q4 裁决**：γ\*_INR 原则批准（≈2.058），**正式配置读 artifact 全精度**，且冻结前须过 provenance 核查——INR 与 CIFAR 同为 105 nonidentity 的巧合须排除沿用 CIFAR 路径/统计字段：核对 json `cells_csv` 指向、cell ID 集合（identity 20 cell 的 client/task/round 应两数据集不同）、GCV 列名映射（bridge_*）、run_dir。105/125 是 GCV 选择口径 ≠ 部署 guard active（r8 48%/full 1% 是 held-out MSE 口径，二者不是同一决策规则）。γ\*_INR 仅用于 R1 的 B8 验证臂；R0 无 B 拟合开销。
 
+**Q4 provenance 核查通过（2026-11-08，izfree）**：`cells_csv` 指向 INR run 目录；重跑复现（105/125、11 边界命中、median 一致）；PAIRING_GATE 隐式排除污染（若误读 CIFAR cells.csv，其 n_train≈1207 与 INR npz ~650 行对账必 FAIL）。**105 巧合 = 结构性必然**：两数据集 identity 集合模式完全相同——全部 20 cell 均为 c0（KD no-op 零漂移客户端）且均为每任务 round 0–3、不含任务末轮 5t+4；125 − 20 = 105。附赠观察：c0 在任务末轮不选 identity，两数据集一致——任务末轮广播边界带系统性额外位移（疑与 task-end 评估/refit 时点耦合）。**γ\*_INR 正式冻结 = 2.0579118185313345**（全精度，仅 R1 B8 验证臂）。
+
 **Stage 3 判决口径**：四固定 readout 条件 = 原始 FedTA OFF / 原r8r8 DSAR / INR-R0 / INR-R1；Current Recovery 门 = 正式 task-end +0.8pp（125-cell pooled preview 不构成 task-end 保证）；历史任务首次在线探索性终点只报不断，R1 未改善历史不得宣布 Historical Rescue。**安全门"超出 matched 噪声"的估计方式与比较规则必须在正式 run 前冻结，否则不得自动判 PASS/FAIL。**
 
 **落盘前置**：安全门噪声规则 + γ*_INR provenance 核查通过后，本节由"条件冻结"转正式冻结。INR 正式 Rescue 继续 LOCKED（另需 INR G1–G4）。
