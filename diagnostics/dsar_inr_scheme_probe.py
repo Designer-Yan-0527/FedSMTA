@@ -42,6 +42,11 @@ birth-head 读出 / 专用 torch.Generator（不碰全局 RNG）。CE/读出前�
   python diagnostics/dsar_inr_scheme_probe.py \
       --run_dir output/ImageNet-R/fedta/inr_bsab_capture_M2matched_p40/seed_42
   python diagnostics/dsar_inr_scheme_probe.py --run_dir ... --rounds 4,9   # 冒烟
+  # 纯 B 网格细化（rank/γ sweep，分钟级）：
+  python diagnostics/dsar_inr_scheme_probe.py --run_dir ... \
+      --skip_l --b_ranks 8,16,24,32 \
+      --b_gammas inr,cifar,0.4,0.8,2.06,4.0,8.0 \
+      --out_dir <run_dir>/dsar_inr_probe_bgrid
 """
 
 import argparse
@@ -89,7 +94,42 @@ def parse_args():
                    help="L 拟合/读出的张量设备（cuda 可显著加速）")
     p.add_argument("--l_epochs", default=0, type=int,
                    help="0 = 生产冻结值 100（冒烟可调小，结果不可采信）")
+    p.add_argument("--b_ranks", default="8,16",
+                   help="B 臂 rank 列表（逗号分隔；如 '8,16,24,32'）")
+    p.add_argument("--b_gammas", default="inr,cifar,gcv,lam0",
+                   help="B 臂 γ 模式列表（inr/cifar/gcv/lam0 或纯数值如 "
+                        "'0.8,2.06,4.0' = 固定 γ 值；命名 g<value>）")
+    p.add_argument("--skip_l", action="store_true",
+                   help="跳过 L 臂与组合臂（纯 B 网格，分钟级；cells.csv "
+                        "不含 acc_L*/acc_chain* 列，summary 覆盖写")
     return p.parse_args()
+
+
+def parse_b_gammas(spec):
+    """'inr,cifar,gcv,lam0,0.8,4.0' -> 模式名列表；数值 -> 'g<value>'。"""
+    modes = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if tok == "":
+            continue
+        if tok in ("inr", "cifar", "gcv", "lam0"):
+            modes.append(tok)
+        else:
+            try:
+                val = float(tok)
+            except ValueError:
+                raise SystemExit(f"bad --b_gammas token: {tok!r}")
+            modes.append("g" + ("%g" % val))
+    if not modes:
+        raise SystemExit("empty --b_gammas")
+    return modes
+
+
+def b_gamma_value(mode):
+    """固定 γ 数值模式 'g0.8' -> 0.8；其余（inr/cifar）返回 None。"""
+    if mode.startswith("g"):
+        return float(mode[1:])
+    return None
 
 
 def stable_seed(*parts):
@@ -182,13 +222,17 @@ def b_scale(zp_rows):
 
 
 def b_lambda(mode, zp_fit):
-    """λ 选择：inr/cifar = N·s·γ 固定；lam0 = 0（gcv 走 b_lambda_gcv）。
-    返回 (lam, gcv_expo)。"""
+    """λ 选择：inr/cifar/g<value> = N·s·γ 固定；lam0 = 0（gcv 走
+    b_lambda_gcv）。返回 (lam, gcv_expo)。"""
     n = zp_fit.shape[0]
     s = b_scale(zp_fit)
-    if mode in ("inr", "cifar"):
-        return float(n) * s * (GAMMA_INR if mode == "inr" else GAMMA_CIFAR), \
-            float("nan")
+    if mode == "inr":
+        return float(n) * s * GAMMA_INR, float("nan")
+    if mode == "cifar":
+        return float(n) * s * GAMMA_CIFAR, float("nan")
+    gv = b_gamma_value(mode)
+    if gv is not None:
+        return float(n) * s * gv, float("nan")
     if mode == "lam0":
         return 0.0, float("nan")
     raise AssertionError(f"gcv mode must use b_lambda_gcv, got {mode}")
@@ -337,10 +381,16 @@ def l_apply(z, M1, M2, bias):
 L_CONFIGS = [(rk, basis, guard)
              for rk in L_RANKS for basis in ("zp", "zm")
              for guard in ("ce", "no")]
-B_CONFIGS = [(rk, gm, guard)
-             for rk in B_RANKS for gm in ("inr", "cifar", "gcv", "lam0")
-             for guard in ("mse", "no")]
 CHAIN_CONFIGS = ("chain_B8inr_L16zp", "chain_B8inr_L16zm")
+
+
+def build_b_configs(ranks_spec, gammas_spec):
+    ranks = [int(x) for x in ranks_spec.split(",") if x.strip()]
+    if not ranks:
+        raise SystemExit("empty --b_ranks")
+    return [(rk, gm, guard) for rk in ranks
+            for gm in parse_b_gammas(gammas_spec)
+            for guard in ("mse", "no")]
 
 
 def cfg_name_l(rk, basis, guard):
@@ -372,6 +422,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     epochs = args.l_epochs if args.l_epochs > 0 else L_EPOCHS
+    b_configs = build_b_configs(args.b_ranks, args.b_gammas)
 
     with open(run_dir / "args.json", encoding="utf-8") as f:
         ra = json.load(f)
@@ -466,7 +517,7 @@ def main():
 
             # ---- B 臂 ----
             b_factors = {}
-            for rk, gm, guard in B_CONFIGS:
+            for rk, gm, guard in b_configs:
                 name = cfg_name_b(rk, gm, guard)
                 M1, M2, bias, status, aux = fit_b(
                     zp_fit, zm_fit, idx_fit, gm, rk,
@@ -485,18 +536,19 @@ def main():
                 else:
                     row[f"acc_{name}"] = row["acc_off"]
 
-            # ---- L 臂 ----
+            # ---- L 臂（--skip_l 时跳过）----
             # 拟合基底：zp = z⁺ train 行（INR-R0 语义）；zm = z⁻ train 行
             # （CIFAR 生产语义）。guard=ce：80% 拟合 + 20% paired CE
             # （不 refit）；guard=no：全行拟合无条件部署。
-            fit_mask, cal_mask = split_fit_cal(idx_fit)
-            idx_f = torch.tensor(fit_mask)
-            idx_c = torch.tensor(cal_mask)
-            n_fit, n_cal = int(idx_f.sum()), int(idx_c.sum())
-            row["n_lfit"] = n_fit
-            row["n_lcal"] = n_cal
-            bases = {"zp": zp_fit, "zm": zm_fit}
-            for rk, basis, guard in L_CONFIGS:
+            if not args.skip_l:
+                fit_mask, cal_mask = split_fit_cal(idx_fit)
+                idx_f = torch.tensor(fit_mask)
+                idx_c = torch.tensor(cal_mask)
+                n_fit, n_cal = int(idx_f.sum()), int(idx_c.sum())
+                row["n_lfit"] = n_fit
+                row["n_lcal"] = n_cal
+                bases = {"zp": zp_fit, "zm": zm_fit}
+            for rk, basis, guard in ([] if args.skip_l else L_CONFIGS):
                 name = cfg_name_l(rk, basis, guard)
                 if n_train < MIN_FIT_ROWS:
                     row[f"{name}_active"] = 0
@@ -551,7 +603,7 @@ def main():
             # ---- 组合臂（B8 inr mse guard 之后 L16；复核可加性）----
             b_name = cfg_name_b(8, "inr", "mse")
             bfac = b_factors.get(b_name)
-            for chain in CHAIN_CONFIGS:
+            for chain in ([] if args.skip_l else CHAIN_CONFIGS):
                 basis = "zp" if chain.endswith("L16zp") else "zm"
                 rk = 16
                 if bfac is None or n_train < MIN_FIT_ROWS:
@@ -587,9 +639,11 @@ def main():
 
     # ---------------------------------------------------------- 汇总排名
     acc_cols = (["acc_off", "acc_ref_zm"]
-                + [f"acc_{cfg_name_l(*c)}" for c in L_CONFIGS]
-                + [f"acc_{cfg_name_b(*c)}" for c in B_CONFIGS]
-                + [f"acc_{c}" for c in CHAIN_CONFIGS])
+                + ([] if args.skip_l
+                   else [f"acc_{cfg_name_l(*c)}" for c in L_CONFIGS])
+                + [f"acc_{cfg_name_b(*c)}" for c in b_configs]
+                + ([] if args.skip_l
+                   else [f"acc_{c}" for c in CHAIN_CONFIGS]))
     def _mean(vals):
         return float(np.mean(vals)) if vals else float("nan")
 
@@ -636,6 +690,8 @@ def main():
         l_recipe=dict(epochs=epochs, batch=L_BATCH, lr=L_LR, wd=L_WD,
                       frozen_production=(epochs == L_EPOCHS)),
         gamma_inr=GAMMA_INR, gamma_cifar=GAMMA_CIFAR,
+        b_grid=dict(ranks=args.b_ranks, gammas=args.b_gammas,
+                    skip_l=args.skip_l),
         ranking=[dict(rank=i + 1, config=k,
                       task_end_pooled_delta=configs[k][
                           "task_end_pooled_delta"],
