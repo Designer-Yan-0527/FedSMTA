@@ -2454,6 +2454,18 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 
 **验证闭环（2026-11-07）**：四项一致性检查通过后，CPU 数值断言重跑全绿——新旧 γ\* 在 125 cell 判决**零翻转**（FITTED 105 / IDENTITY_GUARD 20 不变；λ +1.56% 未触碰任何 guard 离散边界）；外部独立配方复刻 1e-9 对账；对抗扫描 full-wins/r8-loses 样本仍被新 guard 正确拒绝；`G2_IDENTITY_TIE` 全量 cell 成立。G1 在新 γ\* 下重跑 **PASS（15/15）**，宿主 `cifar_base_p15/seed_42`；旧 γ 版本 G1 证据归档为 `dsar_g1_invariance_gamma0.390324_superseded.json`（历史工程证据保留）。§34.4c 勘误验证链闭合，γ\* 相关 LOCKED 条件解除；B1 formal run 的其余前置（G2 运行时断言等）按 §34.4 原时间线不变。
 
+#### 34.4d CIFAR B1 正式训练解锁路径 — G2–G4 最短签核（2026-11-08 GPT 纠正登记）
+
+**更正记录**：此前状态报告中"B1 formal run 全部前置已满足"为**误述**——G1 PASS ≠ G2–G4 通过，Gate 顺序冻结不变。当前确认状态：G1 PASS（15/15）；G2 有充分 CPU 证据但缺独立签核；G3 有 G1 T3 部分证据缺独立签核；**G4 无通过证据**（G1 T3 的单次真实拟合 RNG/mode/状态恢复 ≠ 真实训练逐轮 OFF/ON 主模型等价）。
+
+**最短解锁路径（不重做大规模研究）**：
+
+1. **G2 签核**：以既有 CPU 冒烟证据为基础，对真实 capture 数据跑 §34.4b 五断言（G2_RANK8_GUARD / G2_BIAS8 / G2_IDENTITY_TIE / G2_REFIT / G2_LOW_POWER）的独立复刻签核，产出持久 verdict JSON。
+2. **G3 签核**：G1 T3 配对 hook 证据 + `dsar_task_dispatch_audit.json` 真实 broadcast 调用点审计合并签核。
+3. **G4 签核**：最短 deterministic matched OFF/ON(identity) 训练回归——逐轮比较主模型 state、optimizer、scheduler、RNG 状态与 checkpoint/resume 对应性；ON(identity) 全程逐位等于 OFF。
+
+三项完成后 B1 formal run 解锁。正式全量 run 中保留在线 hash/assert，但**不得以正式 run 本身替代前置 G4**。
+
 #### 34.5 INR B0-lite 判决：RED，裁剪 INR 臂（2026-11-06 封板）
 
 **执行**：izfree `--no_repro` 全量 125 cell（repro gate 按 §34.3 裁除；zref PASS 25/25）。**VERDICT: RED**：ρ mean=0.315 / pooled=0.418，t1=−0.109、t4=−0.226，worst 全部集中 c4（ρ −6.0~−1.8）。
@@ -2465,7 +2477,7 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 | 0 | 0.68 | +0.50 | +0.64 | 78% |
 | 1 | 1.23 | **−0.15** | +0.42 | 塌 |
 | 2 | 2.28 | +0.81 | +1.48 | 36% |
-| 3 | 0.76 | +0.66 | +0.66 | 87% |
+| 3 | 0.76 | +0.66 | +0.66 | 87% | 
 | 4 | 1.82 | **+0.09** | +0.82 | 5% |
 | pooled | ~1.35 | +0.38 | +0.80 | **~28%（cifar 82%）** |
 
@@ -2517,3 +2529,32 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 - **B0-lite 重跑一致性 PASS**：rho mean=0.315 / pooled=0.418 / task 分布（t3 0.991、t1 −0.109、t4 −0.226）/ worst cell（c4 r09 −6.0 等）与 §34.5 封板判决逐项一致，VERDICT RED 不变；additive `bridge_lam_expo` 列未扰动四臂——重跑验收条件满足。
 
 **状态（2026-11-07）**：Stage 0 完整（① verdict 一致性 + ② γ*_INR + ③ preview 读数），待 GPT 对完整包做 Stage 1 冻结裁决。Stage 1 方向初判：B 臂降级候选（低秩覆盖不足 + full 泛化失败 + 组合负收益），L 臂为 INR Rescue 主力（rank 候选 r16/r32），修复主战场转向 L + 历史任务路径。**guard 判据的方法学注意**：R_r 分母退化（结论 1）同时意味着 cal-MSE 对 INR 损伤不敏感——"guard 放行"≠"有效修复"，INR 的 guard 判据是否需换口径（如部署态 CE）列入 Stage 1 裁决议题。INR 正式 Rescue run 继续 LOCKED。
+
+#### 34.6a INR Stage 1 终审裁决 — L 主导方案（2026-11-08 GPT 终审；条件冻结）
+
+**总裁决**：Stage 0 验收 PASS；B 高容量扩张（full-768 / r64+）REJECT；转向 L 主导 Current Recovery + B-only Historical Transfer Test。
+
+**机制结论收紧（证据边界修正，§34.5 RED 判决不变）**：
+
+- **修正 A**：1.34pp = birth-state reference gap（所测广播前后 accuracy 差），**不得**称为 B 的数学修复上限——B 的特征变换可能使准确率超过 raw（B0 已有修复率>1 先例）。
+- **修正 B**：L 超 raw（84.08>83.29）证明 L 修复了"单纯逆转 broadcast 位移无法解释的读出失配"，**不得**直接归因为 ~1.8pp 全部来自时间性 head 陈旧——因果拆分需控制实验。
+
+**Readout profile（预注册，二者仅历史任务 readout 不同，训练轨迹相同）**：
+
+| Profile | 当前任务 | 历史任务 | 地位 |
+|---|---|---|---|
+| INR-R0 | L16-only | 原始 Tail_Anchor（identity） | 当前任务主方案 |
+| INR-R1 | L16-only | B8-only（无标签 guard） | 历史迁移验证臂 |
+
+- R1 的 B 由**当前任务 train rows** 拟合（固定 r8 + train-only identity MSE guard，不用历史任务标签选择启用）；历史结果必须完整报告含负迁移，**不得先看 R1 结果再选主 profile**。
+- INR Rescue = CIFAR DSAR 的数据集专用扩展，论文分别报告，不混称。
+
+**Q2 裁决**：B guard **保持** paired-feature MSE（B 的研究角色 = label-free broadcast alignment；监督 CE gating 属新方法须另立）；**L 新增部署态 CE guard**：`L_active ⟺ CE_L < CE_I`，其中 CE_I=CE(T_{c,t}(z⁺),y)、CE_L=CE(T_{c,t}(L16(z⁺)),y)；协议 = 当前任务 train split 固定 80% 拟合 → 广播后剩余 20% paired CE → 平局选 identity → **校准后不 refit，部署被校准的同一 L16**；官方 `train=True` 语义下 CE guard 须用固定随机前向协议（不得一侧 dropout 一侧关）。CE guard 不保证 test accuracy 不降——正式安全性以 matched evaluation 测量，guard PASS ≠ accuracy safety 证明。
+
+**Q3 裁决**：`rank_L^INR = 16` 冻结（r16→r32 仅 +0.10pp，不足以支撑扩容与 r64 搜索；防 Stage 0 退化为隐性 test-set 选模）。配方沿用 100ep/bs64/Adam/lr1e-3/wd1e-4/λ_L=0 + CE guard。r32 留作探索对照，不据此调参。**注记**：r16 选择已参考同一批探索数据，其最终效果需 Stage 4 新 seed 确认。
+
+**Q4 裁决**：γ\*_INR 原则批准（≈2.058），**正式配置读 artifact 全精度**，且冻结前须过 provenance 核查——INR 与 CIFAR 同为 105 nonidentity 的巧合须排除沿用 CIFAR 路径/统计字段：核对 json `cells_csv` 指向、cell ID 集合（identity 20 cell 的 client/task/round 应两数据集不同）、GCV 列名映射（bridge_*）、run_dir。105/125 是 GCV 选择口径 ≠ 部署 guard active（r8 48%/full 1% 是 held-out MSE 口径，二者不是同一决策规则）。γ\*_INR 仅用于 R1 的 B8 验证臂；R0 无 B 拟合开销。
+
+**Stage 3 判决口径**：四固定 readout 条件 = 原始 FedTA OFF / 原r8r8 DSAR / INR-R0 / INR-R1；Current Recovery 门 = 正式 task-end +0.8pp（125-cell pooled preview 不构成 task-end 保证）；历史任务首次在线探索性终点只报不断，R1 未改善历史不得宣布 Historical Rescue。**安全门"超出 matched 噪声"的估计方式与比较规则必须在正式 run 前冻结，否则不得自动判 PASS/FAIL。**
+
+**落盘前置**：安全门噪声规则 + γ*_INR provenance 核查通过后，本节由"条件冻结"转正式冻结。INR 正式 Rescue 继续 LOCKED（另需 INR G1–G4）。
