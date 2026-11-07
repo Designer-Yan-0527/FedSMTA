@@ -138,10 +138,11 @@ def ta_logits(z, key, anchor_pool, hsd):
 
 
 def masked_acc(logits, y, allowed):
-    keep = torch.full((logits.shape[1],), float("-inf"))
-    keep[allowed] = 0.0
+    keep = torch.full((logits.shape[1],), float("-inf"),
+                     device=logits.device)
+    keep[allowed.to(logits.device)] = 0.0
     pred = (logits + keep).argmax(dim=1)
-    return 100.0 * (pred == y).float().mean().item()
+    return 100.0 * (pred == y.to(logits.device)).float().mean().item()
 
 
 def masked_ce(z, y, key, anchor_pool, hsd, allowed, nb_classes):
