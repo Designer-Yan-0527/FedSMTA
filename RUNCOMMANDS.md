@@ -2452,6 +2452,8 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 
 **连带同步（已完成）**：`Models/DSAR.py`（常数+注释+版本）、RUNCOMMANDS §34.4 冻结项 2 / §34.4a Engineering constants / §34.4b G2_REFIT 断言三处同步为 0.396419，避免文档与代码保留两个不同正式 γ\*。
 
+**验证闭环（2026-11-07）**：四项一致性检查通过后，CPU 数值断言重跑全绿——新旧 γ\* 在 125 cell 判决**零翻转**（FITTED 105 / IDENTITY_GUARD 20 不变；λ +1.56% 未触碰任何 guard 离散边界）；外部独立配方复刻 1e-9 对账；对抗扫描 full-wins/r8-loses 样本仍被新 guard 正确拒绝；`G2_IDENTITY_TIE` 全量 cell 成立。G1 在新 γ\* 下重跑 **PASS（15/15）**，宿主 `cifar_base_p15/seed_42`；旧 γ 版本 G1 证据归档为 `dsar_g1_invariance_gamma0.390324_superseded.json`（历史工程证据保留）。§34.4c 勘误验证链闭合，γ\* 相关 LOCKED 条件解除；B1 formal run 的其余前置（G2 运行时断言等）按 §34.4 原时间线不变。
+
 #### 34.5 INR B0-lite 判决：RED，裁剪 INR 臂（2026-11-06 封板）
 
 **执行**：izfree `--no_repro` 全量 125 cell（repro gate 按 §34.3 裁除；zref PASS 25/25）。**VERDICT: RED**：ρ mean=0.315 / pooled=0.418，t1=−0.109、t4=−0.226，worst 全部集中 c4（ρ −6.0~−1.8）。
@@ -2476,3 +2478,42 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 1. **INR 臂裁剪**：DSAR 不做 INR 端到端部署（收益上限 <0.8pp 撑不起结构成本）；论文 scope 声明"部署于损伤显著的数据集"，INR 作 limitation/边界案例诚实报告（损伤小 + 仿射不可达）。
 2. **cifar B1 照常推进**（§34.4 不受影响）。
 3. INR capture/诊断材料保留（cells.csv + verdict.json + 位移统计），供论文 limitation 段与审稿答复。
+
+### 34.6 INR Rescue Amendment — Stage 0 只读诊断（2026-11-07 执行与读数；Stage 1 冻结待裁决）
+
+**授权与边界**（GPT 2026-11-07 裁决）：批准 Stage 0 工具扩展与只读诊断；与 CIFAR γ\* 勘误两轨道独立并行。目标从"确认 INR 局限"修订为"修复 INR"（B0-lite RED 只证明 §34.2 残差桥参数化不足，不禁止其他修复算子）。B0 GREEN 与 §34.5 RED 封板**不重开**；Stage 0 仍是探索性诊断，**不直接解锁 INR 正式 Rescue run**——正式部署前必须先完成 Stage 1（rank、γ\*_INR、L guard、判决口径冻结）。
+
+**条件 A（knee 规则，冻结）**：R_r=(MSE_I−MSE_r)/(MSE_I−MSE_full)≥0.9 为 knee 判据；聚合口径 = 仅对有效正分母 cell（容差 1e-6·MSE_I）取固定宏平均，同时上报 n_valid、median、p10 与全量 guard-active rate；无 rank 达标 → 记 `NO_KNEE_FOUND`，不得临时降阈值。Stage 0 的 test accuracy **只作机制解释，禁止作为 rank 选择依据**。
+
+**条件 B（γ\*_INR 多统计，冻结）**：导出须含 γ\*、n_nonidentity、p25/p75（IQR）、min/max 及 GCV 网格两端命中数；nonidentity 命中率 >20% → 记 `GCV_GRID_BOUNDARY_WARNING`，median 不直接采信，须先裁决是否修改校准协议。
+
+**执行记录**：izfree，`INR_RUN=output/ImageNet-R/fedta/inr_bsab_capture_M2matched_p40/seed_42`（find 核实，非猜测），125 cell / rounds 0–24 串行三命令：① `bsab_b0_verdict.py --no_repro` 重跑（新增 `bridge_lam_expo` 列）→ ② `bsab_gamma_star.py`（canonical fit_bridge 口径）→ ③ `dsar_birth_preview.py` 全量。
+
+**Stage 0 读数（preview overall，125 cell）**：
+
+| 指标 | 值 | 判读 |
+|---|---|---|
+| acc_raw / damaged / ceiling | 83.29 / 81.95 / 85.10 | 损伤 1.34pp，headroom 1.80pp |
+| bt_full / bt_r8 | 82.74 / 82.12 | B(full) 仅修 25% 损伤-天花板跨度 |
+| lt_r8 / r16 / r32 | 83.70 / 83.98 / 84.08 | **L 修 68% 跨度**，r32 仍在上行 |
+| 最佳 chain (lt32_btfull) | 83.62 | **< L 单独 84.08**，组合不可加 |
+| guard active rate | r8 0.48 → full 0.01 | 部署 r8 会被近半 cell 拦为 identity |
+| R_r / n_valid | NO_KNEE_FOUND；**1/125** | **分母退化**（见结论 1） |
+| 谱 | eff_rank_90=343.2；cum_energy r32=0.13, r256=0.69 | 损伤高秩，低秩 B 结构性不足 |
+| GCV 边界命中（canonical fit_bridge） | 11/105 = 10.5% < 20% | 无 `GCV_GRID_BOUNDARY_WARNING`（preview fit_bt 口径 21 为另一实现，仅参考） |
+| 位移 | c0 0.15 vs c1–c4 2.10–2.29 | KD 客户端高位移高秩 |
+
+**五条结构结论**：
+
+1. **R_r 框架在 INR 结构性退化**：124/125 cell 的分母（MSE_I−MSE_full）≤容差——full-ridge 在 held-out cal 行上对 identity 的 MSE 改善≈0。`NO_KNEE_FOUND` 的成因是参考系失效而非 rank 不足；互锁证据 = 高秩谱（343）+ 欠定（n_fit 均值 510 < d=768）+ 高位移。
+2. **INR 广播损伤在 cell 尺度上不可被线性残差桥泛化修复**；bt_full 的 +0.78pp 准确率收益与 MSE 退化并存，说明其来自对 head 判别面敏感的微小系统性偏移，非行级重建。
+3. **L 主导当前任务修复**（68% vs B 的 25%），且 L rank 收益未饱和（r8→r32 再 +0.38）。
+4. **B→L 组合收益为负**：所有 chain 低于 L 单独（task_1 甚至低于 damaged）——B 与 L 针对重叠损伤，B 在 L 修复后的特征上过度校正；§34.6 组合可加性假设被否决。
+5. **task 异质性**：t2/t4 损伤大且修复空间大，t1 损伤小且所有手段最弱。
+
+**γ\*_INR 与 B0 重跑补录（2026-11-07）**：
+
+- **γ\*_INR = 2.05791**（median，n_nonidentity=105；p25=2.03 / p75=3.6 / min=0.000115 / max=6.44；GCV 边界命中 11/105=10.5%<20%，条件 B 通过无警告）。为 CIFAR γ\*（0.396419）的 5.2 倍——per-dataset 校准必要性坐实。min 离群（低 median 近 5 个数量级）对应边界命中 cell 的近无正则解；median 对其稳健。
+- **B0-lite 重跑一致性 PASS**：rho mean=0.315 / pooled=0.418 / task 分布（t3 0.991、t1 −0.109、t4 −0.226）/ worst cell（c4 r09 −6.0 等）与 §34.5 封板判决逐项一致，VERDICT RED 不变；additive `bridge_lam_expo` 列未扰动四臂——重跑验收条件满足。
+
+**状态（2026-11-07）**：Stage 0 完整（① verdict 一致性 + ② γ*_INR + ③ preview 读数），待 GPT 对完整包做 Stage 1 冻结裁决。Stage 1 方向初判：B 臂降级候选（低秩覆盖不足 + full 泛化失败 + 组合负收益），L 臂为 INR Rescue 主力（rank 候选 r16/r32），修复主战场转向 L + 历史任务路径。**guard 判据的方法学注意**：R_r 分母退化（结论 1）同时意味着 cal-MSE 对 INR 损伤不敏感——"guard 放行"≠"有效修复"，INR 的 guard 判据是否需换口径（如部署态 CE）列入 Stage 1 裁决议题。INR 正式 Rescue run 继续 LOCKED。
