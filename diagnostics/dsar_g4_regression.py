@@ -49,7 +49,12 @@ G4-B 断言（real-fit 路径，2026-11-08 审核补齐项）：
                   一致性；sidecar 提交时点正确（checkpoint 在轮末广播
                   之后保存，故 meta.round_id == completed_round）；全程
                   至少一个 FITTED 在线状态（B=FITTED 或 L=FITTED；审核
-                  要求）。
+                  要求）；GPT 2026-11-07 裁决补两项审计断言——A:
+                  G4B_SEAL_sidecar_d_vs_e（D/E 同名 checkpoint sidecar
+                  逐位相等，含因子/旗标/meta/aux）；B: G4B_SEAL_prompt_
+                  hash_match（全 ON 臂 sidecar.meta.prompt_hash == 该
+                  checkpoint 内 client prompts 状态的 house-style hash，
+                  排除 round 对但 sidecar 属旧广播的状态错配）。
 
 裁决分级（§34.4d 执行审核）：
   G4_IDENTITY_PASS = A/B/C 三臂全绿（不得扩展解释为 FULL）
@@ -141,6 +146,17 @@ def parse_args():
     return p.parse_args()
 
 
+def _git_commit():
+    try:
+        import subprocess as _sp
+        return _sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            check=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
 def run_main(extra):
     cmd = [sys.executable, "main.py", "datasets_delay"] + extra
     print("+", " ".join(cmd), flush=True)
@@ -174,6 +190,73 @@ def client_state_diff(ca, cb):
         elif not deep_equal(va, vb):
             return float("inf")
     return worst
+
+
+def hash_prompt_state(sd):
+    """House-style prompt-module hash (Models/ctrp.py hash_prompt_module)
+    recomputed over a checkpointed state_dict: sha256 over sorted keys,
+    k.encode + tensor bytes, [:16] hex."""
+    import hashlib as _hl
+    h = _hl.sha256()
+    for k in sorted(sd):
+        v = sd[k]
+        if not isinstance(v, torch.Tensor):     # non-tensor registered state
+            v = torch.tensor(v) if isinstance(v, (int, float)) else v
+            h.update(k.encode())
+            h.update(str(v).encode())
+            continue
+        h.update(k.encode())
+        h.update(v.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def check_prompt_hash_match(ckpts, arm_name):
+    """GPT audit item B (2026-11-07 ruling): every ON-arm checkpoint's
+    committed sidecar must correspond to the prompt state actually inside
+    that checkpoint -- sidecar.meta['prompt_hash'] == hash of the client's
+    checkpointed `prompts` state_dict. Rules out 'round_id right but the
+    sidecar belongs to an older broadcast' mismatches (incl. resume /
+    task_end / latest save points)."""
+    issues = []
+    for name, ck in sorted(ckpts.items()):
+        for c in ck["clients"]:
+            sc = c.get("dsar_sidecar")
+            if sc is None:
+                issues.append(f"{arm_name}:{name}: client {c['id']} "
+                              f"sidecar is None")
+                continue
+            meta = sc.get("meta", {})
+            want = meta.get("prompt_hash")
+            if not want:
+                issues.append(f"{arm_name}:{name}: client {c['id']} sidecar "
+                              f"meta.prompt_hash missing")
+                continue
+            got = hash_prompt_state(c["prompts"])
+            if want != got:
+                issues.append(f"{arm_name}:{name}: client {c['id']} sidecar "
+                              f"prompt_hash={want} != checkpoint prompts "
+                              f"hash={got}")
+    return issues
+
+
+def check_sidecar_d_vs_e(ckpts_d, ckpts_e):
+    """GPT audit item A (2026-11-07 ruling): D (real-fit continuous) and
+    E (real-fit split+resume) must carry bitwise-identical sidecars at
+    every same-named checkpoint -- factors/bias, active flags, fit
+    statuses, client/task/round IDs, prompt hashes and aux (the
+    E-vs-D accuracy-matrix equality alone cannot substitute for this)."""
+    issues = []
+    for name in sorted(ckpts_d):
+        if name not in ckpts_e:
+            issues.append(f"checkpoint {name} missing in real_split")
+            continue
+        for ca, cb in zip(ckpts_d[name]["clients"],
+                          ckpts_e[name]["clients"]):
+            sa, sb = ca.get("dsar_sidecar"), cb.get("dsar_sidecar")
+            if not deep_equal(sa, sb):
+                issues.append(f"{name}: client {ca['id']} sidecar "
+                              f"real_full vs real_split not bitwise equal")
+    return issues
 
 
 def compare_ckpts(ck_a, ck_b):
@@ -537,6 +620,15 @@ def main():
     add("G4_SEAL_args_and_schema", not seal_issues,
         "; ".join(seal_issues[:5]))
 
+    # GPT audit item B (2026-11-07 ruling): identity arms too -- committed
+    # sidecar must match the checkpointed prompt state it claims.
+    ph_issues = (check_prompt_hash_match(ckpts["g4_on_full"],
+                                         "g4_on_full")
+                 + check_prompt_hash_match(ckpts["g4_on_split"],
+                                          "g4_on_split"))
+    add("G4_SEAL_prompt_hash_match", not ph_issues,
+        "; ".join(ph_issues[:5]))
+
     add("G4_SEAL_resume_happened",
         resume_happened(runs["g4_on_split"]),
         "train.log lacks RESUME_CHECKPOINT"
@@ -636,6 +728,14 @@ def main():
                 "global_epoch": args.global_epoch, "task_num": args.task_num,
                 "local_epoch": args.local_epoch, "deterministic": True,
                 "skip_real": args.skip_real,
+                "reuse_runs": args.reuse_runs,
+                "validator_erratum": (
+                    "G4B_SEAL timing assertion off-by-one fixed "
+                    "(round_id == completed_round, not cr-1) and GPT audit "
+                    "seals A/B added (sidecar_d_vs_e + prompt_hash_match), "
+                    "2026-11-07 ruling; verdict recomputed from the "
+                    "immutable original five-arm artifacts, no retraining"),
+                "validator_commit": _git_commit(),
             },
             "runs": {arm: str(runs[arm]) for arm in arms},
             "optimizer_scheduler_note": (
@@ -706,6 +806,20 @@ def main():
         resume_happened(runs["g4_on_real_split"]),
         "train.log lacks RESUME_CHECKPOINT"
         if not resume_happened(runs["g4_on_real_split"]) else "")
+
+    # GPT audit items A+B (2026-11-07 ruling): D/E sidecar bitwise
+    # equality (resume-sidecar correspondence) + prompt-state match on
+    # the real arms.
+    de_issues = check_sidecar_d_vs_e(ckpts_real["g4_on_real_full"],
+                                     ckpts_real["g4_on_real_split"])
+    add("G4B_SEAL_sidecar_d_vs_e", not de_issues,
+        "; ".join(de_issues[:5]))
+    phr_issues = (check_prompt_hash_match(ckpts_real["g4_on_real_full"],
+                                          "g4_on_real_full")
+                  + check_prompt_hash_match(ckpts_real["g4_on_real_split"],
+                                           "g4_on_real_split"))
+    add("G4B_SEAL_prompt_hash_match", not phr_issues,
+        "; ".join(phr_issues[:5]))
 
     # ---- G4B trajectory / resume --------------------------------------
     inv_d = checkpoint_inventory(runs["g4_on_real_full"])
