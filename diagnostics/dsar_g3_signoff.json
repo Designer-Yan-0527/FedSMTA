@@ -1,0 +1,55 @@
+{
+  "gate": "G3",
+  "verdict": "PASS",
+  "g1_evidence": {
+    "g1_all_pass": true,
+    "n_clients": 5,
+    "source": "output/cifar100/fedta/cifar_base_p15/seed_42/dsar_g1_invariance.json",
+    "checkpoint": "/root/autodl-tmp/users/ych/FedSMTA/output/cifar100/fedta/cifar_base_p15/seed_42/checkpoints/task_04_end.pth"
+  },
+  "dispatch_audit": {
+    "verdict": "SHARED_PATH_CONFIRMED",
+    "source": "/root/autodl-tmp/users/ych/FedSMTA/diagnostics/dsar_task_dispatch_audit.json",
+    "n_questions": 6,
+    "risks": 2
+  },
+  "semantics": {
+    "S1_insertion_before_model": {
+      "passed": true,
+      "evidence": [
+        "G1 T2 arms B+L(current)/B+L(historical): insertion_point_features_ok + manual_readout_logits_ok 5/5 clients",
+        "audit Q5: Client_DF L1348 single-tensor handoff z_op -> self.model()"
+      ]
+    },
+    "S2_historical_B_only": {
+      "passed": true,
+      "evidence": [
+        "G1 T2 B_identity_L_active(historical): logits_equal_raw_bitwise (L never reaches k<t) 5/5",
+        "audit Q2: historical z_op shares the same broadcast prompt state; B-only branch architecturally legal"
+      ]
+    },
+    "S3_head_selection_unchanged": {
+      "passed": true,
+      "evidence": [
+        "audit Q3: self.heads[task] + class_mask[task]; key/anchor_pool client-local, not in fed_avg payload",
+        "G1 T2 manual readout uses official heads"
+      ]
+    },
+    "S4_unlabeled_current_task_calibration_only": {
+      "passed": true,
+      "evidence": [
+        "G1 T3: legal statuses only (FITTED/IDENTITY_GUARD/LOW_POWER_IDENTITY), RNG/mode-neutral",
+        "audit Q4: dispatch protocol-driven, never label-driven",
+        "G2 signoff: aux decisions computed on train rows only"
+      ]
+    },
+    "B_identity_ne_DSAR_identity": {
+      "passed": true,
+      "evidence": [
+        "G1 T2 B_identity_L_active(current): logits_moved (L still applies when B=I; no short-circuit) 5/5"
+      ]
+    }
+  },
+  "failures": [],
+  "notes": "Sec.34.4d item 2: merge signoff of G1 T2/T3 runtime evidence + dsar_task_dispatch_audit.json static call graph against the four immutable semantics of Sec.34.4a. Read-only; single new JSON output."
+}
