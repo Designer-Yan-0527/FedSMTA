@@ -113,6 +113,15 @@ def bootstrap_server(run_dir, checkpoint=None, data_path=None, device=None):
     from main import build_server
 
     args = load_args_from_run_dir(run_dir, data_path=data_path, device=device)
+    # 诊断构建只做前向/读出，永远不执行广播边界——pair-capture 钩子
+    # 在这里是死代码；若 run args 带 --bsab_pair_capture，中性化以通过
+    # Server_DF 的 RunManager fail-closed 门（capture npz 已由正式 run
+    # 落盘，诊断侧只读 run 目录，不重复产出）。
+    if bool(getattr(args, "bsab_pair_capture", False)):
+        args.bsab_pair_capture = False
+        print("note: bsab_pair_capture neutralized for the diagnostic "
+              "build (no broadcast boundaries are executed here; "
+              "capture npz are read from the run dir)")
     server = build_server(args, run_manager=None)
     server.init_client()
     if checkpoint is not None:
