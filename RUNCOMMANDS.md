@@ -2566,3 +2566,32 @@ CPU 冒烟证据（2026-11-06 全 PASS）：外部复刻对账逐位一致（mse
 **Stage 3 判决口径**：四固定 readout 条件 = 原始 FedTA OFF / 原r8r8 DSAR / INR-R0 / INR-R1；Current Recovery 门 = 正式 task-end +0.8pp（125-cell pooled preview 不构成 task-end 保证）；历史任务首次在线探索性终点只报不断，R1 未改善历史不得宣布 Historical Rescue。**安全门"超出 matched 噪声"的估计方式与比较规则必须在正式 run 前冻结，否则不得自动判 PASS/FAIL。**
 
 **落盘前置**：安全门噪声规则 + γ*_INR provenance 核查通过后，本节由"条件冻结"转正式冻结。INR 正式 Rescue 继续 LOCKED（另需 INR G1–G4）。
+
+#### 34.7 INR 结构定型 + 数据集条件配方实现（2026-11-08；本地拍板，待 GPT 签核）
+
+**背景**：§34.6a 的 Q2/Q3 裁决基于 M2‘ 读出口径探针；2026-11-08 口径更正后（用户抓住：probe 数字全部是 M2’ 口径 = 结构可行性证据；论文部署口径 = baseline 联训头），补测 `inr_bsab_capture_baseline_p40` 三轮离线证据，INR 结构最终定型。
+
+**三轮离线证据（izfree，全部 baseline 联训头口径）**：
+
+1. **方案网格**（`dsar_inr_scheme_probe.py` on baseline capture）：L 复活且主导——L8_zp_no +2.361 te-pooled 全场第一（M2' 口径判死 ↔ 论文口径复活，互为对照 = L 修的就是读出失配）；B24 各 γ +1.13~1.16 过 +0.8 门；chain ≈ L 单独（无可加性）；lam0_no -5.5~-8.3（无 guard min-norm 灾难实证）。
+2. **guard refit 对照**（cer 重跑，`--skip_b`）：cer ≈ ce（L8_zp +0.441 vs +0.385），refit 语义修正判死；数学分解（cer 活跃 cell 部署物 ≡ no 臂全行拟合）证明 **Q2 CE guard 与真实增益反相关**——guard 拒绝的 16% cell 平均真实增益 ≈ +11.5pp（`0.84A=0.441, 0.84A+0.16B=2.361`），guard 恰好在杀最大赢面。机制假设：CE 惩罚自信错误，identity 穿失配头输出低置信均匀垃圾 CE 反而不高，L 修 argmax 但置信度形状不合 CE——CE 与准确率在此分布脱钩。
+3. **历史任务行**（`dsar_inr_hist_probe.py` + stage-1 特征提取 `--prompt_task_mode current --split test`）：B 历史增益小（+0.25~0.36 vs 当前行 +0.9~1.2）；**rank 交互在历史行反转**——B8_inr 唯一全距离为正（+0.32/+0.48/+0.16/+0.53）、胜率 0.58 最高，B24 在 d3 出现负 cell；机制 = B 在当前任务对上拟合、应用到历史特征是外推，低 rank 约束强外推稳。
+
+**worst-cell 安全证据**（无 guard L 部署底线，cells.csv 复算）：L8_zp_no min=-2.36/p5=-0.84/中位+1.66/负 cell 21/125；L16_zp_no **min=-1.20**/p5=-0.56/中位+1.87/负 cell 20/125。与 lam0_no 的 -8.3 量级对比 → L 尾部风险有界且温和。
+
+**INR 冻结配方（dsar-inr-v1）**：
+
+| 参数 | CIFAR（§34.4，逐位不变） | INR（§34.7） | 依据 |
+|---|---|---|---|
+| γ\* | 0.396419 | **2.0579118185313345**（§34.6a provenance 6cd83d9） | B 网格两口径一致：固定γ ≫ GCV ≫ λ0 |
+| L rank | 8 | **16** | te_pooled +2.287 vs r8 +2.361（均值几乎同），worst -1.20 vs -2.36、p5 -0.56 vs -0.84（尾部实质更安全） |
+| B rank | 8 | **8**（不改） | 历史行为主依据：B8_inr 唯一全距离为正；r24 是当前行最优但历史行有负 cell |
+| L guard | 无（生产本无 CE guard） | **无** | guard 反相关分解 + worst-cell 有界（-1.20）；Q2 的 L CE guard 裁决被论文口径证据推翻，B 的 mse guard 不受影响 |
+| L 基底 | zm（拟合 z⁻、部署 B(z⁺)） | **zm（不改）** | probe zm 臂是"拟合 z⁻、部署 z⁺"失配模拟 ≠ 生产语义；生产语义对应 chain_B8inr_L16zm=+2.21，换 zp 基底只买 +0.08pp 且破坏 CIFAR 结构同构 |
+| dispatch / B guard / L 训练配方 | — | **完全同构** | 结构零分叉，论文叙事 = 同一框架、两个数据集参数（γ\* + L rank） |
+
+**实现**（commit 本条同批）：`Models/DSAR.py` 新增 `dsar_recipe(data_name)` + `GAMMA_STAR_INR`/`DSAR_RANK_L_INR`；`dsar_fit_bridge(gamma_star=)`/`dsar_fit_l(rank=)`/`rank_shapes_ok(b_rank=, l_rank=)` 全部默认 = CIFAR 冻结值（CIFAR 路径逐位不变，冒烟 2 验证）；`Models/Client_DF.py` `__init__` 取 recipe、fit 调用与 commit/resume 两处 rank 校验按数据集传参，sidecar meta 记 `recipe` tag；resume fail-closed 天然拒绝跨配方 checkpoint（CIFAR r8 L 的 checkpoint 在 INR r16 配方下形状校验失败）。冒烟 5/5 + 既有套件 13+35 全绿。
+
+**验证缺口（已闭环）与遗留**：① L guard refit 数字（cer 重跑）② 历史行 B 增益（hist probe）——两项均已出数；剩余开放项 = 本配方交 GPT 签核 + INR G1–G4 回归（dsar_g4_regression.py 换 INR 数据跑）+ 在线对照：正在跑的 `inr_b1_dsar_on`（CIFAR 配方）不重启，跑完作"CIFAR 配方在 INR"的对照/稳健性证据，正好衬托数据集条件配方的增益。
+
+**⚠️ 运行中 run 注意**：`inr_b1_dsar_on`（izfree）以 CIFAR 配方运行中——本提交改变 INR 路径行为（γ\* + L rank），该 run 跑完前 izfree 若 pull 本提交且发生 resume，checkpoint 内 r8 L 因子会在新 r16 配方下 fail-closed 拒绝（防静默换配方，符合预期）；其正常连续运行不受影响（进程已加载旧代码）。**结论：等该 run 跑完再 pull，或 pull 后不要 resume。**

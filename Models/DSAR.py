@@ -79,6 +79,41 @@ DSAR_RANK = 8
 MIN_FIT_ROWS = 32      # LOW_POWER_IDENTITY threshold for fit rows
 MIN_CAL_ROWS = 8       # LOW_POWER_IDENTITY threshold for calibration rows
 
+# ---- INR dataset-conditional recipe (§34.7, frozen 2026-11-08) ---------
+# CIFAR keeps the §34.4 frozen recipe bitwise (gamma_star 0.396419 / L r8);
+# ImageNet-R swaps two dataset-conditional constants and NOTHING else:
+#   gamma_star_inr = 2.0579118185313345  (provenance §34.6a, commit 6cd83d9)
+#   L rank = 16                          (te_pooled +2.287 vs r8 +2.361,
+#                                         but worst cell -1.20 vs -2.36 and
+#                                         p5 -0.56 vs -0.84; near-identical
+#                                         mean with a materially safer tail)
+# Evidence (baseline joint-head probe, paper readout scope):
+#   L16(zm, no guard) chained after B8(gamma_inr) = +2.21 te-pooled;
+#   L zp basis is NOT adopted -- production fits L on z- rows and deploys
+#   on B(z+), the probe zm-chain semantics; switching to zp buys +0.08pp
+#   and breaks CIFAR structural parity. B rank 8 + mse guard and the
+#   no-guard L are shared with CIFAR (production L never had a CE guard;
+#   probe L*_ce/cer arms measured the hypothetical guard and it is
+#   ANTI-selective on INR: the rejected 16% of cells average +11.5pp true
+#   gain). Historical-row evidence (dsar_inr_hist_probe): B8/gamma_inr
+#   +0.36 hist_mean, the only all-distance-positive config -> B stays r8
+#   on INR (r24 was current-row-optimal but historical-row-negative).
+GAMMA_STAR_INR = 2.0579118185313345
+DSAR_RANK_L_INR = 16
+
+
+def dsar_recipe(data_name):
+    """Dataset-conditional DSAR recipe. CIFAR path returns the §34.4
+    frozen constants (bitwise-unchanged defaults for every fit function);
+    ImageNet-R returns the §34.7 INR recipe. Callers must pass these into
+    dsar_fit_bridge / dsar_fit_l / rank_shapes_ok."""
+    if str(data_name) == "ImageNet-R":
+        return {"gamma_star": GAMMA_STAR_INR,
+                "l_rank": DSAR_RANK_L_INR,
+                "recipe": "dsar-inr-v1"}
+    return {"gamma_star": GAMMA_STAR, "l_rank": DSAR_RANK,
+            "recipe": "dsar-b1-cifar"}
+
 L_EPOCHS = 100
 L_BATCH = 64
 L_LR = 1e-3
@@ -201,13 +236,15 @@ class DSARSidecar(object):
                             and torch.isfinite(bias).all())
         return ok
 
-    def rank_shapes_ok(self):
-        for M1, M2, bias in ((self.b_M1, self.b_M2, self.b_bias),
-                             (self.l_M1, self.l_M2, self.l_bias)):
+    def rank_shapes_ok(self, b_rank=DSAR_RANK, l_rank=DSAR_RANK):
+        """Per-adapter rank validation. Defaults keep the §34.4 CIFAR
+        semantics (r8 everywhere); INR callers pass l_rank=16 (§34.7)."""
+        for M1, M2, bias, r in ((self.b_M1, self.b_M2, self.b_bias, b_rank),
+                                 (self.l_M1, self.l_M2, self.l_bias, l_rank)):
             if M1 is None:
                 continue
-            if (tuple(M1.shape) != (FEAT_DIM, DSAR_RANK)
-                    or tuple(M2.shape) != (FEAT_DIM, DSAR_RANK)
+            if (tuple(M1.shape) != (FEAT_DIM, r)
+                    or tuple(M2.shape) != (FEAT_DIM, r)
                     or tuple(bias.shape) != (FEAT_DIM,)):
                 return False
         return True
@@ -227,11 +264,13 @@ def dsar_identity_sidecar(round_id, entry, task_id, status,
 
 # ------------------------------------------------------------------ B fit
 
-def dsar_fit_bridge(zp, zm, sample_idx, seed):
+def dsar_fit_bridge(zp, zm, sample_idx, seed, gamma_star=GAMMA_STAR):
     """B_{c,r}: label-free fixed-lambda residual ridge z+ -> z-.
 
     Frozen recipe (§34.4 item 2, no GCV; 2026-11-06 review rulings
-    applied -- truncated-bias recompute + r8-candidate guard):
+    applied -- truncated-bias recompute + r8-candidate guard).
+    gamma_star defaults to the CIFAR frozen constant (bitwise-unchanged
+    CIFAR path); INR callers pass GAMMA_STAR_INR (§34.7).
       1. 80/20 fit/cal split by sample-index hash (deterministic).
       2. LOW_POWER_IDENTITY: fit rows < 32 or cal rows < 8 -> identity.
       3. Fixed lambda = N * s * GAMMA_STAR on the fit half
@@ -276,7 +315,7 @@ def dsar_fit_bridge(zp, zm, sample_idx, seed):
         xbar, ybar = X64.mean(dim=0), Y64.mean(dim=0)
         xc, yc = X64 - xbar, Y64 - ybar
         s = float((xc * xc).sum()) / float(n_ * d_)
-        lam = float(n_) * s * GAMMA_STAR
+        lam = float(n_) * s * gamma_star
         XtX = xc.t() @ xc
         reg = torch.eye(d_, dtype=torch.float64) * lam
         D = yc - xc
@@ -357,10 +396,13 @@ def dsar_fit_bridge(zp, zm, sample_idx, seed):
 # ------------------------------------------------------------------ L fit
 
 def dsar_fit_l(zm, y, readout_logits, seed, epochs=L_EPOCHS,
-               batch=L_BATCH, lr=L_LR, wd=L_WD):
-    """L_{c,r}: rank-8 residual adapter trained by masked CE through the
+               batch=L_BATCH, lr=L_LR, wd=L_WD, rank=DSAR_RANK):
+    """L_{c,r}: residual adapter trained by masked CE through the
     FROZEN current-task readout (eval semantics, dropout OFF; the caller
     loads heads[task_id] into self.model before fitting).
+
+    rank defaults to the CIFAR frozen value 8 (bitwise-unchanged CIFAR
+    path); INR callers pass 16 (§34.7).
 
     Parameterization (fit_lt convention): z + (z@V)@U.T + b with the
     FROZEN init U nonzero (randn*0.01) / V zero / bias zero -> exact
@@ -386,8 +428,8 @@ def dsar_fit_l(zm, y, readout_logits, seed, epochs=L_EPOCHS,
     g.manual_seed(int(seed))
 
     dev = zm.device
-    U = (torch.randn(FEAT_DIM, DSAR_RANK, generator=g) * 0.01).to(dev)
-    V = torch.zeros(FEAT_DIM, DSAR_RANK, device=dev)
+    U = (torch.randn(FEAT_DIM, rank, generator=g) * 0.01).to(dev)
+    V = torch.zeros(FEAT_DIM, rank, device=dev)
     b = torch.zeros(FEAT_DIM, device=dev)
     U.requires_grad_(True)
     V.requires_grad_(True)

@@ -44,7 +44,8 @@ from Models.ctrp import (forward_with_prompt, row_ce, hash_prompt_module,
 # §34.4/§34.4a B1 DSAR sidecar（冻结部署：当前任务 z⁺→B→L→TA_t、
 # 历史任务 z⁺→B→TA_k；插入点 = evaluate 的 self.model() 之前）
 from Models.DSAR import (DSARSidecar, DSAR_VERSION, dsar_identity_sidecar,
-                         dsar_fit_bridge, dsar_fit_l, dsar_stable_seed)
+                         dsar_fit_bridge, dsar_fit_l, dsar_stable_seed,
+                         dsar_recipe)
 
 # refit 固定配方（预注册；探针 probe_oracle_headroom.py 的训练日程，
 # 仅 hidden 取 512 以保持 heads 存储 = Chead schema，见 §23.6-2）
@@ -186,6 +187,11 @@ class Client_DF(object):
                 "DSAR_ON_CTRP_UNSUPPORTED: CTRP matched split changes the "
                 "train-row manifest; B1 is pre-registered on the plain "
                 "fedta baseline (fail-closed)")
+        # §34.7 数据集条件配方：CIFAR = §34.4 冻结值（γ* 0.396419 / L r8，
+        # 逐位不变）；INR = γ*_INR 2.0579 / L r16（结构其余部分与 CIFAR
+        # 完全同构：B r8 + mse guard、L 无 guard、zm 基底、B→L dispatch）。
+        self._dsar_recipe = dsar_recipe(getattr(args, 'data_name',
+                                                'cifar100'))
         self._dsar_sidecar = None
         self._dsar_pending = None
 
@@ -1482,7 +1488,8 @@ class Client_DF(object):
                                       'dsarL', self.id, self.task_id,
                                       int(round_id))
             l_factors, l_status, l_ce = dsar_fit_l(
-                z_minus, y, readout_logits, seed_l)
+                z_minus, y, readout_logits, seed_l,
+                rank=self._dsar_recipe["l_rank"])
             # L 拟合的 backward 会在冻结 Tail_Anchor 参数上留下 grad
             # 缓冲；清掉（训练流 optimizer 每轮新建，不受影响）
             self.model.zero_grad(set_to_none=True)
@@ -1556,9 +1563,11 @@ class Client_DF(object):
                                       'dsarB', self.id, self.task_id,
                                       int(round_id))
             b_factors, b_status, b_aux = dsar_fit_bridge(
-                z_plus, pend["z_minus"], train_idx, seed_b)
+                z_plus, pend["z_minus"], train_idx, seed_b,
+                gamma_star=self._dsar_recipe["gamma_star"])
             meta = {
                 "version": DSAR_VERSION,
+                "recipe": self._dsar_recipe["recipe"],
                 "round_id": int(round_id), "entry": str(entry),
                 "task_id": int(self.task_id),
                 "b_status": b_status, "l_status": pend["l_status"],
@@ -1578,7 +1587,9 @@ class Client_DF(object):
                 (pend["l_factors"] or {}).get("M2"),
                 (pend["l_factors"] or {}).get("bias"),
                 meta)
-            if not sidecar.rank_shapes_ok() or not sidecar.factors_finite():
+            if not sidecar.rank_shapes_ok(
+                    l_rank=self._dsar_recipe["l_rank"]) \
+                    or not sidecar.factors_finite():
                 raise RuntimeError(
                     "client %d round %d: DSAR committed malformed r8 "
                     "factors (fail-closed)" % (self.id, round_id))
@@ -2079,11 +2090,14 @@ class Client_DF(object):
                 DSARSidecar.from_state(sc_state, self.device)
                 if sc_state is not None else None)
             if (self._dsar_sidecar is not None
-                    and not (self._dsar_sidecar.rank_shapes_ok()
-                             and self._dsar_sidecar.factors_finite())):
+                    and not (self._dsar_sidecar.rank_shapes_ok(
+                        l_rank=self._dsar_recipe["l_rank"])
+                        and self._dsar_sidecar.factors_finite())):
                 raise RuntimeError(
                     "client %d: DSAR resume found malformed r8 factors in "
-                    "the checkpoint (fail-closed)" % self.id)
+                    "the checkpoint (fail-closed; a CIFAR-recipe r8 L "
+                    "checkpoint cannot resume under the INR r16 recipe and "
+                    "vice versa)" % self.id)
 
         # A2：保护状态恢复，fail-closed（同 DSAR 纪律：缺 key / arm 不匹
         # 配 / 内部不一致都拒绝，不允许静默变成无保护 A2）
