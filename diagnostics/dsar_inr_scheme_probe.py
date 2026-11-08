@@ -47,6 +47,14 @@ birth-head 读出 / 专用 torch.Generator（不碰全局 RNG）。CE/读出前�
       --skip_l --b_ranks 8,16,24,32 \
       --b_gammas inr,cifar,0.4,0.8,2.06,4.0,8.0 \
       --out_dir <run_dir>/dsar_inr_probe_bgrid
+  # baseline 联训头口径（论文部署口径，GPT 2026-11-07 裁决 1b 开放问题；
+  # 2026-11-08 起协议门同时接受 M2' capture 与 baseline capture run）：
+  python diagnostics/dsar_inr_scheme_probe.py \
+      --run_dir output/ImageNet-R/fedta/inr_bsab_capture_baseline_p40/seed_42 \
+      --device cuda \
+      --b_ranks 8,16,24,32 \
+      --b_gammas inr,cifar,gcv,lam0,0.4,0.8,2.06,4.0 \
+      --out_dir <run_dir>/dsar_inr_probe_baseline
 """
 
 import argparse
@@ -426,10 +434,18 @@ def main():
 
     with open(run_dir / "args.json", encoding="utf-8") as f:
         ra = json.load(f)
-    if not (bool(ra.get("head_refit"))
-            and str(ra.get("refit_timing", "local")) == "local"
-            and bool(ra.get("bsab_pair_capture"))):
-        raise SystemExit("PROTOCOL_GATE_FAIL: not an M2'-matched capture run")
+    # 协议门：两种合法 capture 口径（GPT 2026-11-07 更正版裁决的 1b 开放
+    # 问题 = L/B 在 baseline 联训头口径的效应，此前两轮网格全部是 M2' 口径）
+    if not bool(ra.get("bsab_pair_capture")):
+        raise SystemExit("PROTOCOL_GATE_FAIL: not a pair-capture run")
+    if str(ra.get("refit_timing", "local")) != "local":
+        raise SystemExit("PROTOCOL_GATE_FAIL: unsupported refit_timing "
+                         "(post_broadcast captures are M2'-exclusive)")
+    if bool(ra.get("head_refit")):
+        run_type = "m2_matched"        # npz birth head = M2' refit 头（既有口径）
+    else:
+        run_type = "baseline_joint"    # npz birth head = baseline 联训头（论文口径）
+    print(f"capture run type: {run_type}")
     seed = int(ra.get("seed", 42))
 
     cells = discover_cells(run_dir)
@@ -684,6 +700,7 @@ def main():
 
     summary = dict(
         tool="dsar_inr_scheme_probe", run_dir=str(run_dir),
+        capture_run_type=run_type,
         n_cells=len(rows), n_task_end=len(task_end),
         zref_gate=dict(passed=not zref_violations,
                        violations=zref_violations[:10]),
@@ -701,9 +718,10 @@ def main():
                  for i, k in enumerate(ranked)],
         configs=configs,
         notes="offline replay on capture npz; zero training-runs; readout = "
-              "npz birth M2' head, eval semantics (dropout off), routing on "
-              "corrected z; current-task rows only (historical transfer "
-              "needs GPU extract, next stage).")
+              "npz birth head (m2_matched = M2' refit head / baseline_joint = "
+              "baseline joint-trained head), eval semantics (dropout off), "
+              "routing on corrected z; current-task rows only (historical "
+              "transfer needs GPU extract, next stage).")
     print("\n=== INR scheme probe: ranking (task-end pooled delta, pp) ===")
     print(f"{'config':28s} {'te_pooled':>10s} {'mean':>8s} "
           f"{'guard':>7s}")
