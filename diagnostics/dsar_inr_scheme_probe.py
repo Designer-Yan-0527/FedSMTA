@@ -110,6 +110,10 @@ def parse_args():
     p.add_argument("--skip_l", action="store_true",
                    help="跳过 L 臂与组合臂（纯 B 网格，分钟级；cells.csv "
                         "不含 acc_L*/acc_chain* 列，summary 覆盖写")
+    p.add_argument("--skip_b", action="store_true",
+                   help="跳过 B 臂与组合臂（cer 验证重跑用：B 结果已在"
+                        "上一轮全网格落盘，重跑只算 L 系列省时；chain 臂"
+                        "依赖 B8inr 因子故一并跳过")
     return p.parse_args()
 
 
@@ -388,7 +392,7 @@ def l_apply(z, M1, M2, bias):
 
 L_CONFIGS = [(rk, basis, guard)
              for rk in L_RANKS for basis in ("zp", "zm")
-             for guard in ("ce", "no")]
+             for guard in ("ce", "no", "cer")]
 CHAIN_CONFIGS = ("chain_B8inr_L16zp", "chain_B8inr_L16zm")
 
 
@@ -430,7 +434,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     epochs = args.l_epochs if args.l_epochs > 0 else L_EPOCHS
-    b_configs = build_b_configs(args.b_ranks, args.b_gammas)
+    b_configs = ([] if args.skip_b
+                 else build_b_configs(args.b_ranks, args.b_gammas))
 
     with open(run_dir / "args.json", encoding="utf-8") as f:
         ra = json.load(f)
@@ -570,13 +575,13 @@ def main():
                     row[f"{name}_active"] = 0
                     row[f"acc_{name}"] = row["acc_off"]
                     continue
-                if guard == "ce" and (n_fit < MIN_FIT_ROWS
-                                      or n_cal < MIN_CAL_ROWS):
+                if guard in ("ce", "cer") and (n_fit < MIN_FIT_ROWS
+                                               or n_cal < MIN_CAL_ROWS):
                     row[f"{name}_active"] = 0
                     row[f"acc_{name}"] = row["acc_off"]
                     continue
                 z_base = bases[basis]
-                if guard == "ce":
+                if guard in ("ce", "cer"):
                     z_fit = z_base[idx_f]
                     y_fit_g = y_fit[idx_f]
                 else:
@@ -591,9 +596,12 @@ def main():
                     row[f"acc_{name}"] = row["acc_off"]
                     continue
                 M1, M2, bias = factors
-                if guard == "ce":
+                if guard in ("ce", "cer"):
                     # 部署态 CE guard：20% paired CE（Q2：CE_L < CE_I，
-                    # 平局 identity，不 refit）
+                    # 平局 identity）。ce = Q2 原口径（胜出也只部署 80%
+                    # 行拟合、不 refit）；cer = 胜出后全行 refit 再部署
+                    # （对齐生产 B guard 的“胜出才全行 refit”语义），
+                    # 两臂对照量化 refit 折扣。
                     z_cal = zp_fit[idx_c].to(device)
                     y_cal = y_fit[idx_c].to(device)
                     with torch.no_grad():
@@ -605,6 +613,17 @@ def main():
                     row[f"{name}_ce_i"] = ce_i
                     row[f"{name}_ce_l"] = ce_l
                     active = int(ce_l < ce_i)
+                    if active and guard == "cer":
+                        # 胜出：全行 refit 再部署（同 seed_l 确定性）；
+                        # refit 失败 fail-closed 退 identity。
+                        factors_full = fit_l(z_base, y_fit, key_d, pool_d,
+                                            hsd_d, allowed_d, nb_classes,
+                                            rk, seed_l, device, epochs)
+                        if factors_full is None:
+                            active = 0
+                        else:
+                            M1, M2, bias = factors_full
+                            row[f"{name}_refit"] = 1
                 else:
                     active = 1
                 row[f"{name}_active"] = active
@@ -619,7 +638,8 @@ def main():
             # ---- 组合臂（B8 inr mse guard 之后 L16；复核可加性）----
             b_name = cfg_name_b(8, "inr", "mse")
             bfac = b_factors.get(b_name)
-            for chain in ([] if args.skip_l else CHAIN_CONFIGS):
+            for chain in ([] if (args.skip_l or args.skip_b)
+                         else CHAIN_CONFIGS):
                 basis = "zp" if chain.endswith("L16zp") else "zm"
                 rk = 16
                 if bfac is None or n_train < MIN_FIT_ROWS:
@@ -658,7 +678,7 @@ def main():
                 + ([] if args.skip_l
                    else [f"acc_{cfg_name_l(*c)}" for c in L_CONFIGS])
                 + [f"acc_{cfg_name_b(*c)}" for c in b_configs]
-                + ([] if args.skip_l
+                + ([] if (args.skip_l or args.skip_b)
                    else [f"acc_{c}" for c in CHAIN_CONFIGS]))
     def _mean(vals):
         return float(np.mean(vals)) if vals else float("nan")
@@ -708,7 +728,7 @@ def main():
                       frozen_production=(epochs == L_EPOCHS)),
         gamma_inr=GAMMA_INR, gamma_cifar=GAMMA_CIFAR,
         b_grid=dict(ranks=args.b_ranks, gammas=args.b_gammas,
-                    skip_l=args.skip_l),
+                    skip_l=args.skip_l, skip_b=args.skip_b),
         ranking=[dict(rank=i + 1, config=k,
                       task_end_pooled_delta=configs[k][
                           "task_end_pooled_delta"],
