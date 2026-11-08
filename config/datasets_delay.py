@@ -267,6 +267,26 @@ def get_args_parser(subparsers):
                                  'sidecars every broadcast. OFF vs '
                                  'ON(identity) must be bit-identical '
                                  '(logits/checkpoints); NOT a method arm.')
+    # A2 routing-interface protection (restored 2026-11-08 for the final
+    # A2+L+B plan; original validated implementation db01cf4/8fb9b87,
+    # deleted in f37590d, re-introduced as a switch so it composes with
+    # --dsar). Protection set = union over completed tasks t' < task_id of
+    # the top-1 routing destinations of their train-split features under
+    # the CURRENT key (D0 emergent support). At task start the protected
+    # key/anchor rows are snapshotted; after EVERY Tail_Anchor optimizer
+    # step (phase-2) they are restored (== freeze + weight-decay
+    # exemption; optimizer untouched). Task 0 = empty set = no-op.
+    # Default off = completely bit-identical no-op. RNG-neutral feature
+    # pass (four-stream snapshot/restore); checkpoints gain an a2_state
+    # key on ON runs only; fail-closed resume. Orthogonal to --dsar
+    # (training-side vs readout-side).
+    subparsers.add_argument('--a2_arm', default='off', type=str,
+                            choices=['off', 'key', 'anchor', 'both'],
+                            help='A2 routing-interface protection arm '
+                                 '(default off = bit-identical). key = '
+                                 'freeze protected key rows only '
+                                 '(validated arm, cifar_a2_key_hsn); '
+                                 'anchor = anchor rows only; both = both.')
     subparsers.add_argument('--client_num', default=5, type=int,
                             help='the num of client')
     subparsers.add_argument('--task_num', default=5, type=int,

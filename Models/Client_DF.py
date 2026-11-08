@@ -189,6 +189,19 @@ class Client_DF(object):
         self._dsar_sidecar = None
         self._dsar_pending = None
 
+        # A2 routing-interface protection（2026-11-08 恢复，最终方案
+        # A2+L+B 的训练侧模块；原始实现 db01cf4/8fb9b87，f37590d 删除，
+        # 按开关语义重接入 = 与 --dsar 可组合）。保护集 = 已完成任务
+        # t' < task_id 的 train-split 特征经【当前 key】top-1 路由命中槽位
+        # 并集（D0 emergent support）；任务开始时快照被保护行，phase-2
+        # 每次 optimizer.step() 之后回写（== freeze + wd 豁免，优化器
+        # 零改动）。默认 off = 完全 no-op，逐位一致。
+        self._a2_arm = str(getattr(args, 'a2_arm', 'off') or 'off')
+        self._a2_protected_slots = None   # LongTensor: protected slot ids
+        self._a2_key_snapshot = None      # frozen key rows (arm key/both)
+        self._a2_anchor_snapshot = None   # frozen anchor rows (arm anchor/both)
+        self._a2_task_id = None           # task the current protection belongs to
+
 
     def init_local_model(self,model_name,args=None):
         if model_name=='Tail_Anchor':
@@ -256,6 +269,111 @@ class Client_DF(object):
             # only cifar100 / ImageNet-R are supported in this project
             self.get_data(task)
             self.task_id = task
+            # A2: entering a new task -> recompute the protected slot set
+            # and snapshot the protected rows (no-op when --a2_arm off)
+            if self._a2_arm != 'off':
+                self._a2_init_task_protection()
+
+    # ------------------------------------------------------------------
+    # A2 routing-interface protection（2026-11-08 恢复，见 __init__ 注释）
+    # ------------------------------------------------------------------
+
+    def _a2_init_task_protection(self):
+        """A2: compute the protected slot set and row snapshots at task start.
+
+        Protection set = union over all completed tasks t' < task_id of the
+        top-1 routing destinations of their train-split features under the
+        CURRENT key (= D0 emergent support, B_t > 0). The snapshot is taken
+        once at task start and the protected rows are restored after every
+        Tail_Anchor optimizer step for the whole task (post-step restore ==
+        freeze + weight-decay exemption; the official optimizer is never
+        modified).
+
+        The feature pass is RNG-neutral: sequential loader (shuffle=False,
+        num_workers=0) + four-stream RNG snapshot/restore.
+        """
+        self._a2_task_id = self.task_id
+        completed = [t for t in range(self.task_id)
+                     if t in self.data_split_indices]
+        if not completed:
+            self._a2_protected_slots = None
+            self._a2_key_snapshot = None
+            self._a2_anchor_snapshot = None
+            return
+
+        rng_state = self._a5_rng_snapshot()
+        vit_was_training = self.vit.training
+        orig_was_training = self.original_model.training
+        try:
+            self.original_model.eval()
+            self.vit.eval()
+            self.model.to(self.device)
+            self.vit.to(self.device)
+            # well-defined prompt state (same convention as train())
+            if self.prompts is not None:
+                self.vit.load_prompts(self.prompts)
+
+            hit_slots = []
+            for t in completed:
+                dataset = Subset(self.train_data[t],
+                                 self.data_split_indices[t]["train"])
+                loader = DataLoader(dataset, batch_size=16, num_workers=0,
+                                    shuffle=False)
+                feats = []
+                for input, _target in loader:
+                    input = input.to(self.device, non_blocking=True)
+                    with torch.no_grad():
+                        output = self.original_model(input)
+                        cls_features = output['pre_logits']
+                        output = self.vit(input, task_id=self.task_id,
+                                         cls_features=cls_features, train=True)
+                    feats.append(output['feat'].to(self.device))
+                if not feats:
+                    continue
+                feat = torch.cat(feats, dim=0)
+                # routing exactly as Tail_Anchor.forward: l2-normalized
+                # feature vs l2-normalized key rows, top-1
+                x_embed_norm = self.model.l2_normalize(feat, dim=1)
+                key = self.model.key.reshape(-1, self.model.key_size)
+                key_norm = self.model.l2_normalize(key, dim=1)
+                similarity = torch.matmul(x_embed_norm, key_norm.t())
+                _, index = torch.topk(similarity, k=1)
+                hit_slots.append(index.reshape(-1))
+
+            if hit_slots:
+                slots = torch.unique(torch.cat(hit_slots)).to(self.device)
+            else:
+                slots = None
+            self._a2_protected_slots = slots
+            self._a2_key_snapshot = (self.model.key.data[slots].clone()
+                                     if (slots is not None and
+                                         self._a2_arm in ('key', 'both'))
+                                     else None)
+            self._a2_anchor_snapshot = (self.model.anchor_pool.data[slots].clone()
+                                        if (slots is not None and
+                                            self._a2_arm in ('anchor', 'both'))
+                                        else None)
+            n = 0 if slots is None else int(slots.numel())
+            print(f'[A2] client {self.id} task {self.task_id} arm={self._a2_arm}: '
+                  f'protected {n}/{self.model.key.shape[0]} slots')
+        finally:
+            # restore module modes (train() never sets vit.train(); leaving
+            # eval() on would silently change training; original_model is
+            # shared across clients, so its mode must be restored exactly
+            # as found) + ALL RNG streams
+            self.vit.train(vit_was_training)
+            self.original_model.train(orig_was_training)
+            self._a5_rng_restore(rng_state)
+
+    def _a2_post_step_restore(self):
+        """A2: restore protected key/anchor rows after a Tail_Anchor
+        optimizer step. Only called when --a2_arm != off."""
+        if self._a2_protected_slots is None or self._a2_task_id != self.task_id:
+            return
+        if self._a2_arm in ('key', 'both') and self._a2_key_snapshot is not None:
+            self.model.key.data[self._a2_protected_slots] = self._a2_key_snapshot
+        if self._a2_arm in ('anchor', 'both') and self._a2_anchor_snapshot is not None:
+            self.model.anchor_pool.data[self._a2_protected_slots] = self._a2_anchor_snapshot
 
     def _phase2_train_step(self, input, target, round, args, criterion,
                            optimizer):
@@ -304,6 +422,10 @@ class Client_DF(object):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        # A2: restore protected key/anchor rows after the Tail_Anchor
+        # step. No-op when --a2_arm off (official path bit-identical).
+        if self._a2_arm != 'off':
+            self._a2_post_step_restore()
 
     def train(self, round, args):
         self.original_model.eval()
@@ -1801,7 +1923,80 @@ class Client_DF(object):
                 self._dsar_sidecar.state_dict()
                 if self._dsar_sidecar is not None else None)
 
+        # A2：保护状态封章。schema 仅 ON 臂新增 key（OFF 基线 checkpoint
+        # 逐位不变）；与 dsar_sidecar 独立共存
+        if self._a2_arm != 'off':
+            state["a2_state"] = self._a2_state_for_checkpoint()
+
         return state
+
+    def _a2_state_for_checkpoint(self):
+        """Serialize A2 protection state; always a dict when --a2_arm != off,
+        never called for the off baseline (schema untouched)."""
+        return {
+            "a2_arm": self._a2_arm,
+            "task_id": self._a2_task_id,
+            "protected_slots": (None if self._a2_protected_slots is None
+                                else self._a2_protected_slots.cpu().tolist()),
+            "key_snapshot": (None if self._a2_key_snapshot is None
+                             else self._a2_key_snapshot.detach().cpu()),
+            "anchor_snapshot": (None if self._a2_anchor_snapshot is None
+                                else self._a2_anchor_snapshot.detach().cpu()),
+        }
+
+    def _a2_load_checkpoint_state(self, state):
+        """Restore A2 protection state, FAIL-CLOSED.
+
+        An --a2_arm != off resume from a checkpoint without a2_state would
+        silently continue as unprotected A2 (wrong arm semantics, wrong
+        science). The state MUST exist and be internally consistent, or we
+        refuse.
+        """
+        a2 = state.get("a2_state")
+        if not a2:
+            raise RuntimeError(
+                f"client {self.id}: A2 resume requires a2_state in the "
+                f"checkpoint, got "
+                f"{'missing key' if 'a2_state' not in state else 'None/empty'}"
+                f" -- refusing to silently continue as unprotected A2 "
+                f"(fail-closed; re-run from scratch or use an --a2_arm "
+                f"checkpoint)")
+        if a2.get("a2_arm") != self._a2_arm:
+            raise RuntimeError(
+                f"client {self.id}: A2 arm mismatch on resume "
+                f"(checkpoint={a2.get('a2_arm')}, current={self._a2_arm})")
+        if a2.get("task_id") != state.get("task_id"):
+            raise RuntimeError(
+                f"client {self.id}: A2 protection task_id "
+                f"({a2.get('task_id')}) != checkpoint task_id "
+                f"({state.get('task_id')}); corrupted a2_state")
+        self._a2_task_id = a2.get("task_id")
+        slots = a2.get("protected_slots")
+        self._a2_protected_slots = (None if slots is None
+                                    else torch.tensor(slots, dtype=torch.long,
+                                                      device=self.device))
+        key_snap = a2.get("key_snapshot")
+        anchor_snap = a2.get("anchor_snapshot")
+        # consistency: protected slots must have exactly-matching snapshots
+        # for the rows the arm protects
+        if slots is not None:
+            n = len(slots)
+            if self._a2_arm in ('key', 'both') and (
+                    key_snap is None or key_snap.shape[0] != n):
+                raise RuntimeError(
+                    f"client {self.id}: arm {self._a2_arm} requires a "
+                    f"key_snapshot with {n} rows, got "
+                    f"{'None' if key_snap is None else key_snap.shape[0]}")
+            if self._a2_arm in ('anchor', 'both') and (
+                    anchor_snap is None or anchor_snap.shape[0] != n):
+                raise RuntimeError(
+                    f"client {self.id}: arm {self._a2_arm} requires an "
+                    f"anchor_snapshot with {n} rows, got "
+                    f"{'None' if anchor_snap is None else anchor_snap.shape[0]}")
+        self._a2_key_snapshot = (None if key_snap is None
+                                 else key_snap.to(self.device))
+        self._a2_anchor_snapshot = (None if anchor_snap is None
+                                    else anchor_snap.to(self.device))
 
     def load_checkpoint_state(self, state):
         if state["id"] != self.id:
@@ -1889,6 +2084,11 @@ class Client_DF(object):
                 raise RuntimeError(
                     "client %d: DSAR resume found malformed r8 factors in "
                     "the checkpoint (fail-closed)" % self.id)
+
+        # A2：保护状态恢复，fail-closed（同 DSAR 纪律：缺 key / arm 不匹
+        # 配 / 内部不一致都拒绝，不允许静默变成无保护 A2）
+        if self._a2_arm != 'off':
+            self._a2_load_checkpoint_state(state)
 
         self.global_protos = state.get("global_protos")
         self.local_protos = state.get("local_protos")

@@ -61,6 +61,7 @@ python main.py datasets_delay \
 | `--route_fix` | off | **A2-R 路由修复开关**（R1+R2，探针 `diagnostics/probe_route_fix.py` 判决 keyH 5/5 复活 +3~4 bits 且准确率守住）：R1 = prompt_key 正交球面初始化（独立 RNG 流，seed=`--seed`）+ R2 = 可导软路由 `w=softmax(sim/τ)` 全池加权（token 数 length×top_k 不变；训练/推理同款全软）。默认 off = 官方行为逐位一致；与 `--method`/`--a2_arm`/`--skip_fed_avg_head` 正交 |
 | `--route_tau` | 0.1 | R2 软路由温度 τ（仅 `--route_fix` 时生效；探针验证值 0.1） |
 | `--bsab_pair_capture` | off | **§34.2 0b pair capture 开关**（instrumentation-only）：每个 broadcast boundary 缓存 pre/post 广播配对特征行（当前任务全行 train+test、z_ref/z_op 双侧、pre/post prompt hash、锚定 birth head state+hash、row_index_hash），输出 `<run_dir>/bsab_capture/`。默认 off = 逐位一致。仅限 M2'-matched capture rerun（与 `--refit_timing post_broadcast` fail-closed 互斥：`BSAB_CAPTURE_UNSUPPORTED_REFIT_TIMING`）；不加 BSAB module、不改任何训练/广播行为，BSAB 结构实现仍 FROZEN |
+| `--a2_arm` | off | **A2 路由接口保护开关**（2026-11-08 恢复接入，最终方案 A2+L+B 的训练侧模块；原始实现 db01cf4/8fb9b87，f37590d 删除，按开关语义重接入 = 与 `--dsar` 可组合）。保护集 = 已完成任务 t' < task_id 的 train-split 特征经当前 key top-1 路由命中槽位并集（D0 emergent support）；任务开始时快照被保护 key/anchor 行，phase-2 每次 optimizer.step() 后回写（== freeze + wd 豁免，优化器零改动）。任务 0 = 空集 = no-op。特征 pass 四流 RNG 快照/恢复（RNG-neutral）；checkpoint 仅 ON 臂新增 `a2_state` key；resume fail-closed（缺 key/arm 不匹配/内部不一致均拒绝）+ `RESUME_MUST_MATCH` 两侧校验。当年验证形态 = `--a2_arm key`（cifar_a2_key_hsn）。默认 off = 逐位一致 |
 
 ## 5. 运行管理参数（Phase 0 工程，不影响算法）
 

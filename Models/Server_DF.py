@@ -825,6 +825,9 @@ class Server_DF(object):
         # §33 CTRP v1：任何会改变 CTRP 语义的参数都必须匹配（two-sided：
         # pre-CTRTP 老 checkpoint 不含这些 key，自动跳过保持兼容）
         "ctrp_mode", "ctrp_alpha", "ctrp_alpha_grid", "ctrp_val_frac",
+        # A2（2026-11-08 恢复）：跨 arm resume 会静默改变保护语义
+        # （two-sided：老 checkpoint 不含该 key，自动跳过保持兼容）
+        "a2_arm",
     ]
 
     def validate_checkpoint_args(self, ckpt_args):
