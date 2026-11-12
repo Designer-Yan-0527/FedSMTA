@@ -15,8 +15,8 @@
 ## 1. 拉代码
 
 ```bash
-git clone git@github.com:Designer-Yan-0527/FedSMTA.git
-cd FedSMTA
+git clone git@github.com:Designer-Yan-0527/FedRelink.git
+cd FedRelink
 git log --oneline -1   # 记下 commit，论文实验须统一版本
 ```
 
@@ -55,7 +55,7 @@ local_datasets/
 
 | 权重 | 放置路径 | 用途 | 大小 |
 |---|---|---|---|
-| `ViT-B_16.npz`（L2P 系 ImageNet-21k 预训练 ViT-B/16，即 L2P 官方仓 `pretrain_model/` 同名文件） | `FedSMTA/pretrain_model/ViT-B_16.npz` | 主方法 main.py（`pretrained_cfg['file']` 硬引用） | ~394MB |
+| `ViT-B_16.npz`（L2P 系 ImageNet-21k 预训练 ViT-B/16，即 L2P 官方仓 `pretrain_model/` 同名文件） | `FedRelink/pretrain_model/ViT-B_16.npz` | 主方法 main.py（`pretrained_cfg['file']` 硬引用） | ~394MB |
 | `B_16-i21k-300ep-...res_224.npz`（timm 0.6.7 `vit_base_patch16_224(pretrained=True)` 实际引用的 augreg 权重） | `~/.cache/torch/hub/checkpoints/` | HePCo / Powder adapter | ~346MB |
 
 > .gitignore 已排除两个 npz（超 GitHub 100MB 单文件限制）。
