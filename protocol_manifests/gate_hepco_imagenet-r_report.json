@@ -1,0 +1,728 @@
+{
+  "dataset": "ImageNet-R",
+  "manifest": "/root/autodl-tmp/users/ych/FedSMTA/external_baselines/hepco-fed/protocol_manifests/inr_c5t5p40s5_seed42.json",
+  "increments": [
+    40,
+    40,
+    40,
+    40,
+    40
+  ],
+  "first_arrival_drops": 0,
+  "numpy_lapack": {
+    "svd": "rerouted->scipy",
+    "official_repo_untouched": true
+  },
+  "partA_informational_pass": true,
+  "partB_injection_pass": true,
+  "partC_seal_pass": true,
+  "PASS": true,
+  "rows": [
+    {
+      "item": "A official per-client heterogeneity is gen_imbalanced_data (anchor present; replaced by design)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A official tasks 10 x 20/20 classes != frozen 5 x first-arrival [40, 40, 40, 40, 40] (documented mismatch; adapter enforces the arrival split)",
+      "pass": true,
+      "got": 10,
+      "want": 5
+    },
+    {
+      "item": "A official 2-GPU DataParallel assumption (.module.prompt hard-coded; single-GPU runs get a 1-device DataParallel wrapper)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A official INR loader shuffles + 80/20 (anchor present; replaced by the frozen sorted domain)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B1 trainer.tasks == arrival ranges",
+      "pass": true,
+      "got": 5,
+      "want": 5
+    },
+    {
+      "item": "B1 tasks_logits == arrival ranges",
+      "pass": true,
+      "got": 5,
+      "want": 5
+    },
+    {
+      "item": "B1 server_config tasks_real == ranges",
+      "pass": true,
+      "got": 5,
+      "want": 5
+    },
+    {
+      "item": "B1 server_config prompt_param",
+      "pass": true,
+      "got": 2,
+      "want": 2
+    },
+    {
+      "item": "B1 class_mapping == raw->arrival position",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c0t0 == inner.train NEW-at-t (762 kept, 0 dropped)",
+      "pass": true,
+      "got": 762,
+      "want": 762
+    },
+    {
+      "item": "B2 train labels c0t0 in arrival [0,40)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c0t1 == inner.train NEW-at-t (835 kept, 0 dropped)",
+      "pass": true,
+      "got": 835,
+      "want": 835
+    },
+    {
+      "item": "B2 train labels c0t1 in arrival [40,80)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c0t2 == inner.train NEW-at-t (559 kept, 0 dropped)",
+      "pass": true,
+      "got": 559,
+      "want": 559
+    },
+    {
+      "item": "B2 train labels c0t2 in arrival [80,120)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c0t3 == inner.train NEW-at-t (634 kept, 0 dropped)",
+      "pass": true,
+      "got": 634,
+      "want": 634
+    },
+    {
+      "item": "B2 train labels c0t3 in arrival [120,160)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c0t4 == inner.train NEW-at-t (692 kept, 0 dropped)",
+      "pass": true,
+      "got": 692,
+      "want": 692
+    },
+    {
+      "item": "B2 train labels c0t4 in arrival [160,200)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c1t0 == inner.train NEW-at-t (624 kept, 0 dropped)",
+      "pass": true,
+      "got": 624,
+      "want": 624
+    },
+    {
+      "item": "B2 train labels c1t0 in arrival [0,40)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c1t1 == inner.train NEW-at-t (828 kept, 0 dropped)",
+      "pass": true,
+      "got": 828,
+      "want": 828
+    },
+    {
+      "item": "B2 train labels c1t1 in arrival [40,80)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c1t2 == inner.train NEW-at-t (880 kept, 0 dropped)",
+      "pass": true,
+      "got": 880,
+      "want": 880
+    },
+    {
+      "item": "B2 train labels c1t2 in arrival [80,120)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c1t3 == inner.train NEW-at-t (604 kept, 0 dropped)",
+      "pass": true,
+      "got": 604,
+      "want": 604
+    },
+    {
+      "item": "B2 train labels c1t3 in arrival [120,160)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c1t4 == inner.train NEW-at-t (790 kept, 0 dropped)",
+      "pass": true,
+      "got": 790,
+      "want": 790
+    },
+    {
+      "item": "B2 train labels c1t4 in arrival [160,200)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c2t0 == inner.train NEW-at-t (840 kept, 0 dropped)",
+      "pass": true,
+      "got": 840,
+      "want": 840
+    },
+    {
+      "item": "B2 train labels c2t0 in arrival [0,40)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c2t1 == inner.train NEW-at-t (701 kept, 0 dropped)",
+      "pass": true,
+      "got": 701,
+      "want": 701
+    },
+    {
+      "item": "B2 train labels c2t1 in arrival [40,80)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c2t2 == inner.train NEW-at-t (704 kept, 0 dropped)",
+      "pass": true,
+      "got": 704,
+      "want": 704
+    },
+    {
+      "item": "B2 train labels c2t2 in arrival [80,120)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c2t3 == inner.train NEW-at-t (778 kept, 0 dropped)",
+      "pass": true,
+      "got": 778,
+      "want": 778
+    },
+    {
+      "item": "B2 train labels c2t3 in arrival [120,160)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c2t4 == inner.train NEW-at-t (499 kept, 0 dropped)",
+      "pass": true,
+      "got": 499,
+      "want": 499
+    },
+    {
+      "item": "B2 train labels c2t4 in arrival [160,200)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c3t0 == inner.train NEW-at-t (550 kept, 0 dropped)",
+      "pass": true,
+      "got": 550,
+      "want": 550
+    },
+    {
+      "item": "B2 train labels c3t0 in arrival [0,40)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c3t1 == inner.train NEW-at-t (672 kept, 0 dropped)",
+      "pass": true,
+      "got": 672,
+      "want": 672
+    },
+    {
+      "item": "B2 train labels c3t1 in arrival [40,80)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c3t2 == inner.train NEW-at-t (648 kept, 0 dropped)",
+      "pass": true,
+      "got": 648,
+      "want": 648
+    },
+    {
+      "item": "B2 train labels c3t2 in arrival [80,120)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c3t3 == inner.train NEW-at-t (489 kept, 0 dropped)",
+      "pass": true,
+      "got": 489,
+      "want": 489
+    },
+    {
+      "item": "B2 train labels c3t3 in arrival [120,160)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c3t4 == inner.train NEW-at-t (657 kept, 0 dropped)",
+      "pass": true,
+      "got": 657,
+      "want": 657
+    },
+    {
+      "item": "B2 train labels c3t4 in arrival [160,200)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c4t0 == inner.train NEW-at-t (570 kept, 0 dropped)",
+      "pass": true,
+      "got": 570,
+      "want": 570
+    },
+    {
+      "item": "B2 train labels c4t0 in arrival [0,40)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c4t1 == inner.train NEW-at-t (604 kept, 0 dropped)",
+      "pass": true,
+      "got": 604,
+      "want": 604
+    },
+    {
+      "item": "B2 train labels c4t1 in arrival [40,80)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c4t2 == inner.train NEW-at-t (484 kept, 0 dropped)",
+      "pass": true,
+      "got": 484,
+      "want": 484
+    },
+    {
+      "item": "B2 train labels c4t2 in arrival [80,120)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c4t3 == inner.train NEW-at-t (717 kept, 0 dropped)",
+      "pass": true,
+      "got": 717,
+      "want": 717
+    },
+    {
+      "item": "B2 train labels c4t3 in arrival [120,160)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 train archive c4t4 == inner.train NEW-at-t (542 kept, 0 dropped)",
+      "pass": true,
+      "got": 542,
+      "want": 542
+    },
+    {
+      "item": "B2 train labels c4t4 in arrival [160,200)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B2 first-arrival drops accounted",
+      "pass": true,
+      "got": 0,
+      "want": 0
+    },
+    {
+      "item": "B2 label_counts filled in raw-id domain",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B3 server test archive t0 == pool NEW-at-t (985 samples)",
+      "pass": true,
+      "got": 985,
+      "want": 985
+    },
+    {
+      "item": "B3 server test archive t1 == pool NEW-at-t (1095 samples)",
+      "pass": true,
+      "got": 1095,
+      "want": 1095
+    },
+    {
+      "item": "B3 server test archive t2 == pool NEW-at-t (941 samples)",
+      "pass": true,
+      "got": 941,
+      "want": 941
+    },
+    {
+      "item": "B3 server test archive t3 == pool NEW-at-t (976 samples)",
+      "pass": true,
+      "got": 976,
+      "want": 976
+    },
+    {
+      "item": "B3 server test archive t4 == pool NEW-at-t (1003 samples)",
+      "pass": true,
+      "got": 1003,
+      "want": 1003
+    },
+    {
+      "item": "B3 client test archive c0t0 == pool mask(c,t) (209 samples)",
+      "pass": true,
+      "got": 209,
+      "want": 209
+    },
+    {
+      "item": "B3 client test archive c0t1 == pool mask(c,t) (279 samples)",
+      "pass": true,
+      "got": 279,
+      "want": 279
+    },
+    {
+      "item": "B3 client test archive c0t2 == pool mask(c,t) (155 samples)",
+      "pass": true,
+      "got": 155,
+      "want": 155
+    },
+    {
+      "item": "B3 client test archive c0t3 == pool mask(c,t) (190 samples)",
+      "pass": true,
+      "got": 190,
+      "want": 190
+    },
+    {
+      "item": "B3 client test archive c0t4 == pool mask(c,t) (214 samples)",
+      "pass": true,
+      "got": 214,
+      "want": 214
+    },
+    {
+      "item": "B3 client test archive c1t0 == pool mask(c,t) (186 samples)",
+      "pass": true,
+      "got": 186,
+      "want": 186
+    },
+    {
+      "item": "B3 client test archive c1t1 == pool mask(c,t) (252 samples)",
+      "pass": true,
+      "got": 252,
+      "want": 252
+    },
+    {
+      "item": "B3 client test archive c1t2 == pool mask(c,t) (239 samples)",
+      "pass": true,
+      "got": 239,
+      "want": 239
+    },
+    {
+      "item": "B3 client test archive c1t3 == pool mask(c,t) (169 samples)",
+      "pass": true,
+      "got": 169,
+      "want": 169
+    },
+    {
+      "item": "B3 client test archive c1t4 == pool mask(c,t) (225 samples)",
+      "pass": true,
+      "got": 225,
+      "want": 225
+    },
+    {
+      "item": "B3 client test archive c2t0 == pool mask(c,t) (259 samples)",
+      "pass": true,
+      "got": 259,
+      "want": 259
+    },
+    {
+      "item": "B3 client test archive c2t1 == pool mask(c,t) (196 samples)",
+      "pass": true,
+      "got": 196,
+      "want": 196
+    },
+    {
+      "item": "B3 client test archive c2t2 == pool mask(c,t) (205 samples)",
+      "pass": true,
+      "got": 205,
+      "want": 205
+    },
+    {
+      "item": "B3 client test archive c2t3 == pool mask(c,t) (285 samples)",
+      "pass": true,
+      "got": 285,
+      "want": 285
+    },
+    {
+      "item": "B3 client test archive c2t4 == pool mask(c,t) (139 samples)",
+      "pass": true,
+      "got": 139,
+      "want": 139
+    },
+    {
+      "item": "B3 client test archive c3t0 == pool mask(c,t) (156 samples)",
+      "pass": true,
+      "got": 156,
+      "want": 156
+    },
+    {
+      "item": "B3 client test archive c3t1 == pool mask(c,t) (210 samples)",
+      "pass": true,
+      "got": 210,
+      "want": 210
+    },
+    {
+      "item": "B3 client test archive c3t2 == pool mask(c,t) (193 samples)",
+      "pass": true,
+      "got": 193,
+      "want": 193
+    },
+    {
+      "item": "B3 client test archive c3t3 == pool mask(c,t) (146 samples)",
+      "pass": true,
+      "got": 146,
+      "want": 146
+    },
+    {
+      "item": "B3 client test archive c3t4 == pool mask(c,t) (219 samples)",
+      "pass": true,
+      "got": 219,
+      "want": 219
+    },
+    {
+      "item": "B3 client test archive c4t0 == pool mask(c,t) (175 samples)",
+      "pass": true,
+      "got": 175,
+      "want": 175
+    },
+    {
+      "item": "B3 client test archive c4t1 == pool mask(c,t) (158 samples)",
+      "pass": true,
+      "got": 158,
+      "want": 158
+    },
+    {
+      "item": "B3 client test archive c4t2 == pool mask(c,t) (149 samples)",
+      "pass": true,
+      "got": 149,
+      "want": 149
+    },
+    {
+      "item": "B3 client test archive c4t3 == pool mask(c,t) (186 samples)",
+      "pass": true,
+      "got": 186,
+      "want": 186
+    },
+    {
+      "item": "B3 client test archive c4t4 == pool mask(c,t) (206 samples)",
+      "pass": true,
+      "got": 206,
+      "want": 206
+    },
+    {
+      "item": "B3 server eval concat t4 == arrived pool (5000 samples)",
+      "pass": true,
+      "got": 5000,
+      "want": 5000
+    },
+    {
+      "item": "B3 __getitem__ maps raw->arrival position",
+      "pass": true,
+      "got": 0,
+      "want": 0
+    },
+    {
+      "item": "C1 trainer.py wandb.init anchor intact",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 trainer.py FedAvg communicate anchor intact",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 trainer.py boundary-eval anchor intact",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 dataloader.py gen_imbalanced anchor intact",
+      "pass": true,
+      "got": 3,
+      "want": 3
+    },
+    {
+      "item": "C1 dataloader.py INR official loader anchors intact",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 learners/default.py cuda guard (> 1) intact",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 learners/prompt.py cuda guard (> 1) intact",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 learners/prompt.py update_model signature anchor intact (prev_server/prev_task_model official mismatch documented)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 models/vit.py fairscale import anchor intact",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 Trainer.__init__ is the manifest wrapper",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 Trainer.train carries boundary eval",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 NormalNN/DualPrompt.cuda patched to >= 1 (single-GPU DataParallel)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 DualPrompt.update_model prev_server alias bugfix live",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 wandb is our stub (not installed)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 fairscale is our passthrough stub",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 iIMAGENET_R.load replaced by manifest walk",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C3 args n_rounds == 5",
+      "pass": true,
+      "got": 5,
+      "want": 5
+    },
+    {
+      "item": "C3 args schedule == [30]",
+      "pass": true,
+      "got": [
+        30
+      ],
+      "want": [
+        30
+      ]
+    },
+    {
+      "item": "C3 args seed == manifest seed",
+      "pass": true,
+      "got": 42,
+      "want": 42
+    },
+    {
+      "item": "C3 args memory == 0 (no replay)",
+      "pass": true,
+      "got": 0,
+      "want": 0
+    },
+    {
+      "item": "C3 args n_clients == 5",
+      "pass": true,
+      "got": 5,
+      "want": 5
+    },
+    {
+      "item": "C3 args learner == prompt/L2P",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C3 args max_task == 5",
+      "pass": true,
+      "got": 5,
+      "want": 5
+    },
+    {
+      "item": "C4 numpy LAPACK self-test status recorded",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    }
+  ]
+}

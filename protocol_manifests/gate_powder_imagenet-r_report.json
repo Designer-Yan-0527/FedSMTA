@@ -1,0 +1,873 @@
+{
+  "dataset": "ImageNet-R",
+  "manifest": "/root/autodl-tmp/users/ych/FedSMTA/protocol_manifests/inr_c5t5p40s5_seed42.json",
+  "increments": [
+    40,
+    40,
+    40,
+    40,
+    40
+  ],
+  "drops": 0,
+  "drop_detail": {
+    "total": 0,
+    "zero_train_sample_classes_omitted": [],
+    "rotated_public_class_revisit_policy": "legal continued training (full-width CE over current classes + per-round ntd distillation to the old global model); no drop"
+  },
+  "rotated_public_class_policy": "legal continued training (full-width CE over current classes + per-round ntd distillation); no drop",
+  "vit_pretrained_source": "B_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.01-res_224.npz",
+  "partA_informational_pass": true,
+  "partB_injection_pass": true,
+  "partC_seal_pass": true,
+  "PASS": true,
+  "rows": [
+    {
+      "item": "A1 official: ImageNet_R 20-class rotating partition branch",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A2 official: centralized variant partition",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A3 official: client churn (50% old-client resample)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A4 official: partial participation",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A5 official: single shared global dataset downloads",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A6 official: DualPrompt_hard client cohort",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A7 official: uniform-task arithmetic in CodaPrompt_2d_v2 (int(numclass/class_per_task))",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A8 official: _ntd_loss contiguous-slice distillation (else branch)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A9 ViT-B/16 augreg npz cached (timm 0.6.7)",
+      "pass": true,
+      "got": "True",
+      "want": 1
+    },
+    {
+      "item": "B1 arrival increments",
+      "pass": true,
+      "got": [
+        40,
+        40,
+        40,
+        40,
+        40
+      ],
+      "want": [
+        40,
+        40,
+        40,
+        40,
+        40
+      ]
+    },
+    {
+      "item": "B2 cumulative head widths",
+      "pass": true,
+      "got": [
+        40,
+        80,
+        120,
+        160,
+        200
+      ],
+      "want": [
+        40,
+        80,
+        120,
+        160,
+        200
+      ]
+    },
+    {
+      "item": "B3 c0t0 train union/labels",
+      "pass": true,
+      "got": [
+        762,
+        [
+          0,
+          5,
+          7
+        ]
+      ],
+      "want": [
+        762,
+        [
+          0,
+          5,
+          7
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t1 train union/labels",
+      "pass": true,
+      "got": [
+        835,
+        [
+          41,
+          45,
+          46
+        ]
+      ],
+      "want": [
+        835,
+        [
+          41,
+          45,
+          46
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t2 train union/labels",
+      "pass": true,
+      "got": [
+        559,
+        [
+          82,
+          86,
+          93
+        ]
+      ],
+      "want": [
+        559,
+        [
+          82,
+          86,
+          93
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t3 train union/labels",
+      "pass": true,
+      "got": [
+        634,
+        [
+          126,
+          129,
+          132
+        ]
+      ],
+      "want": [
+        634,
+        [
+          126,
+          129,
+          132
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t4 train union/labels",
+      "pass": true,
+      "got": [
+        692,
+        [
+          160,
+          168,
+          169
+        ]
+      ],
+      "want": [
+        692,
+        [
+          160,
+          168,
+          169
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t0 train union/labels",
+      "pass": true,
+      "got": [
+        624,
+        [
+          1,
+          4,
+          14
+        ]
+      ],
+      "want": [
+        624,
+        [
+          1,
+          4,
+          14
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t1 train union/labels",
+      "pass": true,
+      "got": [
+        828,
+        [
+          44,
+          47,
+          52
+        ]
+      ],
+      "want": [
+        828,
+        [
+          44,
+          47,
+          52
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t2 train union/labels",
+      "pass": true,
+      "got": [
+        880,
+        [
+          85,
+          87,
+          91
+        ]
+      ],
+      "want": [
+        880,
+        [
+          85,
+          87,
+          91
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t3 train union/labels",
+      "pass": true,
+      "got": [
+        604,
+        [
+          123,
+          128,
+          137
+        ]
+      ],
+      "want": [
+        604,
+        [
+          123,
+          128,
+          137
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t4 train union/labels",
+      "pass": true,
+      "got": [
+        790,
+        [
+          161,
+          167,
+          172
+        ]
+      ],
+      "want": [
+        790,
+        [
+          161,
+          167,
+          172
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t0 train union/labels",
+      "pass": true,
+      "got": [
+        840,
+        [
+          3,
+          10,
+          15
+        ]
+      ],
+      "want": [
+        840,
+        [
+          3,
+          10,
+          15
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t1 train union/labels",
+      "pass": true,
+      "got": [
+        701,
+        [
+          56,
+          62,
+          63
+        ]
+      ],
+      "want": [
+        701,
+        [
+          56,
+          62,
+          63
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t2 train union/labels",
+      "pass": true,
+      "got": [
+        704,
+        [
+          81,
+          88,
+          92
+        ]
+      ],
+      "want": [
+        704,
+        [
+          81,
+          88,
+          92
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t3 train union/labels",
+      "pass": true,
+      "got": [
+        778,
+        [
+          122,
+          130,
+          133
+        ]
+      ],
+      "want": [
+        778,
+        [
+          122,
+          130,
+          133
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t4 train union/labels",
+      "pass": true,
+      "got": [
+        499,
+        [
+          164,
+          166,
+          185
+        ]
+      ],
+      "want": [
+        499,
+        [
+          164,
+          166,
+          185
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t0 train union/labels",
+      "pass": true,
+      "got": [
+        550,
+        [
+          9,
+          11,
+          24
+        ]
+      ],
+      "want": [
+        550,
+        [
+          9,
+          11,
+          24
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t1 train union/labels",
+      "pass": true,
+      "got": [
+        672,
+        [
+          42,
+          43,
+          51
+        ]
+      ],
+      "want": [
+        672,
+        [
+          42,
+          43,
+          51
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t2 train union/labels",
+      "pass": true,
+      "got": [
+        648,
+        [
+          84,
+          89,
+          96
+        ]
+      ],
+      "want": [
+        648,
+        [
+          84,
+          89,
+          96
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t3 train union/labels",
+      "pass": true,
+      "got": [
+        489,
+        [
+          120,
+          124,
+          127
+        ]
+      ],
+      "want": [
+        489,
+        [
+          120,
+          124,
+          127
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t4 train union/labels",
+      "pass": true,
+      "got": [
+        657,
+        [
+          162,
+          174,
+          180
+        ]
+      ],
+      "want": [
+        657,
+        [
+          162,
+          174,
+          180
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t0 train union/labels",
+      "pass": true,
+      "got": [
+        570,
+        [
+          2,
+          6,
+          8
+        ]
+      ],
+      "want": [
+        570,
+        [
+          2,
+          6,
+          8
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t1 train union/labels",
+      "pass": true,
+      "got": [
+        604,
+        [
+          40,
+          48,
+          49
+        ]
+      ],
+      "want": [
+        604,
+        [
+          40,
+          48,
+          49
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t2 train union/labels",
+      "pass": true,
+      "got": [
+        484,
+        [
+          80,
+          83,
+          90
+        ]
+      ],
+      "want": [
+        484,
+        [
+          80,
+          83,
+          90
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t3 train union/labels",
+      "pass": true,
+      "got": [
+        717,
+        [
+          121,
+          125,
+          131
+        ]
+      ],
+      "want": [
+        717,
+        [
+          121,
+          125,
+          131
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t4 train union/labels",
+      "pass": true,
+      "got": [
+        542,
+        [
+          163,
+          165,
+          170
+        ]
+      ],
+      "want": [
+        542,
+        [
+          163,
+          165,
+          170
+        ]
+      ]
+    },
+    {
+      "item": "B3b starved omissions == expected",
+      "pass": true,
+      "got": {},
+      "want": {}
+    },
+    {
+      "item": "B4 per-(client,class) ownership == manifest",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B5 full eval pool injection",
+      "pass": true,
+      "got": 5000,
+      "want": 5000
+    },
+    {
+      "item": "B6 boundary c0k0",
+      "pass": true,
+      "got": 209,
+      "want": 209
+    },
+    {
+      "item": "B6 boundary c0k1",
+      "pass": true,
+      "got": 279,
+      "want": 279
+    },
+    {
+      "item": "B6 boundary c0k2",
+      "pass": true,
+      "got": 155,
+      "want": 155
+    },
+    {
+      "item": "B6 boundary c0k3",
+      "pass": true,
+      "got": 190,
+      "want": 190
+    },
+    {
+      "item": "B6 boundary c0k4",
+      "pass": true,
+      "got": 214,
+      "want": 214
+    },
+    {
+      "item": "B6 boundary c1k0",
+      "pass": true,
+      "got": 186,
+      "want": 186
+    },
+    {
+      "item": "B6 boundary c1k1",
+      "pass": true,
+      "got": 252,
+      "want": 252
+    },
+    {
+      "item": "B6 boundary c1k2",
+      "pass": true,
+      "got": 239,
+      "want": 239
+    },
+    {
+      "item": "B6 boundary c1k3",
+      "pass": true,
+      "got": 169,
+      "want": 169
+    },
+    {
+      "item": "B6 boundary c1k4",
+      "pass": true,
+      "got": 225,
+      "want": 225
+    },
+    {
+      "item": "B6 boundary c2k0",
+      "pass": true,
+      "got": 259,
+      "want": 259
+    },
+    {
+      "item": "B6 boundary c2k1",
+      "pass": true,
+      "got": 196,
+      "want": 196
+    },
+    {
+      "item": "B6 boundary c2k2",
+      "pass": true,
+      "got": 205,
+      "want": 205
+    },
+    {
+      "item": "B6 boundary c2k3",
+      "pass": true,
+      "got": 285,
+      "want": 285
+    },
+    {
+      "item": "B6 boundary c2k4",
+      "pass": true,
+      "got": 139,
+      "want": 139
+    },
+    {
+      "item": "B6 boundary c3k0",
+      "pass": true,
+      "got": 156,
+      "want": 156
+    },
+    {
+      "item": "B6 boundary c3k1",
+      "pass": true,
+      "got": 210,
+      "want": 210
+    },
+    {
+      "item": "B6 boundary c3k2",
+      "pass": true,
+      "got": 193,
+      "want": 193
+    },
+    {
+      "item": "B6 boundary c3k3",
+      "pass": true,
+      "got": 146,
+      "want": 146
+    },
+    {
+      "item": "B6 boundary c3k4",
+      "pass": true,
+      "got": 219,
+      "want": 219
+    },
+    {
+      "item": "B6 boundary c4k0",
+      "pass": true,
+      "got": 175,
+      "want": 175
+    },
+    {
+      "item": "B6 boundary c4k1",
+      "pass": true,
+      "got": 158,
+      "want": 158
+    },
+    {
+      "item": "B6 boundary c4k2",
+      "pass": true,
+      "got": 149,
+      "want": 149
+    },
+    {
+      "item": "B6 boundary c4k3",
+      "pass": true,
+      "got": 186,
+      "want": 186
+    },
+    {
+      "item": "B6 boundary c4k4",
+      "pass": true,
+      "got": 206,
+      "want": 206
+    },
+    {
+      "item": "B7 P1 partition structures consistent",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B8 patched fl_main source markers",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B9 S1 weight sizing seal applied",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B10 S2 ntd column seal + numerical identity",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B11 module stubs (nni/cv2/fgvcdata/pl importable, cv2 fail-loud)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 fl_main FULL TEST print anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 fl_main CIFAR dataset-branch anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C3 fl_main churn anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C4 fl_main participation anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C5 fl_main training_log anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C6 fl_main global-eval call anchor x2",
+      "pass": true,
+      "got": 2,
+      "want": 2
+    },
+    {
+      "item": "C7 vit_coda_p S1 anchors in CodaPrompt_2d_v2.__init__ (x3)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C8 prompt_hard S2 anchors in DualPrompt_hard._ntd_loss (x4)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C9 numpy LAPACK self-test status recorded",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C10 official files byte-identical (anchors all verbatim after patching)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets --client_num 5 --task_num 5 --private_class_num 15 --global_epoch 5 --local_epoch 30 --batch-size 16 --lr 0.001 --seed 42 --run_name cifar_base_p15

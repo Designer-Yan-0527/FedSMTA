@@ -1,0 +1,68 @@
+{
+  "n_cells": 125,
+  "n_rho_valid": 84,
+  "n_excluded_neg_denom": 41,
+  "repro_gate": {
+    "mode": "mc_dropout",
+    "n_draws": 50,
+    "z_max": 3.0,
+    "sign_max": 20,
+    "n_cells": 25,
+    "arm1_sign": [
+      7,
+      18
+    ],
+    "arm4_role": "reference_only",
+    "passed": true
+  },
+  "zref_gate": {
+    "passed": true,
+    "violations": []
+  },
+  "rho_birth": {
+    "mean": 1.0057959477721574,
+    "pooled": 1.0182064821914234,
+    "per_task_mean": {
+      "0": 0.707417792075868,
+      "1": 0.9904794961584157,
+      "2": 0.9675508560581493,
+      "3": 1.2447382710722292,
+      "4": 1.032894443267622
+    }
+  },
+  "worst_cells": [
+    {
+      "round": 13,
+      "client": 3,
+      "task": 2,
+      "rho": -0.6666693952391867
+    },
+    {
+      "round": 11,
+      "client": 3,
+      "task": 2,
+      "rho": -0.20000294685349718
+    },
+    {
+      "round": 0,
+      "client": 3,
+      "task": 0,
+      "rho": 0.0
+    },
+    {
+      "round": 6,
+      "client": 0,
+      "task": 1,
+      "rho": 0.0
+    },
+    {
+      "round": 12,
+      "client": 3,
+      "task": 2,
+      "rho": 0.0
+    }
+  ],
+  "collapse_flags": [],
+  "verdict": "GREEN",
+  "notes": "pre-registered Sec.34.2.5; label-free bridge (lambda||dA||^2 residual param, GCV, identity candidate); arm4 = frozen refit recipe on z+; torch CPU."
+}

@@ -1,0 +1,523 @@
+{
+  "test": "fedprotip_protocol_equivalence_gate",
+  "generated_at": "2026-11-11 18:09:49",
+  "manifest": "/root/autodl-tmp/users/ych/FedSMTA/protocol_manifests/cifar100_c5t5p15s20_seed42.json",
+  "dataset": "cifar100",
+  "result": "PASS",
+  "partA_native_mismatch": "PASS",
+  "partB_adapter_injection": "PASS",
+  "partC_seals": "PASS",
+  "first_arrival_increments": [
+    32,
+    26,
+    14,
+    16,
+    12
+  ],
+  "total_dropped_rotated_samples": 5986,
+  "items": [
+    {
+      "item": "A official partition_data is RNG dirichlet (anchor present; replaced by design)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "A official n_tasks=10 != frozen 5 (documented mismatch; adapter enforces 5)",
+      "pass": true,
+      "got_len": 10,
+      "want_len": 5
+    },
+    {
+      "item": "A official increment uniform 10 != first-arrival [32, 26, 14, 16, 12] (documented mismatch; adapter enforces arrival order)",
+      "pass": true,
+      "got_len": 10,
+      "want_len": [
+        32,
+        26,
+        14,
+        16,
+        12
+      ]
+    },
+    {
+      "item": "B1 _increments == first-arrival counts",
+      "pass": true,
+      "got_len": 5,
+      "want_len": 5
+    },
+    {
+      "item": "B1 class order identity",
+      "pass": true,
+      "got_len": 100,
+      "want_len": 100
+    },
+    {
+      "item": "B1 train targets == arrival remap",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B1 test pool size",
+      "pass": true,
+      "got_len": 8000,
+      "want_len": 8000
+    },
+    {
+      "item": "B1 test targets == pool subset in raw order",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B2 task 0 DummyDataset length",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 c0t0 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 858,
+      "want_len": 858
+    },
+    {
+      "item": "B2 c0t0 drop accounting (0 dropped)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B2 c1t0 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1717,
+      "want_len": 1717
+    },
+    {
+      "item": "B2 c1t0 drop accounting (0 dropped)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B2 c2t0 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1592,
+      "want_len": 1592
+    },
+    {
+      "item": "B2 c2t0 drop accounting (0 dropped)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B2 c3t0 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1708,
+      "want_len": 1708
+    },
+    {
+      "item": "B2 c3t0 drop accounting (0 dropped)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B2 c4t0 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1878,
+      "want_len": 1878
+    },
+    {
+      "item": "B2 c4t0 drop accounting (0 dropped)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B2 task 0 all kept labels in [0,32)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 task 1 DummyDataset length",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 c0t1 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 2227,
+      "want_len": 2227
+    },
+    {
+      "item": "B2 c0t1 drop accounting (0 dropped)",
+      "pass": true,
+      "got_len": 0,
+      "want_len": 0
+    },
+    {
+      "item": "B2 c1t1 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1041,
+      "want_len": 1041
+    },
+    {
+      "item": "B2 c1t1 drop accounting (39 dropped)",
+      "pass": true,
+      "got_len": 39,
+      "want_len": 39
+    },
+    {
+      "item": "B2 c2t1 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 897,
+      "want_len": 897
+    },
+    {
+      "item": "B2 c2t1 drop accounting (297 dropped)",
+      "pass": true,
+      "got_len": 297,
+      "want_len": 297
+    },
+    {
+      "item": "B2 c3t1 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1551,
+      "want_len": 1551
+    },
+    {
+      "item": "B2 c3t1 drop accounting (102 dropped)",
+      "pass": true,
+      "got_len": 102,
+      "want_len": 102
+    },
+    {
+      "item": "B2 c4t1 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1118,
+      "want_len": 1118
+    },
+    {
+      "item": "B2 c4t1 drop accounting (100 dropped)",
+      "pass": true,
+      "got_len": 100,
+      "want_len": 100
+    },
+    {
+      "item": "B2 task 1 all kept labels in [32,58)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 task 2 DummyDataset length",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 c0t2 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 738,
+      "want_len": 738
+    },
+    {
+      "item": "B2 c0t2 drop accounting (587 dropped)",
+      "pass": true,
+      "got_len": 587,
+      "want_len": 587
+    },
+    {
+      "item": "B2 c1t2 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1043,
+      "want_len": 1043
+    },
+    {
+      "item": "B2 c1t2 drop accounting (364 dropped)",
+      "pass": true,
+      "got_len": 364,
+      "want_len": 364
+    },
+    {
+      "item": "B2 c2t2 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1054,
+      "want_len": 1054
+    },
+    {
+      "item": "B2 c2t2 drop accounting (232 dropped)",
+      "pass": true,
+      "got_len": 232,
+      "want_len": 232
+    },
+    {
+      "item": "B2 c3t2 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 605,
+      "want_len": 605
+    },
+    {
+      "item": "B2 c3t2 drop accounting (355 dropped)",
+      "pass": true,
+      "got_len": 355,
+      "want_len": 355
+    },
+    {
+      "item": "B2 c4t2 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1094,
+      "want_len": 1094
+    },
+    {
+      "item": "B2 c4t2 drop accounting (299 dropped)",
+      "pass": true,
+      "got_len": 299,
+      "want_len": 299
+    },
+    {
+      "item": "B2 task 2 all kept labels in [58,72)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 task 3 DummyDataset length",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 c0t3 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1062,
+      "want_len": 1062
+    },
+    {
+      "item": "B2 c0t3 drop accounting (441 dropped)",
+      "pass": true,
+      "got_len": 441,
+      "want_len": 441
+    },
+    {
+      "item": "B2 c1t3 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1395,
+      "want_len": 1395
+    },
+    {
+      "item": "B2 c1t3 drop accounting (240 dropped)",
+      "pass": true,
+      "got_len": 240,
+      "want_len": 240
+    },
+    {
+      "item": "B2 c2t3 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1055,
+      "want_len": 1055
+    },
+    {
+      "item": "B2 c2t3 drop accounting (370 dropped)",
+      "pass": true,
+      "got_len": 370,
+      "want_len": 370
+    },
+    {
+      "item": "B2 c3t3 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1411,
+      "want_len": 1411
+    },
+    {
+      "item": "B2 c3t3 drop accounting (142 dropped)",
+      "pass": true,
+      "got_len": 142,
+      "want_len": 142
+    },
+    {
+      "item": "B2 c4t3 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 698,
+      "want_len": 698
+    },
+    {
+      "item": "B2 c4t3 drop accounting (424 dropped)",
+      "pass": true,
+      "got_len": 424,
+      "want_len": 424
+    },
+    {
+      "item": "B2 task 3 all kept labels in [72,88)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 task 4 DummyDataset length",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 c0t4 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1055,
+      "want_len": 1055
+    },
+    {
+      "item": "B2 c0t4 drop accounting (297 dropped)",
+      "pass": true,
+      "got_len": 297,
+      "want_len": 297
+    },
+    {
+      "item": "B2 c1t4 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 703,
+      "want_len": 703
+    },
+    {
+      "item": "B2 c1t4 drop accounting (407 dropped)",
+      "pass": true,
+      "got_len": 407,
+      "want_len": 407
+    },
+    {
+      "item": "B2 c2t4 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 1039,
+      "want_len": 1039
+    },
+    {
+      "item": "B2 c2t4 drop accounting (484 dropped)",
+      "pass": true,
+      "got_len": 484,
+      "want_len": 484
+    },
+    {
+      "item": "B2 c3t4 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 697,
+      "want_len": 697
+    },
+    {
+      "item": "B2 c3t4 drop accounting (437 dropped)",
+      "pass": true,
+      "got_len": 437,
+      "want_len": 437
+    },
+    {
+      "item": "B2 c4t4 kept samples == manifest inner.train(new at t)",
+      "pass": true,
+      "got_len": 722,
+      "want_len": 722
+    },
+    {
+      "item": "B2 c4t4 drop accounting (369 dropped)",
+      "pass": true,
+      "got_len": 369,
+      "want_len": 369
+    },
+    {
+      "item": "B2 task 4 all kept labels in [88,100)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "B2 total first-arrival drops (5986; 0 expected on ImageNet-R)",
+      "pass": true,
+      "got_len": 5986,
+      "want_len": -1
+    },
+    {
+      "item": "B3 per-(client,task) eval views non-empty on the test pool",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C1 official inc_net.py contains the args['increment'] width anchors",
+      "pass": true,
+      "got_len": 5,
+      "want_len": 3
+    },
+    {
+      "item": "C1 patched generate_fc active",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C1 fc block widths == arrival counts",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C2 official train() partition call-site anchor",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C2 official train() known-classes anchor",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C2 patched train() active + boundary eval bound",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C3 official _map_new_class_index anchor (order.index)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C3 module attr replaced by the manifest map",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C5 official client still calls np.linalg.svd (seal: anchors untouched, found 6, expected 6)",
+      "pass": true,
+      "got_len": 6,
+      "want_len": 6
+    },
+    {
+      "item": "C5 numpy LAPACK self-test (rerouted to scipy (broken host) -- either is PASS; the self-test is fail-loud)",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 0
+    },
+    {
+      "item": "C4 wandb/progress stubs installed",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    },
+    {
+      "item": "C4 build_args enforces the frozen protocol",
+      "pass": true,
+      "got_len": 1,
+      "want_len": 1
+    }
+  ],
+  "notes": [
+    "Part A is informational: the official 10-task dirichlet protocol is replaced BY DESIGN by the frozen manifest via the data-partition interface only",
+    "Part B is gating: it verifies the exact objects FedProTIP loads under run_fedprotip.py are the manifest's splits, including the first-arrival label remap, the test-pool eval restriction and the per-(client,task) partition",
+    "CIFAR public classes rotate across tasks per client; samples of already-arrived classes are dropped from that client's new-task training (FedProTIP has no replay path) and counted in the report/drops.json"
+  ]
+}

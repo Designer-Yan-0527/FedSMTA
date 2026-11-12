@@ -1,0 +1,76 @@
+{
+ "cell": {
+  "k": 2,
+  "j": 4,
+  "client": 0,
+  "n_fit": 4410,
+  "n_eval": 569,
+  "zref_rel_diff": 0.0
+ },
+ "acc_stale": 89.98242530755711,
+ "controls": {
+  "identity": {
+   "acc": 89.98242530755711,
+   "bitwise_pred_match": true,
+   "pass": true
+  },
+  "synthetic_identity": {
+   "A_minus_I_rel": 0.0,
+   "b_rel": 0.0,
+   "eval_resid_rel": 0.0,
+   "acc": 89.98242530755711,
+   "fit_info": {
+    "ridge_lambda": null,
+    "gcv": 0.0,
+    "dof": 0.0,
+    "identity_candidate_selected": true
+   },
+   "pass": true
+  },
+  "lambda_inf": {
+   "A_minus_I_frob": 1.5666470217106615e-08,
+   "b_norm": 7.274543634139263e-09,
+   "acc": 89.98242530755711,
+   "R_feat": 1.0,
+   "fit_info": {
+    "ridge_lambda": 1000000000000.0,
+    "gcv": NaN,
+    "dof": 9.666681844499113e-08,
+    "identity_candidate_selected": false
+   },
+   "pass": true
+  },
+  "lambda_zero": {
+   "acc": 93.67311072056239,
+   "R_feat": 0.6099387721978116,
+   "fit_info": {
+    "ridge_lambda": 0.0,
+    "gcv": NaN,
+    "dof": 769.0,
+    "identity_candidate_selected": false
+   },
+   "pass": null,
+   "info": "plain LS, no gate (n_fit > 2d satisfied)"
+  },
+  "mean_shift_only": {
+   "acc": 28.471001757469246,
+   "R_feat": 2.262053015706001,
+   "pass": null,
+   "info": "B(z)=z+mean(D_fit), no gate"
+  },
+  "gcv_production": {
+   "acc": 93.67311072056239,
+   "R_feat": 0.5502443425995072,
+   "fit_info": {
+    "ridge_lambda": 39.75127725384145,
+    "gcv": 8.620330156912603,
+    "dof": 392.22021289080413,
+    "identity_candidate_selected": false
+   },
+   "pass": null,
+   "info": "production GCV path after identity-anchored fix"
+  }
+ },
+ "gate_pass": true,
+ "status": "FIT_SANITY_PASS"
+}

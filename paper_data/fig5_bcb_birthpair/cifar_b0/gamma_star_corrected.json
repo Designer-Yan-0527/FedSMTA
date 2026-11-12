@@ -1,0 +1,16 @@
+{
+  "split_encoding": "train=0 (ERRATUM-gamma-split 2026-11-06)",
+  "cells_csv": "output/cifar100/fedta/cifar_bsab_capture_M2matched/seed_42/bsab_b0/cells.csv",
+  "n_cells_total": 125,
+  "skipped_identity": 20,
+  "n_nonidentity": 105,
+  "gamma_median": 0.396419312045252,
+  "gamma_mean": 0.5259194103106511,
+  "gamma_min": 0.2105167309349984,
+  "gamma_max": 2.2244218526453077,
+  "gamma_p25": 0.3734963441322701,
+  "gamma_p75": 0.6545530246714328,
+  "gcv_boundary_hits": 0,
+  "gcv_boundary_reported": false,
+  "gcv_grid_boundary_warning": false
+}

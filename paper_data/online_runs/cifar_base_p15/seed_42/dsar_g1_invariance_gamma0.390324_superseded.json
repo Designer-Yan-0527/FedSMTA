@@ -1,0 +1,659 @@
+{
+  "gate": "G1_dsar_first_phase_invariance",
+  "run_dir": "output/cifar100/fedta/cifar_base_p15/seed_42",
+  "checkpoint": "/root/autodl-tmp/users/ych/FedSMTA/output/cifar100/fedta/cifar_base_p15/seed_42/checkpoints/task_04_end.pth",
+  "frozen_ref": "RUNCOMMANDS §34.4 / §34.4a",
+  "tests": {
+    "T1": "OFF vs ON(identity): official evaluate() bit-identical (same RNG point, same bs8+shuffle+train=True manifest)",
+    "T2": "frozen dispatch: current B->L, historical B-only; insertion before self.model(); B identity != DSAR identity",
+    "T3": "real-fit path RNG/mode/state neutrality + deterministic replay + legal statuses"
+  },
+  "results": {
+    "client_0": [
+      {
+        "name": "T1_off_vs_on_identity_bitwise",
+        "sidecar_committed": true,
+        "sidecar_is_identity": true,
+        "prompt_hash_matches_broadcast": true,
+        "hooks_rng_neutral": true,
+        "per_task": [
+          {
+            "task": 0,
+            "acc_on": 93.47826385498047,
+            "acc_off": 93.47826385498047,
+            "acc_equal": true,
+            "n_batches": 46,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 1,
+            "acc_on": 80.1047134399414,
+            "acc_off": 80.1047134399414,
+            "acc_equal": true,
+            "n_batches": 120,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 2,
+            "acc_on": 77.32864379882812,
+            "acc_off": 77.32864379882812,
+            "acc_equal": true,
+            "n_batches": 72,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 3,
+            "acc_on": 84.96124267578125,
+            "acc_off": 84.96124267578125,
+            "acc_equal": true,
+            "n_batches": 81,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 4,
+            "acc_on": 97.06896209716797,
+            "acc_off": 97.06896209716797,
+            "acc_equal": true,
+            "n_batches": 73,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T2_readout_dispatch_wiring",
+        "details": [
+          {
+            "arm": "B+L(current)",
+            "task": 4,
+            "is_current": true,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          },
+          {
+            "arm": "B_identity_L_active(historical)",
+            "task": 0,
+            "logits_equal_raw_bitwise": true
+          },
+          {
+            "arm": "B_identity_L_active(current)",
+            "task": 4,
+            "logits_moved": true
+          },
+          {
+            "arm": "B_active_L_identity(historical)",
+            "task": 0,
+            "logits_moved": true
+          },
+          {
+            "arm": "B+L(historical)",
+            "task": 0,
+            "is_current": false,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T3_real_fit_rng_mode_neutrality",
+        "sidecar_committed": true,
+        "b_status": "IDENTITY_GUARD",
+        "l_status": "FITTED",
+        "b_aux": {
+          "n_rows": 1352,
+          "n_fit": 1048,
+          "n_cal": 304,
+          "seed": 4055236858,
+          "lam_fit": 8.822763209855879,
+          "mse_bridge_r8_cal": 5.793060755046569e-14,
+          "mse_identity_cal": 5.635367142728639e-14
+        },
+        "l_final_ce": 0.00017420925723854452,
+        "n_train": 1352,
+        "statuses_legal": true,
+        "rank_shapes_ok": true,
+        "factors_finite": true,
+        "birth_hash_recorded": true,
+        "prompt_hash_matches_perturbed_broadcast": true,
+        "rng_restored": true,
+        "flags_restored": true,
+        "vit_prompt_is_broadcast": true,
+        "tail_anchor_untouched": true,
+        "heads_untouched": true,
+        "replay_reproduces_factors_bitwise": true,
+        "replay_rng_restored": true,
+        "verdict": "PASS"
+      }
+    ],
+    "client_1": [
+      {
+        "name": "T1_off_vs_on_identity_bitwise",
+        "sidecar_committed": true,
+        "sidecar_is_identity": true,
+        "prompt_hash_matches_broadcast": true,
+        "hooks_rng_neutral": true,
+        "per_task": [
+          {
+            "task": 0,
+            "acc_on": 91.44021606445312,
+            "acc_off": 91.44021606445312,
+            "acc_equal": true,
+            "n_batches": 92,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 1,
+            "acc_on": 44.61206817626953,
+            "acc_off": 44.61206817626953,
+            "acc_equal": true,
+            "n_batches": 58,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 2,
+            "acc_on": 53.47682189941406,
+            "acc_off": 53.47682189941406,
+            "acc_equal": true,
+            "n_batches": 76,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 3,
+            "acc_on": 81.45506286621094,
+            "acc_off": 81.45506286621094,
+            "acc_equal": true,
+            "n_batches": 88,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 4,
+            "acc_on": 95.1680679321289,
+            "acc_off": 95.1680679321289,
+            "acc_equal": true,
+            "n_batches": 60,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T2_readout_dispatch_wiring",
+        "details": [
+          {
+            "arm": "B+L(current)",
+            "task": 4,
+            "is_current": true,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          },
+          {
+            "arm": "B_identity_L_active(historical)",
+            "task": 0,
+            "logits_equal_raw_bitwise": true
+          },
+          {
+            "arm": "B_identity_L_active(current)",
+            "task": 4,
+            "logits_moved": true
+          },
+          {
+            "arm": "B_active_L_identity(historical)",
+            "task": 0,
+            "logits_moved": true
+          },
+          {
+            "arm": "B+L(historical)",
+            "task": 0,
+            "is_current": false,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T3_real_fit_rng_mode_neutrality",
+        "sidecar_committed": true,
+        "b_status": "IDENTITY_GUARD",
+        "l_status": "FITTED",
+        "b_aux": {
+          "n_rows": 1110,
+          "n_fit": 863,
+          "n_cal": 247,
+          "seed": 4108810661,
+          "lam_fit": 7.068277002289812,
+          "mse_bridge_r8_cal": 6.685275867014203e-14,
+          "mse_identity_cal": 6.509316161715236e-14
+        },
+        "l_final_ce": 0.00037620554212480783,
+        "n_train": 1110,
+        "statuses_legal": true,
+        "rank_shapes_ok": true,
+        "factors_finite": true,
+        "birth_hash_recorded": true,
+        "prompt_hash_matches_perturbed_broadcast": true,
+        "rng_restored": true,
+        "flags_restored": true,
+        "vit_prompt_is_broadcast": true,
+        "tail_anchor_untouched": true,
+        "heads_untouched": true,
+        "replay_reproduces_factors_bitwise": true,
+        "replay_rng_restored": true,
+        "verdict": "PASS"
+      }
+    ],
+    "client_2": [
+      {
+        "name": "T1_off_vs_on_identity_bitwise",
+        "sidecar_committed": true,
+        "sidecar_is_identity": true,
+        "prompt_hash_matches_broadcast": true,
+        "hooks_rng_neutral": true,
+        "per_task": [
+          {
+            "task": 0,
+            "acc_on": 60.46852111816406,
+            "acc_off": 60.46852111816406,
+            "acc_equal": true,
+            "n_batches": 86,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 1,
+            "acc_on": 45.5078125,
+            "acc_off": 45.5078125,
+            "acc_equal": true,
+            "n_batches": 64,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 2,
+            "acc_on": 71.01449584960938,
+            "acc_off": 71.01449584960938,
+            "acc_equal": true,
+            "n_batches": 69,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 3,
+            "acc_on": 41.50326919555664,
+            "acc_off": 41.50326919555664,
+            "acc_equal": true,
+            "n_batches": 77,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 4,
+            "acc_on": 89.73966217041016,
+            "acc_off": 89.73966217041016,
+            "acc_equal": true,
+            "n_batches": 82,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T2_readout_dispatch_wiring",
+        "details": [
+          {
+            "arm": "B+L(current)",
+            "task": 4,
+            "is_current": true,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          },
+          {
+            "arm": "B_identity_L_active(historical)",
+            "task": 0,
+            "logits_equal_raw_bitwise": true
+          },
+          {
+            "arm": "B_identity_L_active(current)",
+            "task": 4,
+            "logits_moved": true
+          },
+          {
+            "arm": "B_active_L_identity(historical)",
+            "task": 0,
+            "logits_moved": true
+          },
+          {
+            "arm": "B+L(historical)",
+            "task": 0,
+            "is_current": false,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T3_real_fit_rng_mode_neutrality",
+        "sidecar_committed": true,
+        "b_status": "IDENTITY_GUARD",
+        "l_status": "FITTED",
+        "b_aux": {
+          "n_rows": 1523,
+          "n_fit": 1191,
+          "n_cal": 332,
+          "seed": 4030893816,
+          "lam_fit": 10.382767198739607,
+          "mse_bridge_r8_cal": 6.454154360688375e-14,
+          "mse_identity_cal": 6.335760455970624e-14
+        },
+        "l_final_ce": 0.0005479624960571527,
+        "n_train": 1523,
+        "statuses_legal": true,
+        "rank_shapes_ok": true,
+        "factors_finite": true,
+        "birth_hash_recorded": true,
+        "prompt_hash_matches_perturbed_broadcast": true,
+        "rng_restored": true,
+        "flags_restored": true,
+        "vit_prompt_is_broadcast": true,
+        "tail_anchor_untouched": true,
+        "heads_untouched": true,
+        "replay_reproduces_factors_bitwise": true,
+        "replay_rng_restored": true,
+        "verdict": "PASS"
+      }
+    ],
+    "client_3": [
+      {
+        "name": "T1_off_vs_on_identity_bitwise",
+        "sidecar_committed": true,
+        "sidecar_is_identity": true,
+        "prompt_hash_matches_broadcast": true,
+        "hooks_rng_neutral": true,
+        "per_task": [
+          {
+            "task": 0,
+            "acc_on": 88.79781341552734,
+            "acc_off": 88.79781341552734,
+            "acc_equal": true,
+            "n_batches": 92,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 1,
+            "acc_on": 86.74188995361328,
+            "acc_off": 86.74188995361328,
+            "acc_equal": true,
+            "n_batches": 89,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 2,
+            "acc_on": 82.5242691040039,
+            "acc_off": 82.5242691040039,
+            "acc_equal": true,
+            "n_batches": 52,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 3,
+            "acc_on": 65.76576232910156,
+            "acc_off": 65.76576232910156,
+            "acc_equal": true,
+            "n_batches": 84,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 4,
+            "acc_on": 92.4024658203125,
+            "acc_off": 92.4024658203125,
+            "acc_equal": true,
+            "n_batches": 61,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T2_readout_dispatch_wiring",
+        "details": [
+          {
+            "arm": "B+L(current)",
+            "task": 4,
+            "is_current": true,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          },
+          {
+            "arm": "B_identity_L_active(historical)",
+            "task": 0,
+            "logits_equal_raw_bitwise": true
+          },
+          {
+            "arm": "B_identity_L_active(current)",
+            "task": 4,
+            "logits_moved": true
+          },
+          {
+            "arm": "B_active_L_identity(historical)",
+            "task": 0,
+            "logits_moved": true
+          },
+          {
+            "arm": "B+L(historical)",
+            "task": 0,
+            "is_current": false,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T3_real_fit_rng_mode_neutrality",
+        "sidecar_committed": true,
+        "b_status": "IDENTITY_GUARD",
+        "l_status": "FITTED",
+        "b_aux": {
+          "n_rows": 1134,
+          "n_fit": 899,
+          "n_cal": 235,
+          "seed": 2394193277,
+          "lam_fit": 7.283092096149698,
+          "mse_bridge_r8_cal": 6.90119731839995e-14,
+          "mse_identity_cal": 6.754462779574039e-14
+        },
+        "l_final_ce": 0.000666748674120754,
+        "n_train": 1134,
+        "statuses_legal": true,
+        "rank_shapes_ok": true,
+        "factors_finite": true,
+        "birth_hash_recorded": true,
+        "prompt_hash_matches_perturbed_broadcast": true,
+        "rng_restored": true,
+        "flags_restored": true,
+        "vit_prompt_is_broadcast": true,
+        "tail_anchor_untouched": true,
+        "heads_untouched": true,
+        "replay_reproduces_factors_bitwise": true,
+        "replay_rng_restored": true,
+        "verdict": "PASS"
+      }
+    ],
+    "client_4": [
+      {
+        "name": "T1_off_vs_on_identity_bitwise",
+        "sidecar_committed": true,
+        "sidecar_is_identity": true,
+        "prompt_hash_matches_broadcast": true,
+        "hooks_rng_neutral": true,
+        "per_task": [
+          {
+            "task": 0,
+            "acc_on": 64.22360229492188,
+            "acc_off": 64.22360229492188,
+            "acc_equal": true,
+            "n_batches": 101,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 1,
+            "acc_on": 70.36328887939453,
+            "acc_off": 70.36328887939453,
+            "acc_equal": true,
+            "n_batches": 66,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 2,
+            "acc_on": 77.25752258300781,
+            "acc_off": 77.25752258300781,
+            "acc_equal": true,
+            "n_batches": 75,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 3,
+            "acc_on": 57.261409759521484,
+            "acc_off": 57.261409759521484,
+            "acc_equal": true,
+            "n_batches": 61,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          },
+          {
+            "task": 4,
+            "acc_on": 86.32478332519531,
+            "acc_off": 86.32478332519531,
+            "acc_equal": true,
+            "n_batches": 59,
+            "batch_manifest_equal": true,
+            "features_bitwise_equal": true,
+            "logits_bitwise_equal": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T2_readout_dispatch_wiring",
+        "details": [
+          {
+            "arm": "B+L(current)",
+            "task": 4,
+            "is_current": true,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          },
+          {
+            "arm": "B_identity_L_active(historical)",
+            "task": 0,
+            "logits_equal_raw_bitwise": true
+          },
+          {
+            "arm": "B_identity_L_active(current)",
+            "task": 4,
+            "logits_moved": true
+          },
+          {
+            "arm": "B_active_L_identity(historical)",
+            "task": 0,
+            "logits_moved": true
+          },
+          {
+            "arm": "B+L(historical)",
+            "task": 0,
+            "is_current": false,
+            "insertion_point_features_ok": true,
+            "manual_readout_logits_ok": true,
+            "adapters_active": true
+          }
+        ],
+        "verdict": "PASS"
+      },
+      {
+        "name": "T3_real_fit_rng_mode_neutrality",
+        "sidecar_committed": true,
+        "b_status": "IDENTITY_GUARD",
+        "l_status": "FITTED",
+        "b_aux": {
+          "n_rows": 1091,
+          "n_fit": 828,
+          "n_cal": 263,
+          "seed": 361402395,
+          "lam_fit": 7.433395872440438,
+          "mse_bridge_r8_cal": 7.189433806035883e-14,
+          "mse_identity_cal": 7.052619221711928e-14
+        },
+        "l_final_ce": 0.009382017888128757,
+        "n_train": 1091,
+        "statuses_legal": true,
+        "rank_shapes_ok": true,
+        "factors_finite": true,
+        "birth_hash_recorded": true,
+        "prompt_hash_matches_perturbed_broadcast": true,
+        "rng_restored": true,
+        "flags_restored": true,
+        "vit_prompt_is_broadcast": true,
+        "tail_anchor_untouched": true,
+        "heads_untouched": true,
+        "replay_reproduces_factors_bitwise": true,
+        "replay_rng_restored": true,
+        "verdict": "PASS"
+      }
+    ]
+  },
+  "verdict": "PASS"
+}

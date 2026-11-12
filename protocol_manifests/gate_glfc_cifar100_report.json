@@ -1,0 +1,978 @@
+{
+  "dataset": "cifar100",
+  "manifest": "/root/autodl-tmp/users/ych/FedSMTA/protocol_manifests/cifar100_c5t5p15s20_seed42.json",
+  "increments": [
+    32,
+    26,
+    14,
+    16,
+    12
+  ],
+  "drops": 0,
+  "replay": "exemplar memory + proxy gradient-inversion rehearsal",
+  "numpy_lapack": "healthy",
+  "partA_informational_pass": true,
+  "partB_injection_pass": true,
+  "partC_seal_pass": true,
+  "PASS": true,
+  "rows": [
+    {
+      "item": "A1 official: 125 shared-dataset clients",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A2 official: churn adds task_size clients/task",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A3 official: partial participation (local_clients sample)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A4 official: uniform task_size head growth",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A5 official: 6-class random.sample partition in beforeTrain",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A6 official: raw-id interval eval [0, task_size*(t+1))",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A7 official: single shared global trainset",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "A8 native iCIFAR100.getTrainData semantics",
+      "pass": true,
+      "got": 1000,
+      "want": 1000
+    },
+    {
+      "item": "A8b native get_image_class(0) size",
+      "pass": true,
+      "got": 500,
+      "want": 500
+    },
+    {
+      "item": "A9 native network.Incremental_learning",
+      "pass": true,
+      "got": 20,
+      "want": 20
+    },
+    {
+      "item": "A10 native LeNet forward shape",
+      "pass": true,
+      "got": [
+        2,
+        100
+      ],
+      "want": [
+        2,
+        100
+      ]
+    },
+    {
+      "item": "B1 arrival increments",
+      "pass": true,
+      "got": [
+        32,
+        26,
+        14,
+        16,
+        12
+      ],
+      "want": [
+        32,
+        26,
+        14,
+        16,
+        12
+      ]
+    },
+    {
+      "item": "B2 cumulative head widths",
+      "pass": true,
+      "got": [
+        32,
+        58,
+        72,
+        88,
+        100
+      ],
+      "want": [
+        32,
+        58,
+        72,
+        88,
+        100
+      ]
+    },
+    {
+      "item": "B3 c0t0 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        858,
+        [
+          2,
+          5,
+          7
+        ]
+      ],
+      "want": [
+        858,
+        [
+          2,
+          5,
+          7
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t1 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        2227,
+        [
+          33,
+          35,
+          36
+        ]
+      ],
+      "want": [
+        2227,
+        [
+          33,
+          35,
+          36
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t2 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1325,
+        [
+          16,
+          20,
+          43
+        ]
+      ],
+      "want": [
+        1325,
+        [
+          16,
+          20,
+          43
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t3 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1503,
+        [
+          8,
+          18,
+          38
+        ]
+      ],
+      "want": [
+        1503,
+        [
+          8,
+          18,
+          38
+        ]
+      ]
+    },
+    {
+      "item": "B3 c0t4 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1352,
+        [
+          10,
+          24,
+          32
+        ]
+      ],
+      "want": [
+        1352,
+        [
+          10,
+          24,
+          32
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t0 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1717,
+        [
+          3,
+          15,
+          18
+        ]
+      ],
+      "want": [
+        1717,
+        [
+          3,
+          15,
+          18
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t1 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1080,
+        [
+          2,
+          10,
+          17
+        ]
+      ],
+      "want": [
+        1080,
+        [
+          2,
+          10,
+          17
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t2 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1407,
+        [
+          5,
+          7,
+          20
+        ]
+      ],
+      "want": [
+        1407,
+        [
+          5,
+          7,
+          20
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t3 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1635,
+        [
+          8,
+          41,
+          48
+        ]
+      ],
+      "want": [
+        1635,
+        [
+          8,
+          41,
+          48
+        ]
+      ]
+    },
+    {
+      "item": "B3 c1t4 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1110,
+        [
+          16,
+          30,
+          40
+        ]
+      ],
+      "want": [
+        1110,
+        [
+          16,
+          30,
+          40
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t0 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1592,
+        [
+          6,
+          8,
+          10
+        ]
+      ],
+      "want": [
+        1592,
+        [
+          6,
+          8,
+          10
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t1 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1194,
+        [
+          5,
+          16,
+          34
+        ]
+      ],
+      "want": [
+        1194,
+        [
+          5,
+          16,
+          34
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t2 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1286,
+        [
+          15,
+          20,
+          24
+        ]
+      ],
+      "want": [
+        1286,
+        [
+          15,
+          20,
+          24
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t3 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1425,
+        [
+          3,
+          30,
+          41
+        ]
+      ],
+      "want": [
+        1425,
+        [
+          3,
+          30,
+          41
+        ]
+      ]
+    },
+    {
+      "item": "B3 c2t4 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1523,
+        [
+          2,
+          7,
+          50
+        ]
+      ],
+      "want": [
+        1523,
+        [
+          2,
+          7,
+          50
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t0 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1708,
+        [
+          0,
+          2,
+          8
+        ]
+      ],
+      "want": [
+        1708,
+        [
+          0,
+          2,
+          8
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t1 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1653,
+        [
+          10,
+          32,
+          39
+        ]
+      ],
+      "want": [
+        1653,
+        [
+          10,
+          32,
+          39
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t2 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        960,
+        [
+          15,
+          18,
+          25
+        ]
+      ],
+      "want": [
+        960,
+        [
+          15,
+          18,
+          25
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t3 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1553,
+        [
+          3,
+          5,
+          20
+        ]
+      ],
+      "want": [
+        1553,
+        [
+          3,
+          5,
+          20
+        ]
+      ]
+    },
+    {
+      "item": "B3 c3t4 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1134,
+        [
+          7,
+          17,
+          24
+        ]
+      ],
+      "want": [
+        1134,
+        [
+          7,
+          17,
+          24
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t0 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1878,
+        [
+          1,
+          2,
+          4
+        ]
+      ],
+      "want": [
+        1878,
+        [
+          1,
+          2,
+          4
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t1 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1218,
+        [
+          3,
+          7,
+          32
+        ]
+      ],
+      "want": [
+        1218,
+        [
+          3,
+          7,
+          32
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t2 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1393,
+        [
+          5,
+          17,
+          41
+        ]
+      ],
+      "want": [
+        1393,
+        [
+          5,
+          17,
+          41
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t3 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1122,
+        [
+          8,
+          18,
+          38
+        ]
+      ],
+      "want": [
+        1122,
+        [
+          8,
+          18,
+          38
+        ]
+      ]
+    },
+    {
+      "item": "B3 c4t4 train labels/size (manifest space)",
+      "pass": true,
+      "got": [
+        1091,
+        [
+          10,
+          15,
+          16
+        ]
+      ],
+      "want": [
+        1091,
+        [
+          10,
+          15,
+          16
+        ]
+      ]
+    },
+    {
+      "item": "B3c zero-sample omissions == expected starved set",
+      "pass": true,
+      "got": {
+        "c0t4": [
+          3
+        ],
+        "c2t3": [
+          18
+        ]
+      },
+      "want": {
+        "c0t4": [
+          3
+        ],
+        "c2t3": [
+          18
+        ]
+      }
+    },
+    {
+      "item": "B4 exemplar replay concatenation order",
+      "pass": true,
+      "got": 2,
+      "want": 2
+    },
+    {
+      "item": "B5 per-(client,class) ownership == manifest",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B6 eval pool after task 0",
+      "pass": true,
+      "got": 2560,
+      "want": 2560
+    },
+    {
+      "item": "B6 eval pool after task 1",
+      "pass": true,
+      "got": 4640,
+      "want": 4640
+    },
+    {
+      "item": "B6 eval pool after task 2",
+      "pass": true,
+      "got": 5760,
+      "want": 5760
+    },
+    {
+      "item": "B6 eval pool after task 3",
+      "pass": true,
+      "got": 7040,
+      "want": 7040
+    },
+    {
+      "item": "B6 eval pool after task 4",
+      "pass": true,
+      "got": 8000,
+      "want": 8000
+    },
+    {
+      "item": "B7 boundary c0k0",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c0k1",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c0k2",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c0k3",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c0k4",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c1k0",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c1k1",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c1k2",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c1k3",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c1k4",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c2k0",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c2k1",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c2k2",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c2k3",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c2k4",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c3k0",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c3k1",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c3k2",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c3k3",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c3k4",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c4k0",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c4k1",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c4k2",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c4k3",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B7 boundary c4k4",
+      "pass": true,
+      "got": 640,
+      "want": 640
+    },
+    {
+      "item": "B8 patched beforeTrain task 0",
+      "pass": true,
+      "got": 32,
+      "want": 32
+    },
+    {
+      "item": "B9 patched beforeTrain task 1 advance",
+      "pass": true,
+      "got": 58,
+      "want": 58
+    },
+    {
+      "item": "B10 train LR hardcode parameterized",
+      "pass": true,
+      "got": "<GLFC_model.train manifest patch>",
+      "want": "<GLFC_model.train manifest patch>"
+    },
+    {
+      "item": "B11 patched fl_main source markers",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B12 proxyServer.reconstruction nb_classes patched",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "B12b proxyServer.reconstruction C' cpu reroute",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1 fl_main 125-client anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1b fl_main churn anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1c fl_main participation anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1d fl_main task_size growth anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1e fl_main training_log anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C1f fl_main shared-dataset anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C2 GLFC.py ep_g*20 hardcode x3",
+      "pass": true,
+      "got": 3,
+      "want": 3
+    },
+    {
+      "item": "C2b GLFC.py beforeTrain random.sample anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C3 ProxyServer (1,100) anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C3b ProxyServer range(100) anchor",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C3c ProxyServer device anchors (C' seal)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C4 iCIFAR100.py untouched (getTrainData)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C4b iCIFAR100.py untouched (getTestData)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C4c iCIFAR100.py untouched (get_image_class)",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C5 Fed_utils.py model_global_eval untouched",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C6 numpy LAPACK self-test status recorded",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    },
+    {
+      "item": "C7 cv2 stub importable + fail-loud",
+      "pass": true,
+      "got": 1,
+      "want": 1
+    }
+  ]
+}
