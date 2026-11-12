@@ -111,116 +111,20 @@ def get_args_parser(subparsers):
                                  '存档见 git 历史)')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
-    # A5-v2 refit 机制（2026-10-28，预注册 RUNCOMMANDS §23；
-    # F1 head_dropout 消融与 F4 巩固臂已随判死方向清理删除）
-    subparsers.add_argument('--head_refit', action='store_true',
-                            help='A5-v2 F2 (default OFF = official, bit-identical): '
-                                 'post-phase-2 readout-only refit of the current '
-                                 'task head every round. Feature cache = the '
-                                 'task train split under the CURRENT interface '
-                                 'state (no_grad, shuffle=False); retrain a '
-                                 'Chead-shaped readout (masked CE, Adam 1e-3/wd '
-                                 '1e-4/100 epochs/batch 64, deterministic local '
-                                 'seed); replace heads[task_id] storage. RNG-neutral '
-                                 '(four-stream snapshot/restore): representation-side '
-                                 'trajectory (prompt/key/anchor/joint head) stays '
-                                 'bit-identical to the official run; the joint-head '
-                                 'trajectory is preserved separately (_a5_joint_head) '
-                                 'and restored before the next phase-2. See '
-                                 'RUNCOMMANDS.md Sec.23.')
-    subparsers.add_argument('--head_standardize', action='store_true',
-                            help='A5-v2 F3 (default OFF): standardize the refit '
-                                 'input with train-split mean/std (StandardizedChead, '
-                                 'mu/sd stored as buffers). Fail-closed: requires '
-                                 '--head_refit.')
-    subparsers.add_argument('--refit_input', default='x1', choices=['x1', 'feat'],
-                            help='A5-v2 Sec.23.6-1 verdict switch (default x1 = current '
-                                 'behavior, bit-identical): the input fed to the '
-                                 'refit/consolidation readout. x1 = the native 1536-d '
-                                 'anchor-concat interface; feat = the 768-d pre-anchor '
-                                 'z_op (vit output). Probe-verified on ImageNet-R '
-                                 '(2026-10-29): the anchor half of x1 costs ~1.2pp '
-                                 '(top-1 hard routing picks wrong anchors) and the '
-                                 'cifar-tuned recipe overfits it on ~1k-row clients. '
-                                 'feat heads are DEPLOYED as 1536-input modules with '
-                                 'the anchor-half weights hard-zeroed (x1[:, :768] IS '
-                                 'z_op), so evaluate/checkpoint/resume paths are '
-                                 'unchanged. Fail-closed: requires --head_refit.')
-    subparsers.add_argument('--refit_timing', default='local',
-                            choices=['local', 'post_broadcast'],
-                            help='A5-v2 Sec.28 criterion arm (default local = '
-                                 'current M2\' behavior, bit-identical): WHEN the '
-                                 'readout refit runs. local = end of train(), on '
-                                 'the local post-phase-2 (pre-broadcast) interface '
-                                 'state; post_broadcast = inside the broadcast '
-                                 'path (get_global_proto_and_head), on the '
-                                 'post-broadcast state (fused prompt already '
-                                 'loaded into vit) -- the same feature stream '
-                                 'evaluation/deployment uses, closing the ~2pp '
-                                 'train-eval feature-timing gap attributed by the '
-                                 'Sec.27.7-1 ladder probe. Orthogonal to '
-                                 '--refit_input/--head_standardize; checkpoint '
-                                 'schema unchanged. Fail-closed: requires '
-                                 '--head_refit. See RUNCOMMANDS.md Sec.28.')
-    # §33 CTRP v1 -- Calibrated Temporal Residual Prompt (pre-registered
-    # RUNCOMMANDS Sec.33, 2026-11-03; GPT-frozen 9-point verdict).
-    # off = frozen legacy path, bit-identical to the pre-CTRPTA HEAD.
-    # The four matched arms (endpoint / fixed_alpha / ctrp_val /
-    # ctrp_train) ALL run on the identical deterministic nested split
-    # 56% core-train / 14% current-task val / 30% untouched test
-    # (seed a5_stable_seed(seed, client, task)); `off` keeps the legacy
-    # 70/30 path and is NOT a matched CTRP baseline.
-    subparsers.add_argument('--ctrp_mode', default='off', type=str,
-                            choices=['off', 'endpoint', 'fixed_alpha',
-                                     'ctrp_val', 'ctrp_train'],
-                            help='CTRP temporal prompt calibration mode. '
-                                 'off = exact legacy path (default; no '
-                                 'nested split, no calibration, checkpoint '
-                                 'schema unchanged). endpoint = matched '
-                                 'protocol with alpha=1 (matched-split '
-                                 'endpoint control; premise failures are '
-                                 'logged but do not stop the run). '
-                                 'fixed_alpha = matched protocol with the '
-                                 'fixed alpha from --ctrp_alpha. ctrp_val = '
-                                 'primary selector (alpha chosen by pooled '
-                                 'current-task VAL CE, Probe-H tie-breaks). '
-                                 'ctrp_train = secondary selector contrast '
-                                 '(alpha chosen by pooled core-train CE). '
-                                 'Fail-closed: incompatible with '
-                                 '--refit_timing post_broadcast '
-                                 '(CTRP_V1_UNSUPPORTED_REFIT_TIMING).')
-    subparsers.add_argument('--ctrp_alpha', default=None, type=float,
-                            help='the fixed alpha for --ctrp_mode '
-                                 'fixed_alpha (required and only valid in '
-                                 'that mode; must lie in [0, 1])')
-    subparsers.add_argument('--ctrp_alpha_grid', default='0.0,0.05,0.1,'
-                            '0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,'
-                            '0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95,1.0',
-                            type=str,
-                            help='ascending unique alpha grid in [0,1]; '
-                                 'must contain 1.0 (the natural endpoint '
-                                 'reference arm). Default = the Probe-H '
-                                 'lambda grid (21 points, 0.05 step)')
-    subparsers.add_argument('--ctrp_val_frac', default=0.20, type=float,
-                            help='fraction of the inner 70%% train assigned '
-                                 'to the current-task-only validation split '
-                                 '(deterministic class-stratified, seed '
-                                 'a5_stable_seed(seed, client, task); must '
-                                 'lie strictly within (0, 1))')
     # §34.2 0b -- BSAB_PAIR_CAPTURE (pre-registered RUNCOMMANDS Sec.34.2;
     # user APPROVED FOR IMPLEMENTATION 2026-11-04, instrumentation-only):
     # pre/post-broadcast feature-pair cache for the B0 birth test.
     # Default OFF = completely bit-identical no-op. The capture run is
-    # FROZEN as M2'-matched (--refit_timing local; fail-closed otherwise):
-    # the in-run deployed head IS the M2' birth head, so B0 cleanly asks
-    # whether a coordinate bridge can substitute for the M2'' post-
-    # broadcast refit. Scope: capture ONLY (per-row z_ref/z_op pre+post,
-    # prompt/head/row-index hashes, full-row train+test cache, RNG-neutral
-    # diagnostic forward, independent bsab_capture/ output dir). No BSAB
-    # module, no head/loss/prompt/optimizer/broadcast changes -- BSAB
-    # architecture implementation stays FROZEN until the true birth-pair
-    # B0 verdict. Labels are cached for offline accuracy evaluation only
-    # and never enter bridge fitting. See RUNCOMMANDS.md Sec.34.2.
+    # FROZEN as M2'-matched: the in-run deployed head IS the M2' birth
+    # head, so B0 cleanly asks whether a coordinate bridge can substitute
+    # for the M2'' post-broadcast refit. Scope: capture ONLY (per-row
+    # z_ref/z_op pre+post, prompt/head/row-index hashes, full-row
+    # train+test cache, RNG-neutral diagnostic forward, independent
+    # bsab_capture/ output dir). No BSAB module, no head/loss/prompt/
+    # optimizer/broadcast changes -- BSAB architecture implementation
+    # stays FROZEN until the true birth-pair B0 verdict. Labels are cached
+    # for offline accuracy evaluation only and never enter bridge fitting.
+    # See RUNCOMMANDS.md Sec.34.2.
     subparsers.add_argument('--bsab_pair_capture', action='store_true',
                             help='Sec.34.2 0b instrumentation-only pre/post-'
                                  'broadcast pair capture (default OFF = '
@@ -233,10 +137,8 @@ def get_args_parser(subparsers):
                                  'sample-index sequence for both halves). '
                                  'Four-stream RNG snapshot/restore + mode '
                                  'restore: capture OFF vs ON trajectories '
-                                 'must be bitwise identical. Fail-closed '
-                                 'with --refit_timing post_broadcast '
-                                 '(capture run = M2\'-matched, '
-                                 'BSAB_CAPTURE_UNSUPPORTED_REFIT_TIMING). '
+                                 'must be bitwise identical. The capture '
+                                 'run is M2\'-matched. '
                                  'Outputs to <run_dir>/bsab_capture/.')
     # §34.4/§34.4a B1 DSAR sidecar (frozen 2026-11-06, SHARED_PATH_
     # CONFIRMED): client-local per-broadcast r8 readout adapters.
@@ -249,7 +151,7 @@ def get_args_parser(subparsers):
     # completely bit-identical no-op (official path untouched). Zero
     # added FL payload: sidecar state never enters fed_avg / server
     # state transfer; checkpoints gain a dsar_sidecar key on ON runs
-    # only. Fail-closed with --head_refit / --ctrp_mode != off.
+    # only. B1 is pre-registered on the plain fedta baseline.
     subparsers.add_argument('--dsar', action='store_true',
                             help='Sec.34.4/34.4a B1 DSAR readout sidecar '
                                  '(default OFF = bit-identical). Per prompt '

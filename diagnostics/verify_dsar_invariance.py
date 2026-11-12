@@ -66,7 +66,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from diag_utils import load_args_from_run_dir, resolve_checkpoint  # noqa: E402
-from Models.ctrp import hash_prompt_module  # noqa: E402
+from Models.state_hashes import hash_prompt_module  # noqa: E402
 from Models.DSAR import DSARSidecar  # noqa: E402
 
 FEAT_DIM = 768
@@ -106,7 +106,7 @@ def hash_module_state(module):
 
 
 def rng_snapshot(client):
-    return client._a5_rng_snapshot()
+    return client._rng_snapshot()
 
 
 def rng_equal(a, b):
@@ -220,7 +220,7 @@ def test_identity_neutrality(client, report):
         rng1 = rng_snapshot(client)
         acc_on, cap_on = run_eval_with_capture(client, k, nb)
         # rewind to the SAME RNG point; detach the sidecar (OFF arm)
-        client._a5_rng_restore(rng1)
+        client._rng_restore(rng1)
         saved = client._dsar_sidecar
         client._dsar_sidecar = None
         acc_off, cap_off = run_eval_with_capture(client, k, nb)
@@ -277,7 +277,7 @@ def test_dispatch_wiring(client, report):
             rng = rng_snapshot(client)
             client._dsar_sidecar = sidecar
             _, cap_on = run_eval_with_capture(client, task, nb)
-            client._a5_rng_restore(rng)
+            client._rng_restore(rng)
             client._dsar_sidecar = None
             _, cap_off = run_eval_with_capture(client, task, nb)
             return cap_on, cap_off
@@ -325,7 +325,7 @@ def test_dispatch_wiring(client, report):
             rng = rng_snapshot(client)
             client._dsar_sidecar = syn_bL
             _, cap_cur_on = run_eval_with_capture(client, t_cur, nb)
-            client._a5_rng_restore(rng)
+            client._rng_restore(rng)
             client._dsar_sidecar = None
             _, cap_cur_off = run_eval_with_capture(client, t_cur, nb)
             cur_moved = any(not torch.equal(a[1], b[1])

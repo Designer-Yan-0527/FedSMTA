@@ -31,11 +31,12 @@ class Chead(torch.nn.Module):
 
 
 class StandardizedChead(torch.nn.Module):
-    """A5-v2 F3（--head_standardize）refit 头：train-split 标准化输入 +
-    Chead 形状 MLP。mu/sd 作为 persistent buffer 随 state_dict 存取，
-    resume 时按 keys（mean/std + head.*）与 Chead 区分（rebuild_client_head）。
-    forward 语义与 Chead 完全同构（输入 1536 维 x1，输出 label_num logits），
-    因此可无缝进入 Tail_Anchor.load_head / evaluate 路径。"""
+    """标准化输入 + Chead 形状 MLP（判死 A5-v2 方向遗留结构，保留仅为
+    兼容旧 checkpoint 的 rebuild_client_head 路径）。mu/sd 作为 persistent
+    buffer 随 state_dict 存取，resume 时按 keys（mean/std + head.*）与
+    Chead 区分（rebuild_client_head）。forward 语义与 Chead 完全同构
+    （输入 1536 维 x1，输出 label_num logits），因此可无缝进入
+    Tail_Anchor.load_head / evaluate 路径。"""
 
     def __init__(self, label_num, mean, std, hidden=512, dropout=0.1):
         super().__init__()

@@ -91,5 +91,5 @@ python main.py datasets_delay \
 - **正在跑的 `inr_b1_dsar_on`（CIFAR 配方）**：pull 新代码后不要 resume 它——r8 L 因子在 INR 新配方下形状校验 fail-closed 拒绝（防串配方）。让它一口气跑完，作"CIFAR 配方在 INR"的对照证据。
 - **INR baseline 可省**：`inr_bsab_capture_baseline_p40`（izfree 已跑完）的 capture 是 instrumentation-only、训练与 baseline 逐位一致，可直接充当 INR 基线臂；`inr_base_p40` 仅在想统一 run 命名时才需要跑。
 - **磁盘**：checkpoint 约 350MB+/轮，紧张时加 `--save_every 5 --keep_last 2`。
-- 对照冻结配方发车：不要叠加 `--skip_fed_avg_head` / `--route_fix` / `--bsab_pair_capture` 等开关。
+- 对照冻结配方发车：不要叠加 `--bsab_pair_capture` 等插桩开关。
 - 产物：`output/{data_name}/fedta/{run_name}/seed_42/metrics/accuracy_matrix.csv`（R[t][k] 矩阵）与 `summary_metrics.csv`（AA / Forgetting / BWT）。

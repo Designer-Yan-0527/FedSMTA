@@ -7,8 +7,9 @@ which went stale every time build_server grew a new parameter. The fix
 backfills EVERY current-parser key missing from the old args.json with
 the parser's parsed default; this test pins that semantics so the next
 new switch cannot reintroduce the crash. (Historical example keys
-route_fix / skip_fed_avg_head were removed from the parser with their
-dead directions; the generic mechanism is era-agnostic and stays.)
+route_fix / skip_fed_avg_head and the A5-v2 refit / CTRP families were
+removed from the parser with their dead directions; the generic
+mechanism is era-agnostic and stays.)
 """
 import json
 import os
@@ -26,17 +27,18 @@ class TestDiagUtilsOldRunCompat(unittest.TestCase):
 
     def test_current_parser_defaults_cover_new_switches(self):
         d = _current_parser_defaults()
-        for key in ("head_refit", "head_standardize", "refit_input",
-                    "refit_timing", "method"):
+        for key in ("bsab_pair_capture", "dsar", "dsar_identity",
+                    "a2_arm", "method"):
             self.assertIn(key, d)
         # every post-hoc switch defaults to OFF = official behavior, so
         # replaying an old run stays faithful
-        self.assertFalse(d["head_refit"])
-        self.assertFalse(d["head_standardize"])
-        self.assertEqual(d["refit_timing"], "local")
+        self.assertFalse(d["bsab_pair_capture"])
+        self.assertFalse(d["dsar"])
+        self.assertFalse(d["dsar_identity"])
+        self.assertEqual(d["a2_arm"], "off")
 
     def test_old_args_json_gets_backfilled(self):
-        # an args.json from BEFORE --head_refit existed
+        # an args.json from BEFORE --dsar existed
         old = {"data_name": "cifar100", "seed": 42, "client_num": 5,
                "resume": "auto", "max_rounds": 1, "data_path": "x"}
         with tempfile.TemporaryDirectory() as td:
@@ -45,7 +47,7 @@ class TestDiagUtilsOldRunCompat(unittest.TestCase):
                 json.dump(old, f)
             args = load_args_from_run_dir(td)
         # missing keys: current parser defaults
-        self.assertEqual(args.head_refit, False)
+        self.assertEqual(args.dsar, False)
         self.assertFalse(hasattr(args, "nope_not_a_real_key"))
         # present keys: NOT overwritten
         self.assertEqual(args.seed, 42)

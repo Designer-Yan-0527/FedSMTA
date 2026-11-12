@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Models.Client_DF import Client_DF  # noqa: E402
 from Models.classification_head import Chead  # noqa: E402
-from Models.ctrp import hash_prompt_module  # noqa: E402
+from Models.state_hashes import hash_prompt_module  # noqa: E402
 
 _DEVICE = 'cpu'
 _FEAT_DIM = 4
@@ -89,9 +89,7 @@ def _make_client(capture=False, capture_dir=None, seed=123,
                  n_train=20, n_test=6, task_id=0, legacy_args=False):
     kwargs = dict(nb_classes=20, seed=seed)
     if not legacy_args:
-        kwargs.update(bsab_pair_capture=capture,
-                      refit_timing='local', refit_input='feat',
-                      head_refit=True)
+        kwargs.update(bsab_pair_capture=capture)
         if capture_dir is not None:
             kwargs['bsab_capture_dir'] = str(capture_dir)
     args = types.SimpleNamespace(**kwargs)
