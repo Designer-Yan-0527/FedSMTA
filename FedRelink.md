@@ -1,174 +1,204 @@
-# FedRelink —— 项目工作记录（A2 + L + B）
+# FedRelink —— 项目解释文档（A2 + L + B）
 
-> 记录生成于 2026-11-12。只收录与最终方案 **A2 + L + B**（FedRelink）直接相关的工作，包括支撑它的探针链。
-> 判死方向（route_fix / PGC / PSC / M5 / DHT / A5 / 多模态主线等）与外部对比基线（FedProTIP / HePCo / GLFC / Powder / FedMGP / C²Prompt）的详细档案不在本记录，见 RUNCOMMANDS.md 各节与 git 历史。
-> 方法名沿革：载体为官方 FedTA（CVPR 2025）→ 项目方法初名 `fedta_a2`/`fedta` → 2026-11-12 更名 **`fedRelink`**（四臂矩阵 = base / `--a2_arm key` / `--dsar` / 组合臂）。
+> 本文解释 FedRelink 方法的设计原理与公式：要解决什么问题、为什么是这三个模块、每个模块的数学形式与工程语义，以及支撑这套设计的实验证据。载体为官方 FedTA（CVPR 2025）代码库。
+> 运行命令见 RUN.md，外部对比基线见 RUN_BASELINES.md。
 
 ---
 
-## 1. 一句话方案
+## 1. 背景：载体与路由接口
 
-联邦持续学习（FCL）中 prompt-based 方法的表观遗忘，主体不是知识擦除，而是**路由接口跨世代失配**（A1 实验可恢复占比 86.4%）。我们将失配分解为三个独立损伤源，给出最小干预的三模块组合：
+FedTA 是 prompt-based 联邦持续学习（Federated Continual Learning, FCL）方法：服务器维护全局 prompt 池、原型池与分类头；多个客户端各自在**私有的持续任务流**上本地训练，通过 BGPS（原型贪心相似度选择/修复）与 SIKF（知识蒸馏融合 prompt）做聚合，分类头用 FedAvg 聚合后广播。
 
-| 模块 | 损伤源 | 作用层 | 时机 | 保险 |
-|---|---|---|---|---|
-| **A2**（训练侧保护） | key/anchor 支撑槽位被新任务训练冲刷 | 训练侧参数保护 | 任务起点定保护集 + step 级回写 | 默认 off = 基线逐位一致 |
-| **B**（DSAR 广播坐标桥） | server prompt 融合致 z⁺ 漂移（历史任务共享广播态） | 读出侧 | 每轮广播边界 per-client fresh-fit | paired-MSE identity guard |
-| **L**（DSAR 读出适配器） | 当前特征 ↔ 出生/联训头失配 | 读出侧 | 同上，冻结头 CE 训练 | worst-cell 有界（无 CE guard，证据见 §4.4） |
+其推理的核心是 **Tail_Anchor 路由接口**：特征 z ∈ R^768 与 prompt 池的 key 做归一化相似度路由，取 top-1 槽位：
 
-全部零回放、零联邦通信增量（sidecar ≈ 102 KiB/客户端）、训练轨迹逐位中立（G1–G4 硬门）、最坏情况退化为 baseline。
+```
+sim(z) = z̄ · K̄ᵀ          （z̄, K̄ 为 L2 归一化后的特征与 key 矩阵）
+slot(z) = argmax_i sim(z)_i
+```
 
-## 2. 基线纪律（一切干预的地基）
+分类头（per-task Chead）的输入不是裸特征，而是 **[特征 || 被路由命中的 anchor 原型]**。也就是说，分类决策同时依赖三样东西：特征 z、key 路由结果、anchor 原型池——三者的"几何耦合"构成了每个任务世代的**接口**。
 
-- **Phase 0 三门全部 bit-exact PASS** 后冻结为只读科学基线（git tag `phase0-fedta-baseline`）：
-  - **0A** 官方 FedTA 逐位 parity（D=0，global_epoch=5 / threshold=0.25）；
-  - **0B** resume 等价（checkpoint+续训 ≡ 连续训练，含 outer_split_manifest 逐位校验）；
-  - **0C** 观察者不变性（插桩 ON/OFF 轨迹逐位一致）。
-- 方法学承诺：后续一切干预与官方基线**逐位对账**，差异只允许出现在声明过的位置。
-- 划分真值冻结入库：`protocol_manifests/{cifar100_c5t5p15s20, inr_c5t5p40s5}_seed42.json`。
+**关键观察**：任务流推进时，新任务的训练会更新 key / anchor / prompt（哪怕 backbone 冻结）。旧任务的样本再到来时，走的是**已经位移的接口**——即使 backbone 里存的知识完好，读出也可能错位。
 
-## 3. 核心发现：接口遗忘（interface-mismatch forgetting）
+## 2. 问题：接口遗忘（interface-mismatch forgetting）
 
-seed 42 表观遗忘 F=18.89pp，三个异常签名：retention 多处 >100%、遗忘事件驱动非单调（task 2 崩塌后自发恢复）、TKR 作者口径复算（96.5/98.5/96.2%）与表观值割裂。
+基准现象（CIFAR-100, 5 客户端 × 5 任务, seed 42）：表观遗忘 F = 18.89pp，但有三个"不擦除"的异常签名：
 
-**A1 干预实验**（`a1_snapshot_eval`：推理时把旧任务特征换回出生世代 key/anchor）逐任务分解 F = 接口可恢复 + 残余：
+1. retention 多处 > 100%（知识没丢，某些任务后期反而更准）；
+2. 遗忘事件驱动、非单调（task 2 崩塌后又自发恢复）；
+3. TKR（作者口径的知识保持率）复算高达 96%+，与表观遗忘割裂。
 
-| 任务 | 总遗忘 | 接口可恢复 | 占比 |
+**A1 干预实验**（决定性证据）：推理时把旧任务的特征**换回其出生世代的 key/anchor 接口**重评，逐任务把总遗忘分解为"接口可恢复 + 残余"：
+
+| 任务 | 总遗忘 F | 接口可恢复 | 占比 |
 |---|---|---|---|
 | T0 | 8.59 | 7.39 | 86% |
 | T1 | 25.17 | 22.75 | 90% |
-| T2 | 20.22 | 13.38 | 66%（残余最大 = 事件任务 anchor 污染） |
+| T2 | 20.22 | 13.38 | 66% |
 | T3 | 21.57 | 21.81 | 101% |
 | **均值** | **18.89** | **16.33** | **86.4%** |
 
-多 seed 稳健性（三 seed）：对角线 93.8±0.3、F 11.1±6.8、AA 85.1±5.7——波动全部来自旧任务保持。
+即：**表观遗忘的主体（86.4%）不是知识擦除，而是路由接口跨世代失配**。三个 seed 的多 seed 稳健性确认波动全部来自旧任务保持（对角线 93.8±0.3，F 11.1±6.8）。
+
+## 3. 方案总览：三误差源 → 三模块
+
+把接口失配按**发生时机**分解为三个相互独立的损伤源，每个源配一个最小干预模块：
+
+| 模块 | 损伤源 | 时机 | 作用层 | 标签需求 | 通信增量 | 保险 |
+|---|---|---|---|---|---|---|
+| **A2** | 旧任务支撑槽位被新任务训练冲刷 | 训练期 | 参数保护 | 0（旧任务特征回访，不进损失） | 0 | 默认 off = 基线逐位一致 |
+| **B**（DSAR 桥） | server prompt 融合致广播特征 z⁺ 漂移 | 每轮广播边界 | 读出侧坐标桥 | 0（无标签） | 0（client-local） | paired-MSE identity guard |
+| **L**（DSAR 适配器） | 当前特征 ↔ 联训头读出失配 | 部署态 | 读出侧低秩残差 | 当前任务 train 标签 | 0 | worst-cell 有界 |
+
+共同性质：**零回放、零联邦通信增量（sidecar ≈ 102 KiB/客户端）、训练轨迹逐位中立**（G1–G4 硬门保证任何模块在声明位置之外与基线逐位一致）、最坏情况退化为 baseline（每个模块都有独立的 identity 短路）。
 
 ## 4. A2：训练侧接口保护
 
-### 4.1 发现与定位链（探针）
+### 4.1 机制定位（为什么保护 key）
 
-1. **compatibility_drift 2×2**（新旧 key/anchor 交叉换装）：确认损伤来自接口世代差。
-2. **D0 `verify_slot_binding`**：槽位-类绑定是涌现的（路由纯相似度、无显式类绑定）→ 归因前必须先验证绑定。
-3. **D1 v2 `collision_exposure_diagnostic`**（固定效应回归 + `analyze_landing_spots` 落点分析）：未来流量碰撞、槽位劫持、落点去向、路由不稳定、key 直接因果**五条直觉损伤路径全部判死**；唯一存活通道 = anchor 位移（FE rho=+0.259, p=0.001）→ 机制修正为 emergent interface sharing。
-4. **A2 预注册四臂干预（决定性）**：干预推翻相关性归因——**key 单冻臂**才是有效通道：
-   - F 18.89 → **7.11**（削减 63%）、AA 78.62 → **87.09**（+8.5pp）、可塑性代价仅 0.6pp；
-   - anchor 臂有害（F 恶化 5.5pp，破坏 key-anchor 共适应）；both 与 key 打平但多付可塑性；
-   - A1 上界 91.67，A2 捕获其 68%；残余 = prompt 漂移（→ 由 B/L 接手）+ c4 路由碰撞。
+归因链（每个结论都有预注册探针支撑）：
 
-### 4.2 机制（frozen Phase-4 spec，commit f527ab7）
+1. **2×2 换装实验**（新旧 key/anchor 交叉组合评估）：损伤确实来自接口世代差；
+2. **D0 槽位绑定探针**：槽位-类绑定是**涌现的**（路由纯相似度，无显式绑定）——归因前必须先验证绑定；
+3. **D1 固定效应回归**：流量碰撞、槽位劫持、落点去向、路由不稳定、key 直接因果五条直觉路径**全部判死**，唯一存活通道是接口共享损伤；
+4. **预注册四臂干预**（决定性）：key 单冻臂 F 18.89 → **7.11**（削减 63%）、AA 78.62 → **87.09**；anchor 单冻臂反而**有害**（破坏 key-anchor 共适应）；both 不优于 key。干预推翻了相关性诊断中的 anchor 假说——**key 才是真因**，且干预最小的臂最强，机制证明最干净。
 
-- 任务起点：RNG 中立特征回访，已完成任务 train 特征经**当前 key** top-1 路由命中的槽位取并集 = 保护集（D0 涌现支撑）。
-- 训练期：每个 phase-2 optimizer step 后回写保护槽位（freeze + weight-decay 豁免；≡ freeze + wd 豁免，不改官方优化器与损失）。
+### 4.2 保护集与回写（公式）
 
-### 4.3 工程封印与沿革
+任务 t 开始时（RNG 中立，逐位复刻官方特征提取流）：
 
-- checkpoint 携带 `a2_state`；resume fail-closed（arm 不匹配即 RuntimeError）；开关门 `--a2_arm {off,key,anchor,both}`，默认 off = 与基线逐位一致；与 `--dsar` 正交组合。
-- 沿革：11-02 大清理中旧 `--method fedta_a2` 方法线入判死档案（laziness check 否决）；**11-08 从 f37590d^ 恢复 frozen Phase-4 规格并改为开关门实现**（开关语义、可与 DSAR 组合）。新四臂矩阵是 A2 的现役证据载体，不复用 10 月旧四臂数字。
+```
+P_t = ⋃_{t' < t} { slot_{K_t}(z) : z ∈ D^{train}_{t'} }        （D0 涌现支撑集）
+```
 
-## 5. DSAR = B + L：读出侧修复
+即：把**所有已完成任务**的 train 特征过一遍**当前 key** K_t，取 top-1 命中槽位的并集作为保护集 P_t。
 
-### 5.1 发现链（探针）
+训练期：每个 phase-2 optimizer step 之后回写保护槽位（**post-step restore**，语义上 ≡ freeze + weight-decay 豁免）：
 
-1. **读出侧 headroom 确认**：M2' 头重训 CIFAR +2.36pp（corrected 93.07）；**oracle headroom probe**（`probe_oracle_headroom.py`）上界 96.21（CIFAR）/ 84.82（INR）——一大块遗忘不动 backbone 即可拿回。
-2. **损伤时点定位**（§27.7 归因阶梯探针）：2pp 头滞后真凶 = 训练-评估特征时点错位（**HEAD-LAG**）→ §28 post-broadcast refit 判据臂落地结论。
-3. **机制链推进**（Probe-G `probe_prompt_content_drift` + Probe-H `probe_prompt_step_calibration`，CIFAR+INR 双数据集判决）：同槽 prompt 内容漂移与时间步校准的机制解剖，直接引出 BSAB 立项（Broadcast-State Alignment Bridge）。
-4. **birth pair 可测量化**（§34.2 **`BSAB_PAIR_CAPTURE`** instrumentation-only 插桩，2026-11-04 实现并单测）：每广播边界缓存同行 (z⁻, z⁺) 配对 + prompt/head/row-index 哈希 + 全行 train/test 缓存；四流 RNG 快照/恢复；OFF = 逐位 no-op，capture run ≡ baseline 的环 2 identity gate 验证（M2'-matched 冻结口径）。INR 的 `inr_bsab_capture_baseline_p40`（izfree）已跑完，兼作 INR 基线臂证据（instrumentation-only、与 baseline 逐位一致）。
-5. **B_pre aging probe**（`probe_bsab_feasibility.py`，只读 M2' artifacts）：跨任务累积漂移被免标签坐标桥大幅可迁移（32/37 valid cell ρ_age≥0.5）→ 免标签桥先验成立。
-6. **B0 birth probe（决定性）**：125 cell 四臂离线判决 **GREEN**——ρ_birth mean=1.006 / pooled=1.018；identity 94.83 / **bridge 96.64** / 参照 z⁻ 97.24 / M2'' 96.57；免标签桥恢复量达到监督重训参照水平；20/125 cell GCV 自动选 identity = 安全阀有效。
-7. **B1 rank 冻结**：r8（~1% 参数）= 87% 修复量，r64 仅 +0.03pp → **冻结 r8**。
+```
+θ[P_t] ← θ_snap[P_t]        （每个 optimizer.step() 后）
+```
 
-### 5.2 机制（冻结规格 §34.4/§34.4a）
+不改官方优化器、不改训练损失、旧任务数据不进任何前向/反向——只是把"新任务训练会无意冲刷的旧支撑槽位"在每步后还原。
 
-- **B_t 广播桥**：每轮每客户端 fresh-fit `B(z)=z+ΔAz+b`（残差 ridge，λ=N·s·γ*；SVD 截断 r8 + 截断后 bias 重算 b₈）；无标签 identity guard：80% 拟合 → 20% 校准 paired-MSE，桥不赢则严格 B=I。
-- **L_t 读出适配器**：rank-8 残差参数化，冻结头 CE 训练（100ep/bs64/Adam/lr1e-3/wd1e-4）。
-- **部署图**：当前任务 `ŷ_t = TA_t(L(B(z⁺_op)))`；历史任务 `ŷ_k = TA_k(B(z⁺_op))`（B-only，禁 L）。训练前向不经 B/L。
-- **γ\* 冻结**：CIFAR 0.396419（含 §34.4c train/test 行集勘误，四项一致性检查闭环，125 cell 判决零翻转）。
+### 4.3 工程语义
 
-### 5.3 INR 支线：数据集条件配方（§34.5–34.7）
+- 开关门 `--a2_arm {off,key,anchor,both}`，**默认 off = 与基线逐位一致**；
+- checkpoint 携带 `a2_state`；resume 时 arm 不匹配直接 RuntimeError（fail-closed）；
+- 与 `--dsar` 正交组合（A2 动训练侧参数、DSAR 动读出侧，作用集与时机无交）。
 
-- B0-lite 在 INR 判 **RED**：修复率 28% vs CIFAR 82%；机制 = 位移小 32% + 头钝感 30% + 高秩谱（eff_rank 343）+ 欠定（n_fit≈510 < d=768）。
-- Stage 0/1 救援三轮离线证据（全部 baseline 联训头 = 论文口径）：
-  1. 方案网格：**L8_zp_no +2.361 te-pooled 全场第一**；B24 +1.13~1.16 过门；无 guard min-norm 灾难（−5.5~−8.3）→ 修的正是读出失配；
-  2. **guard 反相关分解**：Q2 CE guard 拒绝的 16% cell 真实增益 ≈ +11.5pp——guard 恰好杀最大赢面（CE 惩罚自信错误，identity 穿失配头输出低置信垃圾 CE 反而不高）→ **L 无 guard 部署**，改用 worst-cell 安全证据（L16_zp_no min=−1.20、p5=−0.56，有界温和）；
-  3. **历史行探针**：B8_inr 唯一全距离为正——rank 交互在历史行反转（低秩外推稳）→ **B 保 r8**。
-- **INR 冻结配方 `dsar-inr-v1`**：γ\*=2.0579118185313345（provenance 6cd83d9）、L rank 16、B rank 8、L 无 guard、dispatch 与 CIFAR 完全同构——论文叙事 = 同一框架、两个数据集参数。配方由 `--data_name` 自动分派，CIFAR 臂 sidecar meta `recipe: "dsar-b1-cifar"`，INR 臂 `"dsar-inr-v1"`（防串配方 fail-closed）。
+## 5. DSAR：读出侧修复（B 桥 + L 适配器）
 
-### 5.4 在线验证现状（四项 GREEN 门：ΔAA≥+0.50 ∧ G_old≥+0.25 ∧ ΔF≤+0.25 ∧ minΔ_k≥−1.00）
+### 5.1 问题结构：z⁻ → z⁺ 漂移
 
-| 数据集 | ΔAA | G_old | ΔF | minΔ_k | 判决 |
-|---|---|---|---|---|---|
-| CIFAR（cifar_b1_dsar_on） | +2.19 ✓ | ✓ | +1.60 ✗ | −1.56 ✗ | 2/4 |
-| INR（inr_dsar_v1） | +1.02 ✓ | +0.525 ✓ | +2.56 ✗ | −0.68 ✓ | 3/4 |
+记 z⁻ 为任务头**出生/联训时**所适应的特征坐标，z⁺ 为**当前广播态**下同一批样本的特征。server 的 SIKF prompt 融合会使全体客户端的特征发生系统性位移（z⁻ → z⁺），而历史任务的分类头 TA_k 仍停留在旧坐标。归因阶梯探针显示当前任务也有约 +2.36pp 的"头滞后"（HEAD-LAG：训练结束与评估时点的特征不同）——所以**当前任务与历史任务都需要读出侧修复**，只是形态不同。
 
-- INR 对角线均值 +3.18（T3 出生 +5.31）、末行旧任务全部为正、每客户端 4 正 1 微负。
-- 两处 ΔF 红门同构 = **峰值抬升伪影**（forgetting 是"从峰值跌落"的相对量，对角线被抬高后机械变大；绝对值上旧任务无退化）——处置待终审（metric critique 进 discussion 或换 retention 口径）。
+出生配对插桩（`--bsab_pair_capture`，instrumentation-only）把每轮广播边界的同行 (z⁻, z⁺) 配对缓存下来，使漂移可离线测量；B0 判决性探针证明：一个**免标签**的坐标桥几乎能完全修复该损伤（ρ_birth ≈ 1.0，桥修复 96.64 vs 监督重训参照 96.57 vs identity 94.83）。
 
-## 6. 判死名单（design space falsification，A2+L+B 的反面证据链）
+### 5.2 B：免标签广播坐标桥
 
-| 竞争方案 | 判死证据（全部预注册封板） |
+每轮每客户端 fresh-fit 残差形式的仿射桥：
+
+```
+B(z) = (I + ΔA) z + b          ≈ 把 z⁺ 拉回 z⁻ 坐标
+```
+
+**拟合**（残差 ridge，无标签）：给定配对行 (z⁺_i, z⁻_i)，中心化后解
+
+```
+(XᵀX + λI) ΔA = Xᶜᵀ (Yᶜ − Xᶜ),      X = centered z⁺,  Y = centered z⁻
+λ = N · s · γ*,    s = tr(XᵀX) / (N·d)
+```
+
+**低秩截断**：ΔA 经 SVD 截断到 rank-8（~1% 参数，达到 87% 修复量；r64 仅 +0.03pp），截断后**在截断算子下重算偏置**：
+
+```
+ΔA₈ = M₁ M₂ᵀ      （SVD top-8 因子）
+b₈  = μ_y − μ_x (I + ΔA₈)      （不是全秩解的截断，是截断后重解）
+```
+
+**identity guard（安全阀，无标签）**：train 行按确定性 sample-index hash 80/20 分为拟合/校准半。**被裁决对象 = 实际部署的 r8 截断候选**（而非全秩解——全秩可能赢 MSE 而截断后输），在 20% 校准行上做 paired-MSE 比较：
+
+```
+MSE_cal(B₈) ≥ MSE_cal(I)  ⟹  B = I   （平局归 identity）
+MSE_cal(B₈) <  MSE_cal(I)  ⟹  在全部 train 行重拟合一次 → 再截断 r8 → 部署
+```
+
+测试行/任何标签永远不进入该决策。低样本保护：拟合行 < 32 或校准行 < 8 → 直接 identity（LOW_POWER_IDENTITY）。
+
+### 5.3 L：当前任务读出适配器
+
+当前任务的联训头与"广播后 + 桥修复后"的特征之间仍有读出失配，用低秩残差适配器补上：
+
+```
+L(z) = z + (z V) Uᵀ + b          U ∈ R^{768×r}, V ∈ R^{768×r}
+```
+
+初始化 U ~ randn·0.01、V = 0、b = 0 ⟹ **epoch 0 精确等于 identity**（训练只会从安全点出发）。
+
+**训练配方**（冻结）：在出生侧 z⁻ 行 + 当前任务 train 标签上，通过**冻结的当前任务头**（TA_t，eval 语义、dropout OFF、class-masked logits）做 masked CE 训练 L；Adam（非 AdamW）lr 1e-3、wd 1e-4、100 epochs、bs 64、无早停、无 val/test 选择。
+
+**无 CE guard 的证据**（INR 探针的反直觉发现）：如果给 L 也加"CE 不赢就回 identity"的 guard，guard 拒绝的恰恰是赢面最大的 cell（被拒 16% cell 的真实增益 ≈ +11.5pp——CE 惩罚自信错误，而 identity 穿失配头输出的低置信垃圾 CE 反而不高，guard 呈**反选择性**）。故生产配方**L 无 guard**，安全性改由 worst-cell 证据承担（L16 min = −1.20、p5 = −0.56，有界温和）。
+
+### 5.4 部署图与不可变语义
+
+```
+当前任务 k = t ：  ŷ_t = TA_t( L( B(z⁺_op) ) )
+历史任务 k < t ：  ŷ_k = TA_k( B(z⁺_op) )        （B-only，禁 L）
+```
+
+修正后的特征同时喂给 **key-anchor 路由和 Chead 特征半边**（Chead 输入 = [修正 z ‖ 修正 z 路由到的 anchor]），路由落点允许自然改变。四条冻结语义：
+
+1. B 插在 model 前向之前 → 路由与读出都看到修正后的 z；
+2. 历史任务只用 B（L 用了旧任务不曾见过的当前任务标签，属信息越权）；
+3. 头选择仍是原 heads[k] + 原 key 路由 + class mask（不改官方评估语义）；
+4. B 的 identity 与 L 的 identity **各自独立短路**（B=I 的 sidecar 仍可对当前任务应用 L）。
+
+训练前向**从不经过** B/L——两个适配器只活在评估路径上，训练轨迹与基线逐位一致。
+
+### 5.5 数据集条件配方
+
+同一框架、两个数据集参数，由 `--data_name` 自动分派（配方串用 fail-closed 拒绝）：
+
+| 常数 | CIFAR-100（dsar-b1-cifar） | ImageNet-R（dsar-inr-v1） | 依据 |
+|---|---|---|---|
+| γ* | 0.396419 | 2.0579118 | CIFAR 含 train/test 行集勘误闭环；INR 漂移谱高秩、行集欠定，需更强正则 |
+| rank_B | 8 | 8 | INR 历史行探针：r8 是唯一"全距离为正"的配置（r24 当前行最优但历史行为负——低秩外推更稳） |
+| rank_L | 8 | 16 | INR 上 r16 与 r8 均值几乎持平，但尾部显著更安全（worst cell −1.20 vs −2.36） |
+| L guard | 无 | 无 | guard 反选择性证据（§5.3） |
+
+## 6. 设计依据：系统性排除（design space falsification）
+
+A2 + L + B 之外的竞争方向全部经过预注册判据实验后判死，构成反面证据链：
+
+| 竞争方案 | 判死证据 |
 |---|---|
 | route_fix（修 key 几何） | E2 几何全绿但准确率不回升——修复几何 ≠ 修复分数 |
 | PGC（原型几何先验） | 边界损失主体在头侧（HEAD-LAG +2.0~2.1pp） |
-| 融合候选 A/B（改广播） | ΔA=−0.35pp、ΔB≡0——广播是稳定器，旧行侵蚀数学上不存在 |
+| 改广播融合 | ΔA=−0.35pp、ΔB≡0——广播是稳定器，旧行侵蚀数学上不存在 |
 | PSC（prompt 子空间巩固） | 8/8 全负 + laziness 否决 |
-| M5（边界巩固臂） | 收益 0.5–1.2pp + replay 档位代价 |
+| M5（边界巩固臂） | 收益 0.5–1.2pp，但需付 replay 档位代价 |
 | DHT（历史头迁移） | 可行性探针判死 |
-| A5（共享语义接口/标准化头） | Gate A-2 后判死，11-12 随清理删除（`StandardizedChead` 分支） |
 
-DSAR 胜出性质：① label-free（B 无标签，L 仅当前任务 train 标签）；② 零 FL 通信；③ 轨迹逐位中立（G1–G4，38/38 断言）；④ identity guard 安全阀；⑤ 低秩便宜；⑥ 直接命中已测 z⁻→z⁺ 损伤（ρ≈1 因果支撑）。
+DSAR 胜出的结构性理由：① label-free（B 无标签，L 仅当前任务 train 标签）；② 零 FL 通信（B/L 全 client-local）；③ 轨迹逐位中立（G1–G4，38/38 断言）；④ identity guard 安全阀；⑤ 低秩便宜；⑥ 直接命中已测的 z⁻→z⁺ 损伤（ρ≈1 因果支撑）。
 
-## 7. 探针/插桩清单（仅 A2+L+B 相关）
+## 7. 实验协议与验证现状
 
-| 工具 | 性质 | 判决/用途 |
-|---|---|---|
-| `diagnostics/extract_features.py` | 只读，复刻训练 RNG 流 | z_ref/z_op 特征提取（一切下游探针的输入） |
-| `diagnostics/compatibility_drift.py` | 离线 2×2 换装 | 损伤来自接口世代差（§4.1-1） |
-| `diagnostics/analyze_class_retention.py` | 4 组合 per-class 分解 | 类保持通道分解（发现链辅助） |
-| `diagnostics/verify_tkr.py` | 零 GPU 复算 | TKR 作者口径与表观遗忘割裂（§3 签名三） |
-| `diagnostics/verify_slot_binding.py`（D0） | 零训练 | 槽位-类绑定 = 涌现，非显式 |
-| `diagnostics/collision_exposure_diagnostic.py`（D1 v2） | 零前向固定效应 | 五直觉路径判死，anchor 通道唯一存活 |
-| `diagnostics/analyze_landing_spots.py` | 离线落点 | D1 归因辅助 |
-| `diagnostics/a1_snapshot_eval.py` | 只读重评 | A1 干预：接口遗忘 86.4%（§3） |
-| `diagnostics/probe_oracle_headroom.py`（A5 Gate A-2） | 只读探针 | 读出侧上界 96.21/84.82（DSAR headroom 依据） |
-| §27.7 归因阶梯探针 | 预注册判据臂 | HEAD-LAG 定位（§5.1-2） |
-| `--bsab_pair_capture`（§34.2 hook） | instrumentation-only 插桩 | birth pair 可测量化；OFF=逐位 no-op；capture≡baseline（环 2 gate） |
-| `diagnostics/probe_bsab_feasibility.py`（B_pre） | 只读 M2' artifacts | aging probe：漂移可迁移 32/37 cell |
-| B0 birth probe（离线四臂） | 只读 capture 产物 | 判决 GREEN：免标签桥 ≈ 监督重训参照（§5.1-6） |
-| INR Stage 0/1 离线网格 + guard 反相关分解 + 历史行探针 | 只读 | dsar-inr-v1 配方三要素的证据（§5.3） |
-| Probe-G / Probe-H（`probe_prompt_content_drift` / `probe_prompt_step_calibration`） | 探针级诊断 | prompt 漂移机制解剖 → BSAB 立项前置（§5.1-3） |
-| `evaluate_with_margin` margin stats | observer-only | 评估期观察，不进正式口径 |
+**四臂矩阵**（超加性由组合臂检验）：base / `--a2_arm key` / `--dsar` / `--a2_arm key --dsar`，CIFAR-100 与 ImageNet-R 各一套（命令见 RUN.md）。
 
-其余探针（probe_routing_flip / probe_dht_feasibility / probe_boundary_attribution / PSC 短程判据臂 / Track E-B2 等）均服务于已判死方向，档案在 RUNCOMMANDS.md §21/§25–§30，不在本记录范围。
+**评估口径**：AA（平均准确率）、Forgetting、BWT、R[t][k] 矩阵，产物为 `accuracy_matrix.csv` + `summary_metrics.csv`。
 
-## 8. 工程与验证纪律
+**在线验证现状**（DSAR 臂 vs baseline，四项 GREEN 门：ΔAA≥+0.50 ∧ G_old≥+0.25 ∧ ΔF≤+0.25 ∧ minΔ_k≥−1.00）：
 
-- **RunManager 四层产物树**：`output/{data}/{method}/{run_name}/seed_{seed}/`（args.json / command.txt / git_commit.txt / logs / checkpoints / metrics）；诊断产物按产出脚本归档 `diagnostics_output/`。
-- **checkpoint 一致性**：`data_split_indices` 记录 70/30 划分；outer_split_manifest 逐位校验；RNG 状态最后恢复；原子写；resume `--resume auto`。
-- **逐位中立性 gates**：G1–G4（38/38 断言）覆盖 A2/DSAR/capture 的默认与部署路径；每模块带单测（tests/：Gate 0A/0B/0C、A2/A1 回归、bsab_pair_capture、diag_utils_compat、global_head_rebuild、oracle_headroom_probe 等 29 项 CPU 单测）。
-- **fail-closed 纪律**：resume arm 不匹配、配方串用、strict load 失败等一律 RuntimeError 拒绝，不允许静默兼容。
-- **预注册纪律**：判据先于数据冻结；一切判读按预注册门执行，修订留审计痕迹。
+| 数据集 | ΔAA | G_old | ΔF | minΔ_k | 判决 |
+|---|---|---|---|---|---|
+| CIFAR-100 | +2.19 ✓ | ✓ | +1.60 ✗ | −1.56 ✗ | 2/4 |
+| ImageNet-R | +1.02 ✓ | +0.525 ✓ | +2.56 ✗ | −0.68 ✓ | 3/4 |
 
-## 9. 命名重构与清理（2026-11-12，commit a89bb7d）
+两处 ΔF 红门同构，本质是**峰值抬升伪影**：forgetting 是"从峰值跌落"的相对量，对角线（新任务出生精度）被 DSAR 抬高后机械变大；绝对值上旧任务无退化。A2 与 A2+DSAR 臂为论文最终判据，待发车。
 
-- `--method` 与输出树 `fedta` → **`fedRelink`**；`--model_name` 收敛 `['Tail_Anchor']`；21 个 timm 连字符旗标统一下划线（`--data_path` 等，旧拼写 argparse 拒绝）；`vision_transformer__l2p.py` → `vision_transformer_l2p.py`。
-- 删除 A5 死分支（`StandardizedChead` + rebuild 兼容路径，简化为 strict load fail-closed）与死代码文件。
-- 双仓库推送：新仓 **FedRelink**（github.com/Designer-Yan-0527/FedRelink）+ 原仓 FedSMTA 同步。
-- 验证：import / 29 项单测 / argparse 行为 / GPU base 冒烟 round 0 完整跑通（融合→广播→checkpoint，无 Traceback）；resume 冒烟验证到 checkpoint 加载 + test loader 重建 + round 1 启动。
+**中立性验证纪律**：一切模块默认关闭 = 与基线逐位一致（Gate 0C 观察者不变性）；一切干预与官方 FedTA 基线逐位对账（Gate 0A 官方 parity、0B resume 等价）；判据先于数据冻结（预注册）；一切不兼容（resume arm 不匹配、配方串用、strict load 失败）一律 fail-closed。
 
-## 10. 当前状态与剩余工作
+## 8. 一页总结
 
-**四臂矩阵进度**（正式口径 = 命令在 RUN.md）：
-
-| 臂 | CIFAR-100 | ImageNet-R |
-|---|---|---|
-| baseline | ✓ | ✓（capture baseline 兼作） |
-| A2（--a2_arm key） | 待发车 | 待发车（izfree） |
-| DSAR（--dsar） | ✓ 2/4 门 | ✓ 3/4 门 |
-| A2+DSAR | 待发车 | 待发车（izfree） |
-
-剩余：
-1. 双数据集 A2、A2+DSAR 四格发车（检验超加性，A2 论文最终判据）；
-2. ΔF 峰值抬升伪影的措辞终审（metric critique / retention 口径）；
-3. B1 verdict 工具（四项门 JSON + §34.4d 登记）。
-
-部署：izfree 手册见 SETUP_IZFREE.md；外部对比基线见 RUN_BASELINES.md（另行执行，不在本记录）。
+FedRelink 的主张：prompt-based FCL 的遗忘主体是**接口失配而非知识擦除**（86.4% 可由换回出生接口恢复）。据此做三件最小干预的事：训练期保护旧任务的 key 支撑槽位（A2，post-step restore），部署期用免标签低秩坐标桥修复广播漂移（B，r8 残差 ridge + identity guard），再用低秩读出适配器补当前任务的联训头失配（L，identity 初始化 + 无 guard）。三者零回放、零通信、逐位中立、最坏退化为 baseline——组合臂跑赢全部单臂即证超加性。
