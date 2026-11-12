@@ -18,7 +18,7 @@ seed42 protocol shape, 5 clients x 5 tasks, input_size=224).
 Model construction:
 
   fedl2p   : the main repo's own L2P-style ViT
-             (Models/vision_transformer__l2p.VisionTransformer -- the same
+             (Models/vision_transformer_l2p.VisionTransformer -- the same
              class main.py itself builds with prompt_pool=True). Official
              L2P CIFAR-100 structure hyperparameters
              (external_baselines/L2P/configs/cifar100_l2p.py,
@@ -391,8 +391,8 @@ def setup_model_registry(method):
     of the two modules may be imported per process. Returns the model
     source path (for logs / meta)."""
     if method == "fedl2p":
-        import Models.vision_transformer__l2p  # noqa: E402,F401
-        return "Models/vision_transformer__l2p.py"
+        import Models.vision_transformer_l2p  # noqa: E402,F401
+        return "Models/vision_transformer_l2p.py"
     # feddualp: borrow the official JH-LEE-KR DualPrompt model. Its
     # vision_transformer.py imports the top-level modules 'prompt' and
     # 'attention' from its own repo root, so the root goes onto sys.path

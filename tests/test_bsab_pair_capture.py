@@ -102,7 +102,7 @@ def _make_client(capture=False, capture_dir=None, seed=123,
     train_data = [TensorDataset(feats, labels)]
     torch.manual_seed(seed)
     client = Client_DF(_CLIENT_ID, _BsabOrig(), 'Tail_Anchor', 5,
-                       train_data, 1, 16, 0.01, _DEVICE, 'fedta',
+                       train_data, 1, 16, 0.01, _DEVICE, 'fedRelink',
                        class_mask, args, _BsabVit())
     client.task_id = task_id
     client.data_split_indices = {

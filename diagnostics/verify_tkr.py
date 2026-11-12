@@ -28,7 +28,7 @@ Calibers reported (both aggregations: ratio-of-means and mean-of-ratios):
 Plus the t=0 local/server gap = pure client-drift premium without forgetting.
 
 Usage (from repo root):
-  python diagnostics/verify_tkr.py --run_dir output/cifar100/fedta/<run>/seed_42
+  python diagnostics/verify_tkr.py --run_dir output/cifar100/fedRelink/<run>/seed_42
   python diagnostics/verify_tkr.py --train_log <path>/train_log.csv
 """
 

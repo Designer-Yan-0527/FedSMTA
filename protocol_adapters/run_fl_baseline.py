@@ -79,7 +79,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, Subset  # noqa: E402
 
-import Models.vision_transformer__l2p  # noqa: E402,F401 (registers vit_base_patch16_224)
+import Models.vision_transformer_l2p  # noqa: E402,F401 (registers vit_base_patch16_224)
 from timm.models import create_model  # noqa: E402
 from utils import build_transform  # noqa: E402
 

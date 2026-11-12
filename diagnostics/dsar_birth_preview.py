@@ -81,7 +81,7 @@ NPZ_NAME = re.compile(
 def parse_args():
     p = argparse.ArgumentParser("DSAR birth-semantics preview")
     p.add_argument("--run_dir", default=(
-        "output/cifar100/fedta/cifar_bsab_capture_M2matched/seed_42"))
+        "output/cifar100/fedRelink/cifar_bsab_capture_M2matched/seed_42"))
     p.add_argument("--rounds", default="all",
                    help="'all' 或逗号分隔的 round id，如 '0,5,7'")
     p.add_argument("--out_dir", default=None,

@@ -43,7 +43,7 @@ prompt, key_anchor, acc  (one row per class per combo).
 
 Usage (repo root, on the server):
   python diagnostics/analyze_class_retention.py \
-      --run_dir output/cifar100/fedta/<run>/seed_42 \
+      --run_dir output/cifar100/fedRelink/<run>/seed_42 \
       --old_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth \
       --new_ckpt checkpoints/task_04_end.pth \
       --out_csv diagnostics_output/class_retention_4combo.csv

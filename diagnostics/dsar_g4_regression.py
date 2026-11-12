@@ -69,7 +69,7 @@ G1 写盘纪律：唯一持久写盘点 = verdict JSON（默认
 
 用法（GPU 机器上、repo 根目录）：
   python diagnostics/dsar_g4_regression.py \
-      --data_name cifar100 --data-path ./local_datasets \
+      --data_name cifar100 --data_path ./local_datasets \
       --rounds 3 --split_at 2 --global_epoch 2 --task_num 2 \
       --local_epoch 2 --device cuda
 
@@ -111,7 +111,7 @@ def parse_args():
     p = argparse.ArgumentParser("G4 DSAR training-level regression")
     p.add_argument("--data_name", default="cifar100",
                    choices=["cifar100", "ImageNet-R"])
-    p.add_argument("--data-path", "--data_path", dest="data_path",
+    p.add_argument("--data_path", dest="data_path",
                    default="./local_datasets")
     p.add_argument("--rounds", default=0, type=int,
                    help="total rounds N (0 = global_epoch + 1: crosses the "
@@ -129,7 +129,7 @@ def parse_args():
                    help="0 = dataset protocol default (cifar100: 15, "
                         "ImageNet-R: 40 -- official §5.1, mandatory)")
     p.add_argument("--work_dir", default="output/regression", type=Path)
-    p.add_argument("--method", default="fedta")
+    p.add_argument("--method", default="fedRelink")
     p.add_argument("--skip_real", action="store_true",
                    help="run only the G4-A identity arms (verdict scope "
                         "G4_IDENTITY, not sufficient for B1 unlock)")
@@ -558,7 +558,7 @@ def main():
 
     private_class_num = (args.private_class_num if args.private_class_num > 0
                          else (40 if args.data_name == "ImageNet-R" else 15))
-    common = ["--data_name", args.data_name, "--data-path", args.data_path,
+    common = ["--data_name", args.data_name, "--data_path", args.data_path,
               "--seed", str(args.seed), "--device", args.device,
               "--private_class_num", str(private_class_num),
               "--global_epoch", str(args.global_epoch),

@@ -1,9 +1,7 @@
 import argparse
 
 def get_args_parser(subparsers):
-    # both dash and underscore spellings are accepted (the regression test
-    # scripts historically used the underscore form)
-    subparsers.add_argument('--batch-size', '--batch_size', dest='batch_size',
+    subparsers.add_argument('--batch_size', dest='batch_size',
                             default=16, type=int,
                             help='Batch size per device (SIKF distillation loader; '
                                  'local training stays at the official hardcoded 16)')
@@ -11,42 +9,42 @@ def get_args_parser(subparsers):
 
     # Model parameters
     subparsers.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
-    subparsers.add_argument('--input-size', default=224, type=int, help='images input size')
+    subparsers.add_argument('--input_size', default=224, type=int, help='images input size')
     subparsers.add_argument('--pretrained', default=True, help='Load pretrained model or not')
     subparsers.add_argument('--drop', type=float, default=0.0, metavar='PCT', help='Dropout rate (default: 0.)')
-    subparsers.add_argument('--drop-path', type=float, default=0.0, metavar='PCT', help='Drop path rate (default: 0.)')
+    subparsers.add_argument('--drop_path', type=float, default=0.0, metavar='PCT', help='Drop path rate (default: 0.)')
 
     # Optimizer parameters
     subparsers.add_argument('--opt', default='adam', type=str, metavar='OPTIMIZER', help='Optimizer (default: "adam"')
-    subparsers.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON', help='Optimizer Epsilon (default: 1e-8)')
-    subparsers.add_argument('--opt-betas', default=(0.9, 0.999), type=float, nargs='+', metavar='BETA', help='Optimizer Betas (default: (0.9, 0.999), use opt default)')
-    subparsers.add_argument('--clip-grad', type=float, default=1.0, metavar='NORM',  help='Clip gradient norm (default: None, no clipping)')
+    subparsers.add_argument('--opt_eps', default=1e-8, type=float, metavar='EPSILON', help='Optimizer Epsilon (default: 1e-8)')
+    subparsers.add_argument('--opt_betas', default=(0.9, 0.999), type=float, nargs='+', metavar='BETA', help='Optimizer Betas (default: (0.9, 0.999), use opt default)')
+    subparsers.add_argument('--clip_grad', type=float, default=1.0, metavar='NORM',  help='Clip gradient norm (default: None, no clipping)')
     subparsers.add_argument('--momentum', type=float, default=0.9, metavar='M', help='SGD momentum (default: 0.9)')
-    subparsers.add_argument('--weight-decay', type=float, default=0.0, help='weight decay (default: 0.0)')
+    subparsers.add_argument('--weight_decay', type=float, default=0.0, help='weight decay (default: 0.0)')
     subparsers.add_argument('--reinit_optimizer', type=bool, default=True, help='reinit optimizer (default: True)')
 
     # Learning rate schedule parameters
     subparsers.add_argument('--sched', default='constant', type=str, metavar='SCHEDULER', help='LR scheduler (default: "constant"')
     subparsers.add_argument('--lr', type=float, default=0.001, metavar='LR', help='learning rate (default: 0.03)')
-    subparsers.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct', help='learning rate noise on/off epoch percentages')
-    subparsers.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT', help='learning rate noise limit percent (default: 0.67)')
-    subparsers.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV', help='learning rate noise std-dev (default: 1.0)')
-    subparsers.add_argument('--warmup-lr', type=float, default=1e-6, metavar='LR', help='warmup learning rate (default: 1e-6)')
-    subparsers.add_argument('--min-lr', type=float, default=1e-5, metavar='LR', help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-    subparsers.add_argument('--decay-epochs', type=float, default=30, metavar='N', help='epoch interval to decay LR')
-    subparsers.add_argument('--warmup-epochs', type=int, default=5, metavar='N', help='epochs to warmup LR, if scheduler supports')
-    subparsers.add_argument('--cooldown-epochs', type=int, default=10, metavar='N', help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
-    subparsers.add_argument('--patience-epochs', type=int, default=10, metavar='N', help='patience epochs for Plateau LR scheduler (default: 10')
-    subparsers.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE', help='LR decay rate (default: 0.1)')
+    subparsers.add_argument('--lr_noise', type=float, nargs='+', default=None, metavar='pct, pct', help='learning rate noise on/off epoch percentages')
+    subparsers.add_argument('--lr_noise_pct', type=float, default=0.67, metavar='PERCENT', help='learning rate noise limit percent (default: 0.67)')
+    subparsers.add_argument('--lr_noise_std', type=float, default=1.0, metavar='STDDEV', help='learning rate noise std-dev (default: 1.0)')
+    subparsers.add_argument('--warmup_lr', type=float, default=1e-6, metavar='LR', help='warmup learning rate (default: 1e-6)')
+    subparsers.add_argument('--min_lr', type=float, default=1e-5, metavar='LR', help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+    subparsers.add_argument('--decay_epochs', type=float, default=30, metavar='N', help='epoch interval to decay LR')
+    subparsers.add_argument('--warmup_epochs', type=int, default=5, metavar='N', help='epochs to warmup LR, if scheduler supports')
+    subparsers.add_argument('--cooldown_epochs', type=int, default=10, metavar='N', help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
+    subparsers.add_argument('--patience_epochs', type=int, default=10, metavar='N', help='patience epochs for Plateau LR scheduler (default: 10')
+    subparsers.add_argument('--decay_rate', type=float, default=0.1, metavar='RATE', help='LR decay rate (default: 0.1)')
     subparsers.add_argument('--unscale_lr', type=bool, default=True, help='scaling lr by batch size (default: True)')
 
     # Augmentation parameters
-    subparsers.add_argument('--color-jitter', type=float, default=None, metavar='PCT', help='Color jitter factor (default: 0.3)')
+    subparsers.add_argument('--color_jitter', type=float, default=None, metavar='PCT', help='Color jitter factor (default: 0.3)')
     subparsers.add_argument('--aa', type=str, default=None, metavar='NAME',
                         help='Use AutoAugment policy. "v0" or "original". " + \
                              "(default: rand-m9-mstd0.5-inc1)'),
     subparsers.add_argument('--smoothing', type=float, default=0.1, help='Label smoothing (default: 0.1)')
-    subparsers.add_argument('--train-interpolation', type=str, default='bicubic',
+    subparsers.add_argument('--train_interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
 
     # * Random Erase params
@@ -55,9 +53,7 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--recount', type=int, default=1, help='Random erase count (default: 1)')
 
     # Data parameters
-    # both dash and underscore spellings are accepted (the regression test
-    # scripts historically used the underscore form)
-    subparsers.add_argument('--data-path', '--data_path', dest='data_path',
+    subparsers.add_argument('--data_path', dest='data_path',
                             default='./local_datasets', type=str,
                             help='dataset root path')
     subparsers.add_argument('--shuffle', default=False, help='shuffle the data order')
@@ -66,9 +62,9 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--seed', default=42, type=int)
     subparsers.add_argument('--eval', action='store_true', help='Perform evaluation only')
     subparsers.add_argument('--num_workers', default=2, type=int)
-    subparsers.add_argument('--pin-mem', action='store_true',
+    subparsers.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
-    subparsers.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
+    subparsers.add_argument('--no_pin_mem', action='store_false', dest='pin_mem',
                         help='')
     subparsers.set_defaults(pin_mem=True)
 
@@ -105,9 +101,10 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--print_freq', type=int, default=10, help = 'The frequency of printing')
 
     # Ours
-    subparsers.add_argument('--method', type=str, default='fedta', choices=['fedta'],
-                            help='fedta = frozen Phase-0 baseline (read-only). '
-                                 '(fedta_a2 及其 route_fix 家族已判死并删除，'
+    subparsers.add_argument('--method', type=str, default='fedRelink', choices=['fedRelink'],
+                            help='fedRelink = 本项目方法名（输出树的 method 目录）。'
+                                 '四臂矩阵由 --a2_arm / --dsar 开关组合；'
+                                 '(历史 fedta_a2 及其 route_fix 家族已判死并删除，'
                                  '存档见 git 历史)')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='the layer index of the E-Prompt')
@@ -151,7 +148,7 @@ def get_args_parser(subparsers):
     # completely bit-identical no-op (official path untouched). Zero
     # added FL payload: sidecar state never enters fed_avg / server
     # state transfer; checkpoints gain a dsar_sidecar key on ON runs
-    # only. B1 is pre-registered on the plain fedta baseline.
+    # only. B1 is pre-registered on the plain fedRelink baseline.
     subparsers.add_argument('--dsar', action='store_true',
                             help='Sec.34.4/34.4a B1 DSAR readout sidecar '
                                  '(default OFF = bit-identical). Per prompt '
@@ -205,7 +202,7 @@ def get_args_parser(subparsers):
                             help='BGPS fix threshold (was hardcoded to 0.25 before)')
     subparsers.add_argument('--data_name', default='cifar100', choices=['cifar100', 'ImageNet-R'], type=str,
                             help="dataset to train on (exact match, case sensitive)")
-    subparsers.add_argument('--model_name', default='Tail_Anchor', choices=['AlexNet', 'VGG16','ResNet18','SimpleCNN','Tail_Anchor'], type=str)
+    subparsers.add_argument('--model_name', default='Tail_Anchor', choices=['Tail_Anchor'], type=str)
 
     # Phase 0 runtime arguments (engineering only, no algorithm change)
     subparsers.add_argument('--run_name', default='', type=str,

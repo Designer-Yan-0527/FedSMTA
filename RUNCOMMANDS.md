@@ -3,7 +3,7 @@
 本项目只支持 `cifar100` 和 `ImageNet-R` 两个数据集，通过 `--data_name` 选择。
 所有参数定义在 `config/datasets_delay.py`，两个数据集共用同一套参数。
 
-> 参数名写法：`--data-path` / `--data_path`、`--batch-size` / `--batch_size` 两种拼写均被接受（argparse alias），推荐统一用连字符形式。
+> 参数名写法：统一用下划线形式（`--data_path`、`--batch_size` 等）。2026-11-12 命名重构：method 名由 `fedta` 改为 `fedRelink`（输出树同步），历史连字符旗标拼写已移除。
 
 ## 1. 基本调用格式
 
@@ -18,29 +18,29 @@ python main.py datasets_delay --data_name {cifar100|ImageNet-R} [其他参数]
 ```bash
 python main.py datasets_delay \
     --data_name cifar100 \
-    --data-path ./local_datasets \
+    --data_path ./local_datasets \
     --client_num 5 --task_num 5 --private_class_num 15 \
-    --global_epoch 5 --local_epoch 30 --batch-size 16 \
+    --global_epoch 5 --local_epoch 30 --batch_size 16 \
     --lr 0.001 --seed 42
 ```
 
-数据集准备：**本地导入，不联网下载**。`--data-path` 目录下需已存在 `cifar-100-python/`；缺失直接报错。
+数据集准备：**本地导入，不联网下载**。`--data_path` 目录下需已存在 `cifar-100-python/`；缺失直接报错。
 
 ## 3. 运行 ImageNet-R
 
 ```bash
 python main.py datasets_delay \
     --data_name ImageNet-R \
-    --data-path ./local_datasets \
+    --data_path ./local_datasets \
     --surrogate_num 5 \
     --client_num 5 --task_num 5 --private_class_num 40 \
-    --global_epoch 5 --local_epoch 30 --batch-size 16 \
+    --global_epoch 5 --local_epoch 30 --batch_size 16 \
     --lr 0.001 --seed 42
 ```
 
 > **协议要点（勿改）**：官方论文 §5.1 规定 ImageNet-R 为每客户端 40 私有类、0 公共类、每任务 8 类（P0 manifest 审计 2026-10-20 证实 200 类全部单客户端）。`--private_class_num 40` 是唯一正确取值；误用 15 会得到 125 公共类的错误协议（2026-10-14 误跑已判废）。
 
-数据集准备（本地导入）：`--data-path` 下需已存在 `imagenet-r/`（200 个类别目录）或 `imagenet-r.tar`；首次运行做一次性 80/20 划分（移动到 train/test 子目录后复用）。`--surrogate_num` 只对 cifar100 生效（INR 固定官方值 5）；本地训练 batch size 固定官方硬编码 16。
+数据集准备（本地导入）：`--data_path` 下需已存在 `imagenet-r/`（200 个类别目录）或 `imagenet-r.tar`；首次运行做一次性 80/20 划分（移动到 train/test 子目录后复用）。`--surrogate_num` 只对 cifar100 生效（INR 固定官方值 5）；本地训练 batch size 固定官方硬编码 16。
 
 ## 4. 常用参数速查
 
@@ -49,7 +49,8 @@ python main.py datasets_delay \
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--data_name` | `cifar100` | 数据集（区分大小写） |
-| `--data-path` | `./local_datasets` | 数据集根目录 |
+| `--data_path` | `./local_datasets` | 数据集根目录 |
+| `--method` | `fedRelink` | 方法名（输出树的 method 目录；历史值 `fedta` 已更名） |
 | `--output_dir` | `output/` | 训练产物根目录 |
 | `--client_num` / `--task_num` | 5 / 5 | 客户端 / 任务数 |
 | `--private_class_num` | 15 | 每客户端私有类数（INR 必须 40） |
@@ -82,7 +83,7 @@ python main.py datasets_delay --data_name cifar100 --run_name <原run_name> --re
 
 # 显式指定 checkpoint 路径
 python main.py datasets_delay --data_name cifar100 \
-    --resume output/cifar100/fedta/<run_name>/seed_42/checkpoints/task_02_end.pth
+    --resume output/cifar100/fedRelink/<run_name>/seed_42/checkpoints/task_02_end.pth
 ```
 
 checkpoint 在轮边界保存，恢复时 RNG 精确还原；关键参数校验不一致拒绝恢复。

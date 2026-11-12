@@ -67,25 +67,25 @@ local_datasets/
 ```bash
 # 每条命令在 repo 根目录执行；建议逐 dataset 排队
 nohup bash -c '
-python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+python main.py datasets_delay --data_name cifar100 --data_path ./local_datasets \
     --client_num 5 --task_num 5 --private_class_num 15 --global_epoch 5 --local_epoch 30 \
-    --batch-size 16 --lr 0.001 --seed 42 --run_name cifar_base_p15
-python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --batch_size 16 --lr 0.001 --seed 42 --run_name cifar_base_p15
+python main.py datasets_delay --data_name cifar100 --data_path ./local_datasets \
     --client_num 5 --task_num 5 --private_class_num 15 --global_epoch 5 --local_epoch 30 \
-    --batch-size 16 --lr 0.001 --seed 42 --a2_arm key --run_name cifar_a2_key_v2
-python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --batch_size 16 --lr 0.001 --seed 42 --a2_arm key --run_name cifar_a2_key_v2
+python main.py datasets_delay --data_name cifar100 --data_path ./local_datasets \
     --client_num 5 --task_num 5 --private_class_num 15 --global_epoch 5 --local_epoch 30 \
-    --batch-size 16 --lr 0.001 --seed 42 --dsar --run_name cifar_b1_dsar_on
-python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+    --batch_size 16 --lr 0.001 --seed 42 --dsar --run_name cifar_b1_dsar_on
+python main.py datasets_delay --data_name cifar100 --data_path ./local_datasets \
     --client_num 5 --task_num 5 --private_class_num 15 --global_epoch 5 --local_epoch 30 \
-    --batch-size 16 --lr 0.001 --seed 42 --a2_arm key --dsar --run_name cifar_a2_dsar_on
+    --batch_size 16 --lr 0.001 --seed 42 --a2_arm key --dsar --run_name cifar_a2_dsar_on
 ' > queue_cifar.log 2>&1 &
 ```
 
 INR 四条同理（加 `--surrogate_num 5 --private_class_num 40`，命令见 RUN.md）。
 
 发车自检（每条启动后，照 RUN.md「发车自检」）：
-1. `output/cifar100/fedta/<run>/seed_42/args.json` 旗标与臂一致；
+1. `output/cifar100/fedRelink/<run>/seed_42/args.json` 旗标与臂一致；
 2. 进任务 1 后 train.log 出现 `[A2] client X task 1 arm=key: protected ...`；
 3. DSAR 臂广播边界后 `b_status`/`l_status` 出现 `FITTED`；
 4. INR DSAR 臂 sidecar meta `recipe: "dsar-inr-v1"`（CIFAR 为 `"dsar-b1-cifar"`）。
@@ -112,12 +112,12 @@ INR 四条同理（加 `--surrogate_num 5 --private_class_num 40`，命令见 RU
 ## 8. 发车前冒烟（主方法，分钟级）
 
 ```bash
-python main.py datasets_delay --data_name cifar100 --data-path ./local_datasets \
+python main.py datasets_delay --data_name cifar100 --data_path ./local_datasets \
     --client_num 5 --task_num 5 --private_class_num 15 --global_epoch 5 --local_epoch 1 \
-    --batch-size 16 --lr 0.001 --seed 42 --max_rounds 1 --run_name izfree_smoke
+    --batch_size 16 --lr 0.001 --seed 42 --max_rounds 1 --run_name izfree_smoke
 ```
 
-自检：exit 0；`output/cifar100/fedta/izfree_smoke/seed_42/` 下 args.json / logs/train.log / checkpoints/latest.pth / metrics/ 齐全；train.log 无 traceback。
+自检：exit 0；`output/cifar100/fedRelink/izfree_smoke/seed_42/` 下 args.json / logs/train.log / checkpoints/latest.pth / metrics/ 齐全；train.log 无 traceback。
 
 ## 9. 产物位置与汇总
 

@@ -1,7 +1,7 @@
 """Unified metrics recorder for the external-baseline protocol adapters.
 
 Emits the SAME record schema and CSV layout as the main repo's RunManager
-(runtime_utils.py), so every method -- fedta/A2/A3 (main repo, RunManager)
+(runtime_utils.py), so every method -- fedRelink/A2/A3 (main repo, RunManager)
 and the external baselines (FedMGP, C2Prompt, ...) -- lands in one output
 tree and feeds one three-level (dataset / seed / task) aggregation:
 

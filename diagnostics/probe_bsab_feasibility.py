@@ -74,7 +74,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-RUN_DIR = REPO_ROOT / "output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42"
+RUN_DIR = REPO_ROOT / "output/cifar100/fedRelink/cifar_a5v2_M2_feat_full/seed_42"
 SNAP_DIR = REPO_ROOT / "diagnostics_output"
 OUT_DIR = SNAP_DIR / "bsab_pre"
 

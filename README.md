@@ -1,4 +1,6 @@
-# FedTA PyTorch Implementation
+# FedRelink PyTorch Implementation
+
+基于官方 FedTA (CVPR 2025) 的联邦持续学习方法实现。
 
 This repository contains PyTorch implementation code.
 
@@ -27,7 +29,7 @@ pretrained_cfg['file']='pretrain_model/ViT-B_16.npz'
 ```
 
 ## Data preparation
-If you already have CIFAR-100 or ImageNet-R, pass your dataset path to  `--data-path`.
+If you already have CIFAR-100 or ImageNet-R, pass your dataset path to  `--data_path`.
 
 
 The datasets aren't ready, change the download argument in `{dataset name}_subset_spliter.py` as follows
@@ -65,8 +67,8 @@ The config_file is 'datasets_delay' for both datasets. For example, the training
 python main.py \
        datasets_delay \   #config_file
        --model vit_base_patch16_224 \
-       --batch-size 4 \
-       --data-path local_datasets/ \
+       --batch_size 4 \
+       --data_path local_datasets/ \
        --output_dir ./output \
        --data_name cifar100
 ```

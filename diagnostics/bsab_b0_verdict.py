@@ -73,12 +73,12 @@ REFIT_BATCH = 64
 def parse_args():
     p = argparse.ArgumentParser("BSAB B0 verdict (pre-registered)")
     p.add_argument("--run_dir", default=(
-        "output/cifar100/fedta/cifar_bsab_capture_M2matched/seed_42"))
+        "output/cifar100/fedRelink/cifar_bsab_capture_M2matched/seed_42"))
     p.add_argument("--m2p_dir", default=(
-        "output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42"),
+        "output/cifar100/fedRelink/cifar_a5v2_M2_feat_full/seed_42"),
         help="官方 M2' run（refit_timing local，reproduction 锚①）")
     p.add_argument("--m2pb_dir", default=(
-        "output/cifar100/fedta/cifar_a5v2_M2pb_full/seed_42"),
+        "output/cifar100/fedRelink/cifar_a5v2_M2pb_full/seed_42"),
         help="官方 M2'' run（refit_timing post_broadcast，reproduction 锚④）")
     p.add_argument("--out_dir", default=None,
                    help="default: <run_dir>/bsab_b0")

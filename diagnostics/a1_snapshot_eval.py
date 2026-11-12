@@ -24,7 +24,7 @@ Outputs:
 
 Usage (from repo root, on the server):
   python diagnostics/a1_snapshot_eval.py \
-      --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+      --run_dir output/cifar100/fedRelink/<run_name>/seed_42 \
       --out_csv diagnostics_output/a1_snapshot_eval.csv
 """
 

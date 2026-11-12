@@ -16,7 +16,7 @@ from runtime_utils import RunManager
 from timm.models import create_model
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
-import Models.vision_transformer__l2p
+import Models.vision_transformer_l2p
 from data.iCIFAR100c import iCIFAR100c
 from data.imagenet_r_subset_spliter import ImagenetR_spliter
 
@@ -164,7 +164,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('FedTA training and evaluation configs')
+    parser = argparse.ArgumentParser('fedRelink training and evaluation configs')
 
     # single neutral entry point for both datasets; the dataset is
     # selected with --data_name (cifar100 / ImageNet-R)

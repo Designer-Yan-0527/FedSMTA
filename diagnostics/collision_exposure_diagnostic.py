@@ -30,7 +30,7 @@ Quantities per (client, old task t, class c):
 
 Usage (repo root, on the server; runs in ~1 min, no GPU forward):
   python diagnostics/collision_exposure_diagnostic.py \
-      --run_dir output/cifar100/fedta/<run>/seed_42 \
+      --run_dir output/cifar100/fedRelink/<run>/seed_42 \
       --task_ckpts checkpoints/task_00_end.pth,...,checkpoints/task_04_end.pth \
       --binding_csv diagnostics_output/slot_binding.csv \
       --binding_npz diagnostics_output/slot_binding_matrices.npz \

@@ -57,7 +57,7 @@ def parse_args():
     p.add_argument("--seed", default=42, type=int)
     p.add_argument("--device", default="cuda")
     p.add_argument("--work_dir", default="output/regression", type=Path)
-    p.add_argument("--method", default="fedta")
+    p.add_argument("--method", default="fedRelink")
     return p.parse_args()
 
 
@@ -280,7 +280,7 @@ def main():
     if args.split_at >= args.rounds:
         raise SystemExit("--split_at must be < --rounds")
 
-    base = ["--data_name", args.data_name, "--data-path", args.data_path,
+    base = ["--data_name", args.data_name, "--data_path", args.data_path,
             "--seed", str(args.seed), "--device", args.device,
             "--global_epoch", str(args.global_epoch),
             "--task_num", str(args.task_num),

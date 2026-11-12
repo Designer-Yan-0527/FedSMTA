@@ -33,7 +33,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-G1_DEFAULT = ("output/cifar100/fedta/cifar_base_p15/seed_42/"
+G1_DEFAULT = ("output/cifar100/fedRelink/cifar_base_p15/seed_42/"
               "dsar_g1_invariance.json")
 AUDIT_DEFAULT = REPO_ROOT / "diagnostics" / "dsar_task_dispatch_audit.json"
 

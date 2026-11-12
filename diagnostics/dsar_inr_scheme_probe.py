@@ -40,7 +40,7 @@ birth-head 读出 / 专用 torch.Generator（不碰全局 RNG）。CE/读出前�
 
 用法（izfree repo 根目录；CPU 可跑，--device cuda 更快）：
   python diagnostics/dsar_inr_scheme_probe.py \
-      --run_dir output/ImageNet-R/fedta/inr_bsab_capture_M2matched_p40/seed_42
+      --run_dir output/ImageNet-R/fedRelink/inr_bsab_capture_M2matched_p40/seed_42
   python diagnostics/dsar_inr_scheme_probe.py --run_dir ... --rounds 4,9   # 冒烟
   # 纯 B 网格细化（rank/γ sweep，分钟级）：
   python diagnostics/dsar_inr_scheme_probe.py --run_dir ... \
@@ -50,7 +50,7 @@ birth-head 读出 / 专用 torch.Generator（不碰全局 RNG）。CE/读出前�
   # baseline 联训头口径（论文部署口径，GPT 2026-11-07 裁决 1b 开放问题；
   # 2026-11-08 起协议门同时接受 M2' capture 与 baseline capture run）：
   python diagnostics/dsar_inr_scheme_probe.py \
-      --run_dir output/ImageNet-R/fedta/inr_bsab_capture_baseline_p40/seed_42 \
+      --run_dir output/ImageNet-R/fedRelink/inr_bsab_capture_baseline_p40/seed_42 \
       --device cuda \
       --b_ranks 8,16,24,32 \
       --b_gammas inr,cifar,gcv,lam0,0.4,0.8,2.06,4.0 \
@@ -93,7 +93,7 @@ L_WD = 1e-4
 def parse_args():
     p = argparse.ArgumentParser("INR scheme offline probe")
     p.add_argument("--run_dir", default=(
-        "output/ImageNet-R/fedta/inr_bsab_capture_M2matched_p40/seed_42"))
+        "output/ImageNet-R/fedRelink/inr_bsab_capture_M2matched_p40/seed_42"))
     p.add_argument("--out_dir", default=None,
                    help="default: <run_dir>/dsar_inr_probe")
     p.add_argument("--rounds", default="all",

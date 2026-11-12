@@ -32,8 +32,6 @@ import matplotlib.pyplot as plt
 
 import hashlib
 
-from Models.classification_head import StandardizedChead as _A5StandardizedChead
-
 from Models.state_hashes import hash_prompt_module, hash_tensor
 
 # §34.4/§34.4a B1 DSAR sidecar（冻结部署：当前任务 z⁺→B→L→TA_t、
@@ -51,32 +49,14 @@ BSAB_CAPTURE_BATCH = 16
 
 
 def rebuild_client_head(h_state, template):
-    """resume 时按 state keys 识别客户端头存储的结构并重建
-    （rebuild_global_head 的 heads 版先例，75ead14）：
-      * keys == template（官方 Chead）的 keys -> deepcopy(template) 装载；
-      * 含 mean/std buffer -> StandardizedChead（维度从 state 自证）；
-      * 其他 -> fail-closed 拒绝（截断/外来 keys 不允许静默误装载）。
+    """resume 时重建客户端头：keys 必须与 template（官方 Chead）完全一致，
+    deepcopy(template) 装载；截断/外来 keys 由 strict load_state_dict
+    fail-closed 拒绝（不允许静默误装载）。
+    （历史 StandardizedChead 分支已随 A5-v2 方向清理删除，存档见 git 历史。）
     """
-    keys = set(h_state.keys())
-    if keys == set(deepcopy(template).state_dict().keys()):
-        head = deepcopy(template)
-        head.load_state_dict(h_state)
-        return head
-    if "mean" in keys and "std" in keys:
-        in_features = h_state["mean"].shape[0]
-        out_features = h_state["head.3.weight"].shape[0]
-        dummy = _A5StandardizedChead(
-            out_features,
-            torch.zeros(in_features), torch.ones(in_features))
-        if keys == set(dummy.state_dict().keys()):
-            head = _A5StandardizedChead(
-                out_features,
-                torch.zeros(in_features), torch.ones(in_features))
-            head.load_state_dict(h_state)
-            return head
-    raise RuntimeError(
-        "unrecognized client head checkpoint structure: "
-        + str(sorted(keys)))
+    head = deepcopy(template)
+    head.load_state_dict(h_state)
+    return head
 
 
 class Client_DF(object):

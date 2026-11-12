@@ -77,7 +77,7 @@ CFULL_SEP = 1e-5            # c_full 与 b8 视为可分辨的阈值
 def parse_args():
     p = argparse.ArgumentParser("G2 DSAR numerical signoff")
     p.add_argument("--run_dir", default=(
-        "output/cifar100/fedta/cifar_bsab_capture_M2matched/seed_42"))
+        "output/cifar100/fedRelink/cifar_bsab_capture_M2matched/seed_42"))
     p.add_argument("--out_json", default=None,
                    help="default: <run_dir>/bsab_b0/dsar_g2_signoff.json")
     return p.parse_args()

@@ -54,7 +54,7 @@ code is written:
 Usage (repo root, user tmux):
 
   python diagnostics/probe_boundary_attribution.py \
-      --run_dir output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42 \
+      --run_dir output/cifar100/fedRelink/cifar_a5v2_M2_feat_full/seed_42 \
       --checkpoints task_00_end.pth,task_01_end.pth,task_02_end.pth,task_03_end.pth,task_04_end.pth \
       --out_csv diagnostics_output/boundary_probe/cifar_attribution.csv \
       --summary_json diagnostics_output/boundary_probe/cifar_attribution.json --device cuda

@@ -31,7 +31,7 @@ restored in finally; empty results raise.
 
 Usage (repo root, on the server):
   python diagnostics/verify_slot_binding.py \
-      --run_dir output/cifar100/fedta/<run>/seed_42 \
+      --run_dir output/cifar100/fedRelink/<run>/seed_42 \
       --task_ckpts checkpoints/task_00_end.pth,checkpoints/task_01_end.pth,checkpoints/task_02_end.pth,checkpoints/task_03_end.pth,checkpoints/task_04_end.pth \
       --out_csv diagnostics_output/slot_binding.csv \
       --out_matrix_npz diagnostics_output/slot_binding_matrices.npz \

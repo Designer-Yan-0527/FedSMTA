@@ -34,32 +34,32 @@ Seals (fail-loud, no vacuous pass):
       covering all positions of the corresponding outer subset
   S3  surrogate + test_pool partition the full 10k test set exactly
   S4  (optional, --verify-task0-replay) replay build_server + round-0
-      update_data on CPU with the fedta method and require the resulting
+      update_data on CPU with the fedRelink method and require the resulting
       task-0 inner splits == manifest inner task 0 (proves the reference
       checkpoint's torch RNG stream through the first task boundary equals
-      the fedta baseline's).
+      the fedRelink baseline's).
 
 Reference-checkpoint choice: any seed-42 run whose torch RNG stream through
-every task boundary equals the fedta baseline's. The A2 arms qualify: all
+every task boundary equals the fedRelink baseline's. The A2 arms qualify: all
 three arms' data_split_state are bit-identical (empirically verified), and
-A2's only extra work vs fedta is the post-step parameter restore plus the
+A2's only extra work vs fedRelink is the post-step parameter restore plus the
 RNG-snapshot-guarded feature pass (RNG-neutral by construction, cf.
-Models/Client_DF.py). When the true fedta seed_42 checkpoint becomes
+Models/Client_DF.py). When the true fedRelink seed_42 checkpoint becomes
 available, re-run with it via --reference-checkpoint to upgrade the
 provenance; S1/S2 must still pass.
 
 Usage (FedSMTA conda env, from the repo root):
 
   python diagnostics/export_split_manifest.py \
-      --reference-checkpoint output/cifar100/fedta/cifar_a5v2_M2_feat_full/seed_42/checkpoints/latest.pth \
+      --reference-checkpoint output/cifar100/fedRelink/cifar_a5v2_M2_feat_full/seed_42/checkpoints/latest.pth \
       -o protocol_manifests/cifar100_c5t5p15s20_seed42.json \
       --verify-task0-replay
 
-ImageNet-R (reference run: output/ImageNet-R/fedta/inr_base_p40/seed_42;
-the fedta baseline itself, so S1/S4 are self-consistency seals):
+ImageNet-R (reference run: output/ImageNet-R/fedRelink/inr_base_p40/seed_42;
+the fedRelink baseline itself, so S1/S4 are self-consistency seals):
 
   python diagnostics/export_split_manifest.py --dataset ImageNet-R \
-      --reference-checkpoint output/ImageNet-R/fedta/inr_base_p40/seed_42/checkpoints/latest.pth \
+      --reference-checkpoint output/ImageNet-R/fedRelink/inr_base_p40/seed_42/checkpoints/latest.pth \
       -o protocol_manifests/inr_c5t5p40s5_seed42.json \
       --verify-task0-replay
 """
@@ -115,7 +115,7 @@ def fail(msg):
 
 
 def verify_task0_replay(args, manifest):
-    """Seal S4: replay the fedta stream through the round-0 update_data on
+    """Seal S4: replay the fedRelink stream through the round-0 update_data on
     CPU and require the task-0 inner splits to equal the manifest's."""
     import argparse as _argparse
     from config.datasets_delay import get_args_parser
@@ -126,7 +126,7 @@ def verify_task0_replay(args, manifest):
     cp = sub.add_parser("datasets_delay")
     get_args_parser(cp)
     replay_args = parser.parse_args([
-        "datasets_delay", "--method", "fedta", "--device", "cpu",
+        "datasets_delay", "--method", "fedRelink", "--device", "cpu",
         "--data_path", args.data_path, "--seed", str(args.seed),
         "--client_num", str(args.client_num), "--task_num", str(args.task_num),
         "--private_class_num", str(args.private_class_num),
@@ -149,8 +149,8 @@ def verify_task0_replay(args, manifest):
            [int(x) for x in got["test"]] != want["test"]:
             fail(f"task0 replay: client {j} inner split != manifest "
                  f"(the reference checkpoint's torch RNG stream diverges "
-                 f"from the fedta baseline's)")
-    print("[seal S4] task-0 inner split replay (fedta stream): PASS")
+                 f"from the fedRelink baseline's)")
+    print("[seal S4] task-0 inner split replay (fedRelink stream): PASS")
 
 
 def main():
@@ -174,7 +174,7 @@ def main():
                         "70/30 splits (data_split_state) and the outer "
                         "cross-check (outer_split_manifest)")
     p.add_argument("--verify-task0-replay", action="store_true",
-                   help="slow seal S4: CPU replay of the fedta stream "
+                   help="slow seal S4: CPU replay of the fedRelink stream "
                         "through round-0 update_data")
     p.add_argument("-o", "--output", required=True)
     args = p.parse_args()

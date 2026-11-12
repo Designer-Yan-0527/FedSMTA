@@ -39,7 +39,7 @@ scheme probe 当前任务行口径）；本工具出数后交 GPT 裁决冻结�
 
 用法（repo 根目录）：
   python diagnostics/dsar_inr_hist_probe.py \
-      --run_dir output/ImageNet-R/fedta/inr_bsab_capture_baseline_p40/seed_42 \
+      --run_dir output/ImageNet-R/fedRelink/inr_bsab_capture_baseline_p40/seed_42 \
       --b_ranks 8,24 --b_gammas inr,cifar
 """
 
@@ -68,7 +68,7 @@ from dsar_inr_scheme_probe import (
 def parse_args():
     p = argparse.ArgumentParser("INR historical-task DSAR-B probe")
     p.add_argument("--run_dir", default=(
-        "output/ImageNet-R/fedta/inr_bsab_capture_baseline_p40/seed_42"))
+        "output/ImageNet-R/fedRelink/inr_bsab_capture_baseline_p40/seed_42"))
     p.add_argument("--feat_dir", default=None,
                    help="stage-1 extract 目录；default <run_dir>/dsar_hist_feats")
     p.add_argument("--out_dir", default=None,

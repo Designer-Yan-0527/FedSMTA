@@ -29,7 +29,7 @@ check_feature_batch_sensitivity.py measured its floors.
 
 Usage (from repo root, on the server):
   python diagnostics/extract_features.py \
-      --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+      --run_dir output/cifar100/fedRelink/<run_name>/seed_42 \
       --checkpoint checkpoints/task_04_end.pth \
       --out_dir diagnostics_output
 

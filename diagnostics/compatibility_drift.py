@@ -33,7 +33,7 @@ accuracy, margin_mean, margin_median, margin_p10.
 
 Usage (from repo root, on the server):
   python diagnostics/compatibility_drift.py \
-      --run_dir output/cifar100/fedta/<run_name>/seed_42 \
+      --run_dir output/cifar100/fedRelink/<run_name>/seed_42 \
       --old_ckpt checkpoints/task_00_end.pth \
       --new_ckpt checkpoints/task_03_end.pth \
       --out_csv diagnostics_output/compatibility_2x2.csv

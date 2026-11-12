@@ -28,8 +28,8 @@ refit 无 capture）逐位一致？A5 的 RNG 中立性设计预言：一致。�
   python diagnostics/verify_trajectory_identity.py
   # 或显式指定：
   python diagnostics/verify_trajectory_identity.py \
-      --baseline_dir output/cifar100/fedta/cifar_base_p15/seed_42 \
-      --treatment_dir output/cifar100/fedta/cifar_bsab_capture_M2matched/seed_42
+      --baseline_dir output/cifar100/fedRelink/cifar_base_p15/seed_42 \
+      --treatment_dir output/cifar100/fedRelink/cifar_bsab_capture_M2matched/seed_42
 """
 
 import argparse
@@ -50,9 +50,9 @@ MAX_DIFF_DETAIL = 20
 def parse_args():
     p = argparse.ArgumentParser("two-run trajectory identity gate")
     p.add_argument("--baseline_dir", default=(
-        "output/cifar100/fedta/cifar_base_p15/seed_42"))
+        "output/cifar100/fedRelink/cifar_base_p15/seed_42"))
     p.add_argument("--treatment_dir", default=(
-        "output/cifar100/fedta/cifar_bsab_capture_M2matched/seed_42"))
+        "output/cifar100/fedRelink/cifar_bsab_capture_M2matched/seed_42"))
     return p.parse_args()
 
 

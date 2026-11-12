@@ -52,7 +52,7 @@ LT_WD = 1e-4
 def parse_args():
     p = argparse.ArgumentParser("DSAR offline pilot")
     p.add_argument("--run_dir", default=(
-        "output/cifar100/fedta/cifar_base_p15/seed_42"))
+        "output/cifar100/fedRelink/cifar_base_p15/seed_42"))
     p.add_argument("--stage", default="both",
                    choices=["extract", "fit", "both"])
     p.add_argument("--rounds", default="all",

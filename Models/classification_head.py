@@ -28,33 +28,3 @@ class Chead(torch.nn.Module):
 
     def get_head(self):
         return self.head
-
-
-class StandardizedChead(torch.nn.Module):
-    """标准化输入 + Chead 形状 MLP（判死 A5-v2 方向遗留结构，保留仅为
-    兼容旧 checkpoint 的 rebuild_client_head 路径）。mu/sd 作为 persistent
-    buffer 随 state_dict 存取，resume 时按 keys（mean/std + head.*）与
-    Chead 区分（rebuild_client_head）。forward 语义与 Chead 完全同构
-    （输入 1536 维 x1，输出 label_num logits），因此可无缝进入
-    Tail_Anchor.load_head / evaluate 路径。"""
-
-    def __init__(self, label_num, mean, std, hidden=512, dropout=0.1):
-        super().__init__()
-        self.register_buffer("mean", mean.detach().clone().float())
-        self.register_buffer("std", std.detach().clone().float())
-        self.head = nn.Sequential(nn.Linear(mean.shape[0], hidden),
-                                  nn.ReLU(),
-                                  nn.Dropout(p=dropout),
-                                  nn.Linear(hidden, label_num))
-
-    def forward(self, x):
-        x = (x - self.mean) / self.std
-        return self.head(x)
-
-    def load_head(self, head):
-        self.head = deepcopy(head.head)
-        self.mean = head.mean.clone()
-        self.std = head.std.clone()
-
-    def get_head(self):
-        return self.head

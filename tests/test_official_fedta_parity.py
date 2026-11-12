@@ -3,7 +3,7 @@
 Gate 0B (resume regression) only proves "our code continuous == our code
 resumed". This test proves the stronger statement:
 
-    FedSMTA --method fedta --no_instrumentation  ==  Official FedTA
+    FedSMTA --method fedRelink --no_instrumentation  ==  Official FedTA
 
 It runs the OFFICIAL FedTA repo in-process through a generated driver
 script (the official repo has no checkpoint mechanism, so the driver
@@ -69,7 +69,6 @@ from test_resume_regression import (
 # --config_module if the official layout differs)
 CONFIG_MODULE_CANDIDATES = ["config.cifar100", "config.cifar100_delay"]
 VIT_MODULE_CANDIDATES = [
-    "Models.vision_transformer__l2p",
     "Models.vision_transformer_l2p",
     "models.vision_transformer__l2p",
 ]
@@ -434,7 +433,7 @@ def parse_args():
     p.add_argument("--seed", default=42, type=int)
     p.add_argument("--device", default="cuda")
     p.add_argument("--work_dir", default="output/regression", type=Path)
-    p.add_argument("--method", default="fedta")
+    p.add_argument("--method", default="fedRelink")
     p.add_argument("--keep_driver", action="store_true",
                    help="keep the generated driver/payload/dump files in "
                         "the official repo for debugging")
@@ -531,7 +530,7 @@ def main():
     payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     run_dir = (args.work_dir / args.data_name / args.method
-               / "parity_fedta" / f"seed_{args.seed}")
+               / "parity_fedRelink" / f"seed_{args.seed}")
     if run_dir.exists():
         print(f"[cleanup] removing previous test run dir {run_dir}")
         shutil.rmtree(run_dir)
@@ -547,16 +546,16 @@ def main():
         if proc.returncode != 0:
             raise RuntimeError("official-repo parity driver failed")
 
-        # ---------- side 2: the fork (fedta, observers off) ----------
+        # ---------- side 2: the fork (fedRelink, observers off) ----------
         base = ["--data_name", args.data_name,
-                "--data-path", args.data_path,
+                "--data_path", args.data_path,
                 "--seed", str(args.seed), "--device", args.device,
                 "--client_num", str(args.client_num),
                 "--task_num", str(args.task_num),
                 "--private_class_num", str(args.private_class_num),
                 "--global_epoch", str(args.global_epoch),
                 "--local_epoch", str(args.local_epoch),
-                "--batch-size", str(args.batch_size),
+                "--batch_size", str(args.batch_size),
                 "--surrogate_num", str(args.surrogate_num),
                 "--threshold", str(args.threshold),
                 "--lr", str(args.lr),
@@ -565,7 +564,7 @@ def main():
                 "--save_every", "1",
                 "--output_dir", str(args.work_dir),
                 "--max_rounds", str(args.rounds)]
-        run_main(base + ["--run_name", "parity_fedta"])
+        run_main(base + ["--run_name", "parity_fedRelink"])
 
         dump = torch_load_compat(dump_path)
         ckpt = torch_load_compat(run_dir / "checkpoints" / "latest.pth")
@@ -710,7 +709,7 @@ def main():
 
         verification = {
             "test": "official_fedta_parity",
-            "gate": "Gate 0A: FedSMTA --method fedta must be bit-identical "
+            "gate": "Gate 0A: FedSMTA --method fedRelink must be bit-identical "
                     "to the official FedTA (D=0)",
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "result": result,
@@ -749,7 +748,7 @@ def main():
 
         print(f"\nsaved {out_path}")
         print("\nRESULT:", result if all_ok else
-              "FAIL (the fedta path diverges from the official FedTA; "
+              "FAIL (the fedRelink path diverges from the official FedTA; "
               "compare the checksums in the JSON to locate the first "
               "diverging component)")
     finally:

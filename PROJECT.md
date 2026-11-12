@@ -1,6 +1,6 @@
 # FedSMTA 项目结构
 
-FedTA：基于 prompt 的联邦持续学习（Federated Continual Learning）项目。
+FedRelink（仓名 FedSMTA）：基于 prompt 的联邦持续学习（Federated Continual Learning）项目，载体为官方 FedTA (CVPR 2025)。
 服务器维护全局 prompt / 原型 / 分类头，多个客户端在私有持续任务流上本地训练，
 通过 BGPS（原型贪心相似度选择/修复）与 SIKF（知识蒸馏融合 prompt）做聚合。
 
@@ -30,8 +30,7 @@ FedSMTA/
 │   ├── Tail_Anchor.py                #   Tail Anchor（key + anchor_pool，top-1 路由）
 │   ├── classification_head.py        #   per-task Chead
 │   ├── global_prompt.py              #   prompt pool
-│   ├── vision_transformer*.py        #   ViT 骨干（含 L2P 风格变体）
-│   └── models.py                     #   timm 模型注册
+│   └── vision_transformer*.py        #   ViT 骨干（含 L2P 风格变体 + timm 模型注册）
 │
 ├── diagnostics/                      # 诊断脚本（全部 observer-only，复刻训练 RNG 流）：
 │   │                                 #   extract_features / compatibility_drift (2×2) /
@@ -58,7 +57,7 @@ FedSMTA/
 ```
 main.py → 解析参数 → 固定种子 → RunManager → 数据划分 → Server_DF.start()
   每轮：clients[j].update_data()（任务切换时 70/30 切分并记录索引）
-       → clients[j].train()（prompt + Tail_Anchor；fedta_a2 下 post-step restore）
+       → clients[j].train()（prompt + Tail_Anchor；A2 臂下 post-step restore）
        → BGPS 原型聚合/修复 → SIKF kd_fusion_prompt → fed_avg_head → 广播
   任务边界：全任务评估 → 指标 CSV → checkpoint
 ```
@@ -70,7 +69,7 @@ main.py → 解析参数 → 固定种子 → RunManager → 数据划分 → Se
 
 - **共享 ViT 实例**：所有客户端共享服务器传入的同一 ViT；prompts 以 deepcopy 保存在客户端侧
 - **original_model**：冻结预训练 ViT，训练时提供 cls_features 做蒸馏/特征引导
-- **method flag**：`--method fedta`（read-only 基线）/ `fedta_a2`（接口保护，`--a2_arm key|anchor|both`）
+- **method flag**：`--method fedRelink`（唯一方法名，2026-11-12 由 `fedta` 更名；四臂矩阵由 `--a2_arm key|anchor|both` / `--dsar` 开关组合）
 - **checkpoint 一致性**：`data_split_indices` 记录 70/30 划分；外层 manifest 逐位校验；RNG 状态最后恢复
 - **ImageNet-R 划分固化**：首次运行 80/20 移动到 train/test 子目录后复用
 

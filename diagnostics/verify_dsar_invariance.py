@@ -1,7 +1,7 @@
 """G1 DSAR invariance verifier (RUNCOMMANDS §34.4/§34.4a hard-gate tool).
 
 First-phase B1 deliverable evidence -- NOT accuracy. Three checks per
-client, replayed on a real round-boundary checkpoint (plain fedta
+client, replayed on a real round-boundary checkpoint (plain fedRelink
 baseline run, e.g. cifar_base_p15_legacy task_04_end):
 
   TEST 1  OFF/ON(identity) bit-identical neutrality.
@@ -42,7 +42,7 @@ baseline run, e.g. cifar_base_p15_legacy task_04_end):
 
 Usage (repo root):
   OMP_NUM_THREADS=8 python diagnostics/verify_dsar_invariance.py \
-      --run_dir output/cifar100/fedta/cifar_base_p15_legacy/seed_42 \
+      --run_dir output/cifar100/fedRelink/cifar_base_p15_legacy/seed_42 \
       --checkpoint checkpoints/task_04_end.pth
 
 Exit code 0 = all PASS; 1 = any FAIL (printed per test).
@@ -77,7 +77,7 @@ LEGAL_STATUSES = {"FITTED", "IDENTITY_GUARD", "LOW_POWER_IDENTITY"}
 def parse_args():
     p = argparse.ArgumentParser("G1 DSAR invariance verifier")
     p.add_argument("--run_dir", default=(
-        "output/cifar100/fedta/cifar_base_p15_legacy/seed_42"))
+        "output/cifar100/fedRelink/cifar_base_p15_legacy/seed_42"))
     p.add_argument("--checkpoint", default="checkpoints/task_04_end.pth")
     p.add_argument("--clients", default="all",
                    help="'all' or comma-separated client ids, e.g. '0,2'")
@@ -460,14 +460,14 @@ def main():
 
     args = load_args_from_run_dir(run_dir, data_path=cli.data_path,
                                   device=cli.device)
-    # replay must be on the plain fedta baseline (B1 arm definition)
+    # replay must be on the plain fedRelink baseline (B1 arm definition)
     if bool(getattr(args, "head_refit", False)):
         raise SystemExit("PROTOCOL_GATE_FAIL: run_dir is a head_refit run; "
-                         "G1 DSAR verification requires the plain fedta "
+                         "G1 DSAR verification requires the plain fedRelink "
                          "baseline")
     if str(getattr(args, "ctrp_mode", "off") or "off") != "off":
         raise SystemExit("PROTOCOL_GATE_FAIL: run_dir is a CTRP run; G1 "
-                         "DSAR verification requires the plain fedta "
+                         "DSAR verification requires the plain fedRelink "
                          "baseline")
     args.dsar = False       # bootstrap OFF; the tests flip client flags
     args.dsar_identity = False
